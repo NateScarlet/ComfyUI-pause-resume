@@ -6,4 +6,4 @@
 
 依赖 pwsh7。
 
-[yara](https://github.com/Satellile/yara)　保存的工作流会缺少未使用的节点，所以我自己用 HTTP API 实现了
+[yara](https://github.com/Satellile/yara)　保存的工作流会缺少 extra_data，所以我自己用 HTTP API 实现了
