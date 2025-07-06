@@ -39,13 +39,18 @@ function Send-Workflow {
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
         [PSObject]$workflow  # 直接接收 JSON 数组的单个元素（长度为5的数组）
     )
-    Write-Host "处理工作流 $($workflow[0])"
+    $number, $id, $prompt, $extra_data, $_ = $workflow
+    Write-Host "处理工作流 $number ($id)"
     $body = @{
-        client_id  = $workflow[1]
-        prompt     = $workflow[2]
-        extra_data = $workflow[3]
-    } | ConvertTo-Json -Compress -Depth 100
-
+        number     = $number
+        prompt     = $prompt
+        extra_data = $extra_data
+    }
+    if ($extra_data.client_id) {
+        $body.client_id = $extra_data.client_id
+    }
+    $body = $body | ConvertTo-Json -Compress -Depth 100
+    
     $response = Invoke-WebRequest -Uri "$url/prompt" -Method Post -Body $body -ContentType "application/json"
     if ($response.StatusCode -ne 200) {
         Write-Error "工作流入列失败 状态码: $($response.StatusCode), 响应: $($response.Content)"
