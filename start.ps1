@@ -2,6 +2,8 @@ $port = $env:COMFYUI_PORT ?? 8188
 $url = "http://localhost:$port"
 $info_file = "$PSScriptRoot\.process_info"
 $queue_file = "$PSScriptRoot\queue.json"
+$program = "$PSScriptRoot\python_embeded\python.exe"
+$program_args = @("-s", "ComfyUI\main.py", "--port", $port, "--fast", "--cache-classic", "--preview-method", "taesd", "--preview-size", "1024")
 
 function Wait-ServerReady() {
     $timeout = 300  # 最长等待时间（秒）
@@ -37,7 +39,7 @@ function Send-Workflow {
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
         [PSObject]$workflow  # 直接接收 JSON 数组的单个元素（长度为5的数组）
     )
-    Write-Host "处理 workflow $($workflow[0])"
+    Write-Host "处理工作流 $($workflow[0])"
     $body = @{
         client_id  = $workflow[1]
         prompt     = $workflow[2]
@@ -63,8 +65,8 @@ catch {
 }
 
 # 保存进程信息
-$process = Start-Process -FilePath "$PSScriptRoot\python_embeded\python.exe" `
-    -ArgumentList @("-s", "ComfyUI\main.py", "--port", $port, "--fast", "--cache-classic", "--preview-method", "taesd", "--preview-size", "1024") `
+$process = Start-Process -FilePath $program `
+    -ArgumentList $program_args `
     -PassThru `
     -ErrorAction Stop
 
