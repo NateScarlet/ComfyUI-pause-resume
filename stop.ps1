@@ -1,6 +1,6 @@
 $info_file = "$PSScriptRoot\.process_info"
 $lock_file = "$PSScriptRoot\.stop_lock"
-$force = $true
+$queue_file = "$PSScriptRoot\queue.json"
 
 try {
     $file = [System.IO.File]::Open($lock_file, 'CreateNew', 'Write', 'None')
@@ -11,7 +11,6 @@ catch {
     exit 0  # 静默退出而非错误
 }
 try {
-
     if (Test-Path $info_file) {
         $info = Get-Content $info_file | ConvertFrom-Json
     
@@ -24,35 +23,9 @@ try {
             $targetProcess.ProcessName -eq $info.ProcessName -and
             $targetProcess.StartTime.Ticks -eq $info.StartTimeTicks) {   
         
-            if ($force) {
-                # 保存所有任务，进行中任务之后要从头开始，用户可以自己选择合适的时机停止
-                yara save -wr last_session
-                if ($LASTEXITCODE) {
-                    exit $LASTEXITCODE
-                }
-            }
-            else {
-                # 保存后续任务
-                yara save last_session
-                if ($LASTEXITCODE) {
-                    exit $LASTEXITCODE
-                }
-        
-                # 清空刚才已经保存的任务
-                try {
-                    Invoke-WebRequest -Uri "${url}/queue" -Method 'POST' -ContentType 'application/json' -Body '{"clear":true}' -UseBasicParsing -ErrorAction Stop | Out-Null
-                }
-                catch {
-                    Write-Warning "清空队列失败: $($_.Exception.Message)"
-                }
-        
-                # 等待正在处理的任务完成
-                yara wait
-                if ($LASTEXITCODE) {
-                    exit $LASTEXITCODE
-                }
-            }
-        
+            # 保存当前队列
+            Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
+
             # 停止进程
             Stop-Process $info.PID
         }
