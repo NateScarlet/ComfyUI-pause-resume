@@ -17,11 +17,11 @@ try {
         # 使用文件中的端口构建URL
         $url = "http://localhost:$($info.Port)"
     
-        $targetProcess = Get-Process -Id $info.PID -ErrorAction SilentlyContinue
+        $process = Get-Process -Id $info.PID -ErrorAction SilentlyContinue
         # 多重校验
-        if ($targetProcess -and 
-            $targetProcess.ProcessName -eq $info.ProcessName -and
-            $targetProcess.StartTime.Ticks -eq $info.StartTimeTicks) {   
+        if ($process -and 
+            $process.ProcessName -eq $info.ProcessName -and
+            $process.StartTime.Ticks -eq $info.StartTimeTicks) {   
         
             # 保存当前队列
             Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
