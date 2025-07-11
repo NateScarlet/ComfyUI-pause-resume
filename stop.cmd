@@ -1,1 +1,1 @@
-pwsh %~dp0\stop.ps1
+pwsh %~dp0\stop.ps1 || PAUSE
