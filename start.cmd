@@ -1,1 +1,1 @@
-pwsh %~dp0\start.ps1 || PAUSE
+pwsh "%~dp0start.ps1" || PAUSE
