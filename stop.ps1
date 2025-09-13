@@ -27,9 +27,9 @@ try {
             Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
 
             # 停止进程
-            Stop-Process $info.PID
+            Stop-Process $info.PID -ErrorAction Stop 
         }
-        Remove-Item $info_file -Force
+        Remove-Item $info_file -Force -ErrorAction Stop 
     }
 }
 finally {
