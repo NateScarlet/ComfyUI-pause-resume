@@ -28,8 +28,8 @@ try {
 
             # 停止进程
             Stop-Process $info.PID -ErrorAction Stop 
+            Remove-Item $info_file -Force -ErrorAction Stop 
         }
-        Remove-Item $info_file -Force -ErrorAction Stop 
     }
 }
 finally {
