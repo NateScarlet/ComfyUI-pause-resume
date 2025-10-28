@@ -3,7 +3,7 @@ $url = "http://localhost:$port"
 $info_file = "$PSScriptRoot\.process_info"
 $queue_file = "$PSScriptRoot\queue.json"
 $program = "$PSScriptRoot\python_embeded\python.exe"
-$program_args = @("-s", "ComfyUI\main.py", "--port", $port, "--fast", "--cache-classic", "--preview-method", "taesd", "--preview-size", "1024")
+$program_args = @("-s", "ComfyUI\main.py", "--port", $port)
 
 function Wait-ServerReady() {
     $timeout = 300  # 最长等待时间（秒）
