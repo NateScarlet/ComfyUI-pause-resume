@@ -1,1 +1,1 @@
-pwsh "%~dp0start.ps1" || PAUSE
+pwsh -NoProfile "%~dp0start.ps1" || PAUSE
