@@ -7,8 +7,8 @@ $queue_file = "$PSScriptRoot\queue.json"
 $program = "$PSScriptRoot\python_embeded\python.exe"
 $program_args = @("-s", "ComfyUI\main.py", "--port", $port)
 # 备份
-$backup_debounce_interval = 5  # 防抖间隔（秒）
-$max_backup_delay = 30         # 最大备份延迟（秒）
+$backup_debounce_interval_secs = 5  
+$max_backup_delay_secs = 300
 
 #endregion
 
@@ -64,6 +64,76 @@ function Send-Workflow {
     }
 }
 
+# 备份调度器类
+class BackupScheduler {
+    [bool]$Enabled = $false
+    [datetime]$LastStderrTime
+    [System.Timers.Timer]$Timer
+    [bool]$Scheduled = $false
+    [int]$MaxDelaySecs
+    [string]$QueueFile
+    [string]$Url
+
+    BackupScheduler([int]$debounceIntervalSecs, [int]$maxDelaySecs, [string]$queueFile, [string]$url) {
+        $this.MaxDelaySecs = $maxDelaySecs
+        $this.QueueFile = $queueFile
+        $this.Url = $url
+        $this.Timer = New-Object System.Timers.Timer
+        $this.Timer.Interval = $debounceIntervalSecs * 1000
+        $this.Timer.AutoReset = $false
+        $self = $this
+        $this.Timer.Add_Elapsed({
+                if ($self.Scheduled) {
+                    $self.Scheduled = $false
+                    $self.Execute()
+                }
+            })
+    }
+
+    [void]Schedule() {
+        if (-not $this.Enabled) {
+            return
+        }
+        
+        $this.Timer.Stop()
+        
+        if ($this.LastStderrTime) {
+            $currentTime = Get-Date
+            $sinceLastOutput = ($currentTime - $this.LastStderrTime).TotalSeconds
+            if ($sinceLastOutput -gt $this.MaxDelaySecs) {
+                # 达到最大延迟，立即执行备份
+                $this.Execute()
+                return
+            }
+        }
+        
+        $this.Scheduled = $true
+        $this.Timer.Start()
+    }
+
+    [void]Execute() {
+        Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
+
+        try {
+            # 保存当前备份
+            if (Test-Path $this.QueueFile) {
+                Move-Item $this.QueueFile "$($this.QueueFile)~" -Force -ErrorAction Ignore
+            }
+
+            # 获取最新队列并保存
+            Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $this.QueueFile -ErrorAction Stop
+            Write-Host "✅ 队列备份完成" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    [void]Dispose() {
+        $this.Timer.Dispose()
+    }
+}
+
 #endregion
 
 #region 主程序
@@ -79,8 +149,6 @@ catch {
     # 忽略检测出错
 }
 
-
-
 # 创建进程对象
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo.FileName = $program
@@ -91,66 +159,8 @@ $process.StartInfo.RedirectStandardOutput = $true
 $process.StartInfo.RedirectStandardError = $true
 $process.StartInfo.UseShellExecute = $false
 
-# 创建共享状态对象（解决变量作用域问题）
-$sharedState = [PSCustomObject]@{
-    EnableBackup           = $false
-    LastStderrTime         = $null
-    BackupTimer            = $null
-    BackupScheduled        = $false
-    BackupDebounceInterval = $backup_debounce_interval
-    MaxBackupDelay         = $max_backup_delay
-}
-
-# 定义备份调度函数（使用共享状态对象）
-$scheduleBackup = {
-    if (-not $sharedState.EnableBackup) {
-        return
-    }
-    
-    $currentTime = Get-Date
-    
-    # 取消现有计时器
-    if ($sharedState.BackupTimer) {
-        $sharedState.BackupTimer.Dispose()
-        $sharedState.BackupTimer = $null
-    }
-    
-    # 计算延迟时间（防抖逻辑）
-    $delay = $sharedState.BackupDebounceInterval
-    if ($sharedState.LastStderrTime) {
-        $timeSinceLastOutput = ($currentTime - $sharedState.LastStderrTime).TotalSeconds
-        if ($timeSinceLastOutput -gt $sharedState.MaxBackupDelay) {
-            $delay = 1  # 如果已经很久没有输出，立即备份
-        }
-    }
-    
-    $sharedState.BackupScheduled = $true
-    
-    $sharedState.BackupTimer = New-Object System.Timers.Timer
-    $sharedState.BackupTimer.Interval = $delay * 1000
-    $sharedState.BackupTimer.AutoReset = $false
-    $sharedState.BackupTimer.Add_Elapsed({
-            if ($sharedState.BackupScheduled) {
-                $sharedState.BackupScheduled = $false
-                Write-Host "💾 备份队列到 $queue_file" -ForegroundColor Yellow
-    
-                try {
-                    # 保存当前备份
-                    if (Test-Path $queue_file) {
-                        Move-Item $queue_file "${queue_file}~" -Force -ErrorAction Ignore
-                    }
-        
-                    # 获取最新队列并保存
-                    Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
-                    Write-Host "✅ 队列备份完成" -ForegroundColor Green
-                }
-                catch {
-                    Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
-                }
-            }
-        })
-    $sharedState.BackupTimer.Start()
-}
+# 创建备份调度器实例
+$script:backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
 
 # 标准输出处理
 $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
@@ -167,8 +177,8 @@ $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataRe
         Write-Host $data -ForegroundColor Red
         
         # 更新最后错误输出时间并安排备份
-        $sharedState.LastStderrTime = Get-Date
-        & $scheduleBackup
+        $script:backupScheduler.LastStderrTime = Get-Date
+        $script:backupScheduler.Schedule()
     }
 }
 
@@ -213,8 +223,8 @@ try {
     
     # 队列恢复完成，启用备份功能
     Write-Host "🔔 启用队列自动备份功能" -ForegroundColor Green
-    $sharedState.EnableBackup = $true
-    Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval}秒, 最大延迟 ${max_backup_delay}秒" -ForegroundColor Gray
+    $script:backupScheduler.Enabled = $true
+    Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval_secs}秒, 最大延迟 ${max_backup_delay_secs}秒" -ForegroundColor Gray
     
     # 等待进程退出
     Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
@@ -235,10 +245,7 @@ finally {
     Write-Host "🧹 清理资源..." -ForegroundColor Gray
     Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
     Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
-    
-    if ($sharedState.BackupTimer) {
-        $sharedState.BackupTimer.Dispose()
-    }
+    $script:backupScheduler.Dispose()
 }
 
 #endregion
