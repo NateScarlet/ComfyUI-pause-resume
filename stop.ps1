@@ -29,6 +29,8 @@ try {
             # 停止进程
             Stop-Process $info.PID -ErrorAction Stop 
             Remove-Item $info_file -Force -ErrorAction Stop 
+        } else {
+            Write-Warning "当前对应 PID 进程不匹配，跳过处理"
         }
     }
 }
