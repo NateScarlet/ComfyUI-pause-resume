@@ -180,8 +180,8 @@ $process.Start() | Out-Null
 @{
     PID            = $process.Id
     Port           = $port
-    ProcessName    = (Get-Item $program).Name
-    StartTimeTicks = (Get-Date).Ticks
+    ProcessName    = $process.ProcessName
+    StartTimeTicks = $process.StartTime.Ticks
 } | ConvertTo-Json | Set-Content -Path $info_file -Force
 
 # 开始异步读取输出
