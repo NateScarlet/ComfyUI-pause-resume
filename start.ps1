@@ -64,24 +64,6 @@ function Send-Workflow {
     }
 }
 
-function Backup-Queue {
-    Write-Host "💾 备份队列到 $queue_file" -ForegroundColor Yellow
-    
-    try {
-        # 保存当前备份
-        if (Test-Path $queue_file) {
-            Move-Item $queue_file "${queue_file}~" -Force -ErrorAction Ignore
-        }
-        
-        # 获取最新队列并保存
-        Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
-        Write-Host "✅ 队列备份完成" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
 #endregion
 
 #region 主程序
@@ -150,7 +132,21 @@ $scheduleBackup = {
     $sharedState.BackupTimer.Add_Elapsed({
             if ($sharedState.BackupScheduled) {
                 $sharedState.BackupScheduled = $false
-                Backup-Queue
+                Write-Host "💾 备份队列到 $queue_file" -ForegroundColor Yellow
+    
+                try {
+                    # 保存当前备份
+                    if (Test-Path $queue_file) {
+                        Move-Item $queue_file "${queue_file}~" -Force -ErrorAction Ignore
+                    }
+        
+                    # 获取最新队列并保存
+                    Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
+                    Write-Host "✅ 队列备份完成" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
+                }
             }
         })
     $sharedState.BackupTimer.Start()
@@ -192,9 +188,6 @@ $process.Start() | Out-Null
 $process.BeginOutputReadLine()
 $process.BeginErrorReadLine()
 
-Write-Host "💾 StdOut 保存到: $stdout_log" -ForegroundColor Gray
-Write-Host "💾 StdErr 保存到: $stderr_log" -ForegroundColor Gray
-
 try {
     # 等待服务就绪
     Wait-ServerReady
@@ -225,7 +218,10 @@ try {
     
     # 等待进程退出
     Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
-    $process.WaitForExit()
+    # XXX: $process.WaitForExit() 会阻塞事件循环，导致 stderr 事件不处理
+    while (-not $process.HasExited) {
+        Start-Sleep -Milliseconds 10
+    }
     $exitCode = $process.ExitCode
     Write-Host "🔚 进程已退出，退出码: $exitCode" -ForegroundColor Cyan
     # 删除进程信息文件
