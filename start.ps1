@@ -138,17 +138,12 @@ class BackupScheduler {
 #endregion
 
 #region 主程序
-try {
-    # 检查服务是否已运行
-    $response = Invoke-WebRequest -Uri $url -Method Get -TimeoutSec 1 -ErrorAction SilentlyContinue
-    if ($response -and $response.StatusCode -eq 200) {
-        Write-Host "✅ 服务已在运行 ($url)" -ForegroundColor Green
-        exit 0
-    }    
-}
-catch {
-    # 忽略检测出错
-}
+
+# 检查端口占用（服务是否已运行）
+if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
+    Write-Host "端口 $port 正被占用" -ForegroundColor Red
+    exit 1
+}    
 
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
