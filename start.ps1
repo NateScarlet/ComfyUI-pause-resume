@@ -251,7 +251,7 @@ while ($true) {
         exit $exitCode
     }
     else {
-        Write-Host "⚠️ 非正常退出码 $exitCode，60秒后自动重启..." -ForegroundColor Yellow
+        Write-Host "⚠️ 非正常退出码 $exitCode，$restart_delay_secs 秒后自动重启..." -ForegroundColor Yellow
         Start-Sleep -Seconds $restart_delay_secs
     }
 
