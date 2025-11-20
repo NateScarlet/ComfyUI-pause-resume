@@ -129,7 +129,6 @@ $sharedState = [PSCustomObject]@{
 # 定义备份调度函数（使用共享状态对象）
 $scheduleBackup = {
     if (-not $sharedState.EnableBackup) {
-        Write-Host "⏸️ 备份功能暂未启用（队列恢复中）" -ForegroundColor Gray
         return
     }
     
@@ -151,7 +150,6 @@ $scheduleBackup = {
     }
     
     $sharedState.BackupScheduled = $true
-    Write-Host "⏰ 安排 $delay 秒后备份队列..." -ForegroundColor Cyan
     
     $sharedState.BackupTimer = New-Object System.Timers.Timer
     $sharedState.BackupTimer.Interval = $delay * 1000
