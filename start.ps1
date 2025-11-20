@@ -51,6 +51,7 @@ function Send-Workflow {
     $body = @{
         number     = $number
         prompt     = $prompt
+        prompt_id  = $id
         extra_data = $extra_data
     }
     if ($extra_data.client_id) {
