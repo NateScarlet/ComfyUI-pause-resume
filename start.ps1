@@ -177,8 +177,15 @@ $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataRe
         Write-Host $data -ForegroundColor Red
         
         # 更新最后错误输出时间并安排备份
-        $script:backupScheduler.LastStderrTime = Get-Date
-        $script:backupScheduler.Schedule()
+        try {
+
+            $script:backupScheduler.LastStderrTime = Get-Date
+            $script:backupScheduler.Schedule()
+        }
+        catch {
+            # 输出异常信息，以便我们知道事件回调中发生了错误
+            Write-Error "STDERR事件回调出错: $_" -ForegroundColor Yellow
+        }
     }
 }
 
