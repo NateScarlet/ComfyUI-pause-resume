@@ -8,7 +8,7 @@ $program = "$PSScriptRoot\python_embeded\python.exe"
 $program_args = @("-s", "ComfyUI\main.py", "--port", $port)
 # 备份
 $backup_debounce_interval_secs = 5  
-$max_backup_delay_secs = 300
+$max_backup_delay_secs = 60
 
 #endregion
 
@@ -67,7 +67,7 @@ function Send-Workflow {
 # 备份调度器类
 class BackupScheduler {
     [bool]$Enabled = $false
-    [datetime]$LastStderrTime
+    [datetime]$LastExecute
     [System.Timers.Timer]$Timer
     [bool]$Scheduled = $false
     [int]$MaxDelaySecs
@@ -97,14 +97,12 @@ class BackupScheduler {
         
         $this.Timer.Stop()
         
-        if ($this.LastStderrTime) {
-            $currentTime = Get-Date
-            $sinceLastOutput = ($currentTime - $this.LastStderrTime).TotalSeconds
-            if ($sinceLastOutput -gt $this.MaxDelaySecs) {
-                # 达到最大延迟，立即执行备份
-                $this.Execute()
-                return
-            }
+        $currentTime = Get-Date
+        $sinceLastOutput = ($currentTime - $this.LastExecute).TotalSeconds
+        if ($sinceLastOutput -gt $this.MaxDelaySecs) {
+            # 达到最大延迟，立即执行备份
+            $this.Execute()
+            return
         }
         
         $this.Scheduled = $true
@@ -112,6 +110,7 @@ class BackupScheduler {
     }
 
     [void]Execute() {
+        $this.LastExecute = Get-Date
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
 
         try {
@@ -160,32 +159,23 @@ $process.StartInfo.RedirectStandardError = $true
 $process.StartInfo.UseShellExecute = $false
 
 # 创建备份调度器实例
-$script:backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
+$backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
 
 # 标准输出处理
 $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
     $data = $Event.SourceEventArgs.Data
-    if ($data) {
-        Write-Host $data
-    }
+    Write-Host $data
 }
 
 # 标准错误处理（触发备份）
 $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
-    $data = $Event.SourceEventArgs.Data
-    if ($data) {
+    try {
+        $data = $Event.SourceEventArgs.Data
         Write-Host $data -ForegroundColor Red
-        
-        # 更新最后错误输出时间并安排备份
-        try {
-
-            $script:backupScheduler.LastStderrTime = Get-Date
-            $script:backupScheduler.Schedule()
-        }
-        catch {
-            # 输出异常信息，以便我们知道事件回调中发生了错误
-            Write-Error "STDERR事件回调出错: $_" -ForegroundColor Yellow
-        }
+        $backupScheduler.Schedule()
+    }
+    catch {
+        Write-Host "STDERR事件回调出错: $_" -ForegroundColor Yellow
     }
 }
 
@@ -230,7 +220,8 @@ try {
     
     # 队列恢复完成，启用备份功能
     Write-Host "🔔 启用队列自动备份功能" -ForegroundColor Green
-    $script:backupScheduler.Enabled = $true
+    $backupScheduler.LastExecute = Get-Date
+    $backupScheduler.Enabled = $true
     Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval_secs}秒, 最大延迟 ${max_backup_delay_secs}秒" -ForegroundColor Gray
     
     # 等待进程退出
@@ -253,7 +244,7 @@ finally {
     Write-Host "🧹 清理资源..." -ForegroundColor Gray
     Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
     Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
-    $script:backupScheduler.Dispose()
+    $backupScheduler.Dispose()
 }
 
 #endregion
