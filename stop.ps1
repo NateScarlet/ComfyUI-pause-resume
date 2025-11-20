@@ -24,7 +24,9 @@ try {
             $process.StartTime.Ticks -eq $info.StartTimeTicks) {   
         
             # 保存当前队列
-            Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $queue_file -ErrorAction Stop
+            $tmpFile = "$queue_file.$([System.IO.Path]::GetRandomFileName())"
+            Invoke-WebRequest -Uri "${url}/queue" -Method Get -OutFile $tmpFile -ErrorAction Stop
+            Move-Item  $tmpFile $queue_file -Force -ErrorAction Stop
 
             # 停止进程
             Stop-Process $info.PID -ErrorAction Stop 

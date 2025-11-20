@@ -114,13 +114,9 @@ class BackupScheduler {
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
 
         try {
-            # 保存当前备份
-            if (Test-Path $this.QueueFile) {
-                Move-Item $this.QueueFile "$($this.QueueFile)~" -Force -ErrorAction Ignore
-            }
-
-            # 获取最新队列并保存
-            Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $this.QueueFile -ErrorAction Stop
+            $tmpFile = "$($this.QueueFile).$([System.IO.Path]::GetRandomFileName())"
+            Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $tmpFile -ErrorAction Stop
+            Move-Item  $tmpFile $this.QueueFile -Force -ErrorAction Stop
             Write-Host "✅ 队列备份完成" -ForegroundColor Green
         }
         catch {
