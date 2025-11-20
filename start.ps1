@@ -83,18 +83,18 @@ class BackupScheduler {
         $this.Timer = New-Object System.Timers.Timer
         $this.Timer.Interval = $debounceIntervalSecs * 1000
         $this.Timer.AutoReset = $false
-        $self = $this
-        $this.Timer.Add_Elapsed({
-                try {
-                    if ($self.Scheduled) {
-                        $self.Scheduled = $false
-                        $self.Execute()
-                    }
+        Register-ObjectEvent -InputObject $this.Timer -EventName Elapsed  -MessageData $this  -Action {
+            try {
+                $scheduler = $Event.MessageData
+                if ($scheduler.Scheduled) {
+                    $scheduler.Scheduled = $false
+                    $scheduler.Execute()
                 }
-                catch {
-                    Write-Host "备份计时器回调出错: $_" -ForegroundColor Yellow
-                }
-            })
+            }
+            catch {
+                Write-Host "备份计时器回调出错: $_" -ForegroundColor Yellow
+            }
+        } -
     }
 
     [void]Schedule() {
