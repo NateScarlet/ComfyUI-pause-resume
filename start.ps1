@@ -6,9 +6,6 @@ $info_file = "$PSScriptRoot\.process_info"
 $queue_file = "$PSScriptRoot\queue.json"
 $program = "$PSScriptRoot\python_embeded\python.exe"
 $program_args = @("-s", "ComfyUI\main.py", "--port", $port)
-# 日志文件路径
-$stdout_log = "$PSScriptRoot\stdout.log"
-$stderr_log = "$PSScriptRoot\stderr.log"
 # 备份
 $backup_debounce_interval = 5  # 防抖间隔（秒）
 $max_backup_delay = 30         # 最大备份延迟（秒）
@@ -112,10 +109,6 @@ $process.StartInfo.RedirectStandardOutput = $true
 $process.StartInfo.RedirectStandardError = $true
 $process.StartInfo.UseShellExecute = $false
 
-# 创建日志写入器
-$stdoutWriter = [System.IO.StreamWriter]::new($stdout_log, $true)
-$stderrWriter = [System.IO.StreamWriter]::new($stderr_log, $true)
-
 # 创建共享状态对象（解决变量作用域问题）
 $sharedState = [PSCustomObject]@{
     EnableBackup           = $false
@@ -167,8 +160,6 @@ $scheduleBackup = {
 $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
     $data = $Event.SourceEventArgs.Data
     if ($data) {
-        $stdoutWriter.WriteLine($data)
-        $stdoutWriter.Flush()
         Write-Host $data
     }
 }
@@ -177,8 +168,6 @@ $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataR
 $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
     $data = $Event.SourceEventArgs.Data
     if ($data) {
-        $stderrWriter.WriteLine($data)
-        $stderrWriter.Flush()
         Write-Host $data -ForegroundColor Red
         
         # 更新最后错误输出时间并安排备份
@@ -254,9 +243,6 @@ finally {
     if ($sharedState.BackupTimer) {
         $sharedState.BackupTimer.Dispose()
     }
-    
-    $stdoutWriter.Close()
-    $stderrWriter.Close()
 }
 
 #endregion
