@@ -85,9 +85,14 @@ class BackupScheduler {
         $this.Timer.AutoReset = $false
         $self = $this
         $this.Timer.Add_Elapsed({
-                if ($self.Scheduled) {
-                    $self.Scheduled = $false
-                    $self.Execute()
+                try {
+                    if ($self.Scheduled) {
+                        $self.Scheduled = $false
+                        $self.Execute()
+                    }
+                }
+                catch {
+                    Write-Host "备份计时器回调出错: $_" -ForegroundColor Yellow
                 }
             })
     }
