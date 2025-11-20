@@ -72,11 +72,13 @@ class BackupScheduler {
     [bool]$Scheduled = $false
     [int]$MaxDelaySecs
     [string]$QueueFile
+    [string]$QueueTempFile
     [string]$Url
 
     BackupScheduler([int]$debounceIntervalSecs, [int]$maxDelaySecs, [string]$queueFile, [string]$url) {
         $this.MaxDelaySecs = $maxDelaySecs
         $this.QueueFile = $queueFile
+        $this.QueueTempFile = "$($queueFile).$([System.IO.Path]::GetRandomFileName())"
         $this.Url = $url
         $this.Timer = New-Object System.Timers.Timer
         $this.Timer.Interval = $debounceIntervalSecs * 1000
@@ -114,9 +116,8 @@ class BackupScheduler {
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
 
         try {
-            $tmpFile = "$($this.QueueFile).$([System.IO.Path]::GetRandomFileName())"
-            Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $tmpFile -ErrorAction Stop
-            Move-Item  $tmpFile $this.QueueFile -Force -ErrorAction Stop
+            Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $this.QueueTempFile -ErrorAction Stop
+            Move-Item  $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
             Write-Host "✅ 队列备份完成" -ForegroundColor Green
         }
         catch {
