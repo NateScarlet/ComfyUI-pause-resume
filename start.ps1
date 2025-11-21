@@ -75,6 +75,7 @@ class BackupScheduler {
     [string]$QueueFile
     [string]$QueueTempFile
     [string]$Url
+    [int]$LastBackupQueueSize = -1
 
     BackupScheduler([int]$debounceIntervalSecs, [int]$maxDelaySecs, [string]$queueFile, [string]$url) {
         $this.MaxDelaySecs = $maxDelaySecs
@@ -95,7 +96,7 @@ class BackupScheduler {
             catch {
                 Write-Host "备份计时器回调出错: $_" -ForegroundColor Yellow
             }
-        } -
+        }
     }
 
     [void]Schedule() {
@@ -123,8 +124,10 @@ class BackupScheduler {
 
         try {
             Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $this.QueueTempFile -ErrorAction Stop
+            $data = Get-Content $this.QueueTempFile -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $this.LastBackupQueueSize = $data.queue_running.Length + $data.queue_pending.Length
             Move-Item  $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
-            Write-Host "✅ 队列备份完成" -ForegroundColor Green
+            Write-Host "✅ 队列备份完成 ($($this.LastBackupQueueSize) 任务)" -ForegroundColor Green
         }
         catch {
             Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
@@ -148,7 +151,7 @@ if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
 
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
-
+$errorCount = 0;
 while ($true) {
     # 创建进程对象
     $process = New-Object System.Diagnostics.Process
@@ -207,9 +210,14 @@ while ($true) {
             Write-Host "获取到 $($queue.queue_running.Length) 运行中 + $($queue.queue_pending.Length) 等待中 工作流"
         
             if ($queue.queue_running.Length -gt 0 -or $queue.queue_pending.Length -gt 0) {
-                $queue.queue_running | ForEach-Object { Send-Workflow $_ -ErrorAction Stop }
-                $queue.queue_pending | ForEach-Object { Send-Workflow $_ -ErrorAction Stop }
-            
+                $combinedQueue = $queue.queue_running + $queue.queue_pending
+                # 进行偏移，避免一直卡在无法进行的任务上
+                $startOffset = $errorCount % $combinedQueue.Length
+                if ($startOffset) {
+                    $combinedQueue = $combinedQueue[$startOffset..($combinedQueue.Length - 1)] + $combinedQueue[0..$startOffset]
+                }            
+                $combinedQueue | ForEach-Object { Send-Workflow $_ -ErrorAction Stop }
+        
                 # 保留备份
                 Move-Item $queue_file "${queue_file}~" -Force -ErrorAction Ignore
                 Write-Host "✅ 队列恢复完成" -ForegroundColor Green
@@ -230,6 +238,10 @@ while ($true) {
         # XXX: $process.WaitForExit() 会阻塞事件循环，导致 stderr 事件不处理
         while (-not $process.HasExited) {
             Start-Sleep -Seconds 1
+            if ($backupScheduler.LastBackupQueueSize -eq 0) {
+                # 成功处理完所有任务，重置错误计数
+                $errorCount = 0
+            }
         }
         $exitCode = $process.ExitCode
         Write-Host "🔚 进程已退出，退出码: $exitCode" -ForegroundColor Cyan
@@ -240,6 +252,7 @@ while ($true) {
   
     }
     catch {
+        $errorCount += 1
         Write-Host "监控出错：$_"
     }
     finally {
@@ -263,6 +276,5 @@ while ($true) {
         Write-Host "⚠️ 非正常退出码 $exitCode，$restart_delay_secs 秒后自动重启..." -ForegroundColor Yellow
         Start-Sleep -Seconds $restart_delay_secs
     }
-
 }
 #endregion
