@@ -229,7 +229,7 @@ while ($true) {
         Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
         # XXX: $process.WaitForExit() 会阻塞事件循环，导致 stderr 事件不处理
         while (-not $process.HasExited) {
-            Start-Sleep -Milliseconds 10
+            Start-Sleep -Seconds 1
         }
         $exitCode = $process.ExitCode
         Write-Host "🔚 进程已退出，退出码: $exitCode" -ForegroundColor Cyan
