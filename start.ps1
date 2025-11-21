@@ -239,10 +239,17 @@ while ($true) {
         }
   
     }
+    catch {
+        Write-Host "监控出错：$_"
+    }
     finally {
-        # 不关闭服务端，因为可能正在处理重要数据，可以用 ./stop.ps1 进行关闭
-        # 清理资源
         Write-Host "🧹 清理资源..." -ForegroundColor Gray
+        if ($process.HasExited) {
+            $exitCode = $process.ExitCode
+        }
+        else {
+            $process.Kill()
+        }
         Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
         Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
         $backupScheduler.Enabled = $false
