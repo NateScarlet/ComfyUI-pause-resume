@@ -99,17 +99,21 @@ class BackupScheduler {
         }
     }
 
-    [void]Schedule() {
+    [void]Schedule([bool]$immediate = $false) {
         if (-not $this.Enabled) {
             return
         }
         
         $this.Timer.Stop()
-        
-        $currentTime = Get-Date
-        $sinceLastOutput = ($currentTime - $this.LastExecute).TotalSeconds
-        if ($sinceLastOutput -gt $this.MaxDelaySecs) {
-            # 达到最大延迟，立即执行备份
+
+        if (-not $immediate) {
+            # 达到最大延迟时需要立即执行备份
+            $currentTime = Get-Date
+            $sinceLastOutput = ($currentTime - $this.LastExecute).TotalSeconds
+            $immediate = $sinceLastOutput -gt $this.MaxDelaySecs
+        }
+        if ($immediate) {
+            # 立即执行备份
             $this.Execute()
             return
         }
@@ -175,7 +179,8 @@ while ($true) {
         try {
             $data = $Event.SourceEventArgs.Data
             Write-Host $data -ForegroundColor Red
-            $backupScheduler.Schedule()
+            # 包含特定消息时直接触发备份
+            $backupScheduler.Schedule($data -match "got prompt|Prompt executed in")
         }
         catch {
             Write-Host "STDERR事件回调出错: $_" -ForegroundColor Yellow
