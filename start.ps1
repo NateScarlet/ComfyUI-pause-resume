@@ -8,7 +8,7 @@ $program = "$PSScriptRoot\python_embeded\python.exe"
 $program_args = @("-s", "ComfyUI\main.py", "--port", $port)
 $backup_debounce_interval_secs = 5  
 $max_backup_delay_secs = 60
-$restart_delay_secs = 60
+$restart_delay_secs = 10
 
 #endregion
 
