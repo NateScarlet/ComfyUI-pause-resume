@@ -218,8 +218,6 @@ while ($true) {
                 }            
                 $combinedQueue | ForEach-Object { Send-Workflow $_ -ErrorAction Stop }
         
-                # 保留备份
-                Move-Item $queue_file "${queue_file}~" -Force -ErrorAction Ignore
                 Write-Host "✅ 队列恢复完成" -ForegroundColor Green
             }
             else {
