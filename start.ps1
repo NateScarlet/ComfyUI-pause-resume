@@ -103,7 +103,7 @@ class BackupScheduler {
         if (-not $this.Enabled) {
             return
         }
-        
+        $this.Scheduled = $false
         $this.Timer.Stop()
 
         if (-not $immediate) {
