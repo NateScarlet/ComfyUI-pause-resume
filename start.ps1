@@ -50,7 +50,6 @@ function Send-Workflow {
         [PSObject]$workflow
     )
     $number, $id, $prompt, $extra_data, $_ = $workflow
-    Write-Host "处理工作流 $number ($id)"
     $body = @{
         number     = $number
         prompt     = $prompt
