@@ -106,12 +106,6 @@ class BackupScheduler {
     }
 
     [void]Schedule([bool]$immediate = $false) {
-        # 检查是否需要忽略备份
-        if ($this.IgnoreCount -gt 0) {
-            $this.IgnoreCount --
-            return
-        }
-        
         $this.Scheduled = $false
         $this.Timer.Stop()
 
@@ -137,6 +131,11 @@ class BackupScheduler {
     [void]Execute() {
         if (-not $this.Enabled) {
             return 
+        }
+        if ($this.IgnoreCount -gt 0) {
+            # 忽略备份
+            $this.IgnoreCount --
+            return
         }
         $this.LastExecute = Get-Date
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
