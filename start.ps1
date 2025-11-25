@@ -173,7 +173,7 @@ class BackupScheduler {
 
 # 检查端口占用（服务是否已运行）
 if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
-    Write-Host "端口 $port 正被占用" -ForegroundColor Red
+    Write-Host "🚫 端口 $port 正被占用" -ForegroundColor Red
     exit 1
 }    
 
@@ -240,7 +240,7 @@ while ($true) {
         if (Test-Path $queue_file) {
             Write-Host "🔄 恢复队列..." -ForegroundColor Cyan
             $queue = Get-Content $queue_file -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            Write-Host "获取到 $($queue.queue_running.Length) 运行中 + $($queue.queue_pending.Length) 等待中 工作流"
+            Write-Host "📊 获取到 $($queue.queue_running.Length) 运行中 + $($queue.queue_pending.Length) 等待中 工作流"
         
             if ($queue.queue_running.Length -gt 0 -or $queue.queue_pending.Length -gt 0) {
                 $workflows = $queue.queue_running + $queue.queue_pending
@@ -257,7 +257,7 @@ while ($true) {
                     $workflow = $workflows[$i]
                     $id = $workflow[1]
                     if ($seenID.ContainsKey($id)) {
-                        Write-Host "跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                        Write-Host "⏭️ 跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
                         continue
                     }
                     $seenID[$id] = $true
@@ -295,7 +295,7 @@ while ($true) {
     }
     catch {
         $errorCount += 1
-        Write-Host "服务出错(第 $errorCount 次)：$_ "
+        Write-Host "🚨 服务出错(第 $errorCount 次)：$_ " -ForegroundColor Red
     }
     finally {
         Write-Host "🧹 清理资源..." -ForegroundColor Gray
