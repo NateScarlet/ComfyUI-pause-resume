@@ -154,7 +154,7 @@ class BackupScheduler {
             $this.LastBackupQueueSize = $data.queue_running.Length + $data.queue_pending.Length
             
             # 将修改后的数据写回临时文件
-            $data | ConvertTo-Json -Depth 100 | Set-Content $this.QueueTempFile -Force
+            $data | ConvertTo-Json -Compress -Depth 100 | Set-Content $this.QueueTempFile -Force
             
             Move-Item $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
             Write-Host "✅ 队列备份完成 ($($this.LastBackupQueueSize) 任务)" -ForegroundColor Green
