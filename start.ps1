@@ -263,7 +263,7 @@ while ($true) {
                     $seenID[$id] = $true
                     Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
                     # 设置剩余未发送的工作流
-                    $backupScheduler.PendingWorkflows = $workflows[($i + 1)..($workflows.Length - 1)]
+                    $backupScheduler.PendingWorkflows = $workflows[($i + 1)..$workflows.Length]
                     $backupScheduler.IgnoreCount ++
                     Send-Workflow -workflow $workflow -ErrorAction Stop
                 }
