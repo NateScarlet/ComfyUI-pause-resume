@@ -252,9 +252,9 @@ while ($true) {
                 }
                 
                 # 逐个发送工作流，每次发送后更新剩余队列
-                for ($pendingWorkflows) {
+                while ($pendingWorkflows) {
                     $workflow = $pendingWorkflows[0]
-                    $pendingWorkflows = $pendingWorkflows[1..$pendingWorkflows.Length ]
+                    $pendingWorkflows = $pendingWorkflows[1..$pendingWorkflows.Length]
                     Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1])) (剩余 $($pendingWorkflows.Length))" -ForegroundColor Cyan            
                     # 设置剩余未发送的工作流
                     $backupScheduler.PendingWorkflows = $pendingWorkflows
