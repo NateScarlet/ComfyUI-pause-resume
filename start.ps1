@@ -243,26 +243,25 @@ while ($true) {
             Write-Host "获取到 $($queue.queue_running.Length) 运行中 + $($queue.queue_pending.Length) 等待中 工作流"
         
             if ($queue.queue_running.Length -gt 0 -or $queue.queue_pending.Length -gt 0) {
-                $combinedQueue = $queue.queue_running + $queue.queue_pending
+                $pendingWorkflows = $queue.queue_running + $queue.queue_pending
 
                 # 进行偏移，避免一直卡在无法进行的任务上
-                $startOffset = $errorCount % $combinedQueue.Length
+                $startOffset = $errorCount % $pendingWorkflows.Length
                 if ($startOffset) {
-                    $combinedQueue = $combinedQueue[$startOffset..($combinedQueue.Length - 1)] + $combinedQueue[0..($startOffset - 1)]
+                    $pendingWorkflows = $pendingWorkflows[$startOffset..($pendingWorkflows.Length - 1)] + $pendingWorkflows[0..($startOffset - 1)]
                 }
                 
                 # 逐个发送工作流，每次发送后更新剩余队列
-                for ($i = 0; $i -lt $combinedQueue.Length; $i++) {
-                    $workflow = $combinedQueue[$i]
-                    Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1]))... ($($i+1)/$($combinedQueue.Length))" -ForegroundColor Cyan
-                    
+                for ($pendingWorkflows) {
+                    $workflow = $pendingWorkflows[0]
+                    $pendingWorkflows = $pendingWorkflows[1..$pendingWorkflows.Length ]
+                    Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1])) (剩余 $($pendingWorkflows.Length))" -ForegroundColor Cyan            
                     # 设置剩余未发送的工作流
-                    $backupScheduler.PendingWorkflows = $combinedQueue[($i + 1)..($combinedQueue.Length - 1)]
-                    
+                    $backupScheduler.PendingWorkflows = $pendingWorkflows
                     $backupScheduler.IgnoreCount ++
                     Send-Workflow -workflow $workflow -ErrorAction Stop
                 }
-        
+
                 Write-Host "✅ 队列恢复完成" -ForegroundColor Green
             }
             else {
