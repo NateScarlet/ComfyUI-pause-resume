@@ -297,6 +297,7 @@ while ($true) {
         }
         else {
             $process.Kill()
+            $exitCode = -1
         }
         Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
         Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
