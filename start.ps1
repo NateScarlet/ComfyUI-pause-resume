@@ -1,3 +1,6 @@
+#Requires -Version 7.0
+$ErrorActionPreference = "Stop"
+
 #region 配置
 
 $port = $env:COMFYUI_PORT ?? 8188
@@ -67,15 +70,17 @@ function Send-Workflow {
 
 # 备份调度器类
 class BackupScheduler {
-    [bool]$Enabled = $false
     [datetime]$LastExecute
     [System.Timers.Timer]$Timer
+    [bool]$Enabled 
     [bool]$Scheduled = $false
     [int]$MaxDelaySecs
     [string]$QueueFile
     [string]$QueueTempFile
     [string]$Url
     [int]$LastBackupQueueSize = -1
+    [array]$PendingWorkflows = @()
+    [int]$IgnoreCount = 0
 
     BackupScheduler([int]$debounceIntervalSecs, [int]$maxDelaySecs, [string]$queueFile, [string]$url) {
         $this.MaxDelaySecs = $maxDelaySecs
@@ -90,6 +95,7 @@ class BackupScheduler {
                 $scheduler = $Event.MessageData
                 if ($scheduler.Scheduled) {
                     $scheduler.Scheduled = $false
+                    Write-Host "计时器触发备份"
                     $scheduler.Execute()
                 }
             }
@@ -100,17 +106,23 @@ class BackupScheduler {
     }
 
     [void]Schedule([bool]$immediate = $false) {
-        if (-not $this.Enabled) {
+        # 检查是否需要忽略备份
+        if ($this.IgnoreCount -gt 0) {
+            $this.IgnoreCount --
             return
         }
+        
         $this.Scheduled = $false
         $this.Timer.Stop()
 
-        if (-not $immediate) {
+        if (-not $immediate -and $this.LastExecute.Ticks -gt 0) {
             # 达到最大延迟时需要立即执行备份
             $currentTime = Get-Date
             $sinceLastOutput = ($currentTime - $this.LastExecute).TotalSeconds
-            $immediate = $sinceLastOutput -gt $this.MaxDelaySecs
+            if ($sinceLastOutput -gt $this.MaxDelaySecs) {
+                $immediate = $true
+                Write-Host "最大时长触发备份（距离上次备份：$sinceLastOutput 秒）"
+            }
         }
         if ($immediate) {
             # 立即执行备份
@@ -123,14 +135,28 @@ class BackupScheduler {
     }
 
     [void]Execute() {
+        if (-not $this.Enabled) {
+            return 
+        }
         $this.LastExecute = Get-Date
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
 
         try {
             Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $this.QueueTempFile -ErrorAction Stop
             $data = Get-Content $this.QueueTempFile -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            
+            # 将未恢复的任务附加到queue_pending后面
+            if ($this.PendingWorkflows.Length -gt 0) {
+                Write-Host "📋 附加 $($this.PendingWorkflows.Length) 个未恢复任务到备份队列" -ForegroundColor Cyan
+                $data.queue_pending = $data.queue_pending + $this.PendingWorkflows
+            }
+            
             $this.LastBackupQueueSize = $data.queue_running.Length + $data.queue_pending.Length
-            Move-Item  $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
+            
+            # 将修改后的数据写回临时文件
+            $data | ConvertTo-Json -Depth 100 | Set-Content $this.QueueTempFile -Force
+            
+            Move-Item $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
             Write-Host "✅ 队列备份完成 ($($this.LastBackupQueueSize) 任务)" -ForegroundColor Green
         }
         catch {
@@ -156,6 +182,7 @@ if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
 $errorCount = 0;
+
 while ($true) {
     # 创建进程对象
     $process = New-Object System.Diagnostics.Process
@@ -167,7 +194,6 @@ while ($true) {
     $process.StartInfo.RedirectStandardError = $true
     $process.StartInfo.UseShellExecute = $false
 
-
     # 标准输出处理
     $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
         $data = $Event.SourceEventArgs.Data
@@ -175,12 +201,13 @@ while ($true) {
     }
 
     # 标准错误处理（触发备份）
-    $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+    $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -MessageData $backupScheduler -Action {
         try {
+            $scheduler = $Event.MessageData
             $data = $Event.SourceEventArgs.Data
             Write-Host $data -ForegroundColor Red
             # 包含特定消息时直接触发备份
-            $backupScheduler.Schedule($data -match "got prompt|Prompt executed in")
+            $scheduler.Schedule($data -match "got prompt|Prompt executed in")
         }
         catch {
             Write-Host "STDERR事件回调出错: $_" -ForegroundColor Yellow
@@ -208,6 +235,9 @@ while ($true) {
         # 等待服务就绪
         Wait-ServerReady
 
+        Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval_secs}秒, 最大延迟 ${max_backup_delay_secs}秒" -ForegroundColor Gray
+        $backupScheduler.Enabled = $true
+
         # 恢复队列（如果存在）
         if (Test-Path $queue_file) {
             Write-Host "🔄 恢复队列..." -ForegroundColor Cyan
@@ -216,12 +246,24 @@ while ($true) {
         
             if ($queue.queue_running.Length -gt 0 -or $queue.queue_pending.Length -gt 0) {
                 $combinedQueue = $queue.queue_running + $queue.queue_pending
+
                 # 进行偏移，避免一直卡在无法进行的任务上
                 $startOffset = $errorCount % $combinedQueue.Length
                 if ($startOffset) {
-                    $combinedQueue = $combinedQueue[$startOffset..($combinedQueue.Length - 1)] + $combinedQueue[0..$startOffset]
-                }            
-                $combinedQueue | ForEach-Object { Send-Workflow $_ -ErrorAction Stop }
+                    $combinedQueue = $combinedQueue[$startOffset..($combinedQueue.Length - 1)] + $combinedQueue[0..($startOffset - 1)]
+                }
+                
+                # 逐个发送工作流，每次发送后更新剩余队列
+                for ($i = 0; $i -lt $combinedQueue.Length; $i++) {
+                    $workflow = $combinedQueue[$i]
+                    Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1]))... ($($i+1)/$($combinedQueue.Length))" -ForegroundColor Cyan
+                    
+                    # 设置剩余未发送的工作流
+                    $backupScheduler.PendingWorkflows = $combinedQueue[($i + 1)..($combinedQueue.Length - 1)]
+                    
+                    $backupScheduler.IgnoreCount ++
+                    Send-Workflow -workflow $workflow -ErrorAction Stop
+                }
         
                 Write-Host "✅ 队列恢复完成" -ForegroundColor Green
             }
@@ -230,15 +272,8 @@ while ($true) {
             }
         }
     
-        # 队列恢复完成，启用备份功能
-        Write-Host "🔔 启用队列自动备份功能" -ForegroundColor Green
-        $backupScheduler.LastExecute = Get-Date
-        $backupScheduler.Enabled = $true
-        Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval_secs}秒, 最大延迟 ${max_backup_delay_secs}秒" -ForegroundColor Gray
-    
         # 等待进程退出
         Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
-        # XXX: $process.WaitForExit() 会阻塞事件循环，导致 stderr 事件不处理
         while (-not $process.HasExited) {
             Start-Sleep -Seconds 1
             if ($backupScheduler.LastBackupQueueSize -eq 0) {
@@ -256,7 +291,7 @@ while ($true) {
     }
     catch {
         $errorCount += 1
-        Write-Host "监控出错：$_"
+        Write-Host "服务出错(第 $errorCount 次)：$_ "
     }
     finally {
         Write-Host "🧹 清理资源..." -ForegroundColor Gray
@@ -270,6 +305,7 @@ while ($true) {
         Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
         $backupScheduler.Enabled = $false
         $backupScheduler.Scheduled = $false
+        $backupScheduler.IgnoreCount = 0
     }
 
     if ($exitCode -in -1, 0) {
