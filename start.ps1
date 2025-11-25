@@ -201,11 +201,14 @@ while ($true) {
     # 标准错误处理（触发备份）
     $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -MessageData $backupScheduler -Action {
         try {
-            $scheduler = $Event.MessageData
-            $data = $Event.SourceEventArgs.Data
+            [System.Management.Automation.PSEventArgs]$e = $Event
+            [BackupScheduler]$scheduler = $e.MessageData
+            $data = $e.SourceEventArgs.Data
             Write-Host $data -ForegroundColor Red
-            # 包含特定消息时直接触发备份
-            $scheduler.Schedule($data -match "got prompt|Prompt executed in")
+            if ($e.TimeGenerated -gt $scheduler.LastExecute) { 
+                # 包含特定消息时直接触发备份
+                $scheduler.Schedule($data -match "got prompt|Prompt executed in")
+            }
         }
         catch {
             Write-Host "STDERR事件回调出错: $_" -ForegroundColor Yellow
