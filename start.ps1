@@ -69,7 +69,7 @@ function Send-Workflow {
 
 # 备份调度器类
 class BackupScheduler {
-    [datetime]$LastExecute
+    [datetime]$LastExecuted
     [System.Timers.Timer]$Timer
     [bool]$Enabled 
     [bool]$Scheduled = $false
@@ -77,7 +77,7 @@ class BackupScheduler {
     [string]$QueueFile
     [string]$QueueTempFile
     [string]$Url
-    [int]$LastBackupQueueSize = -1
+    [int]$LastQueueSize = -1
     [array]$PendingWorkflows = @()
     [int]$IgnoreCount = 0
 
@@ -108,10 +108,10 @@ class BackupScheduler {
         $this.Scheduled = $false
         $this.Timer.Stop()
 
-        if (-not $immediate -and $this.LastExecute.Ticks -gt 0) {
+        if (-not $immediate -and $this.LastExecuted.Ticks -gt 0) {
             # 达到最大延迟时需要立即执行备份    
             $currentTime = Get-Date
-            $sinceLastOutput = ($currentTime - $this.LastExecute).TotalSeconds
+            $sinceLastOutput = ($currentTime - $this.LastExecuted).TotalSeconds
             if ($sinceLastOutput -gt $this.MaxDelaySecs) {
                 $immediate = $true
                 Write-Host "最大时长触发备份（距离上次备份：$sinceLastOutput 秒）"
@@ -136,7 +136,7 @@ class BackupScheduler {
             $this.IgnoreCount --
             return
         }
-        $this.LastExecute = Get-Date
+        $this.LastExecuted = Get-Date
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
 
         try {
@@ -149,13 +149,13 @@ class BackupScheduler {
                 $data.queue_pending = $data.queue_pending + $this.PendingWorkflows
             }
             
-            $this.LastBackupQueueSize = $data.queue_running.Length + $data.queue_pending.Length
+            $this.LastQueueSize = $data.queue_running.Length + $data.queue_pending.Length
             
             # 将修改后的数据写回临时文件
             $data | ConvertTo-Json -Compress -Depth 100 | Set-Content $this.QueueTempFile -Force
             
             Move-Item $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
-            Write-Host "✅ 队列备份完成 ($($this.LastBackupQueueSize) 任务)" -ForegroundColor Green
+            Write-Host "✅ 队列备份完成 ($($this.LastQueueSize) 任务)" -ForegroundColor Green
         }
         catch {
             Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
@@ -205,7 +205,7 @@ while ($true) {
             [BackupScheduler]$scheduler = $e.MessageData
             $data = $e.SourceEventArgs.Data
             Write-Host $data -ForegroundColor Red
-            if ($e.TimeGenerated -gt $scheduler.LastExecute) { 
+            if ($e.TimeGenerated -gt $scheduler.LastExecuted) { 
                 # 包含特定消息时直接触发备份
                 $scheduler.Schedule($data -match "got prompt|Prompt executed in")
             }
@@ -283,7 +283,7 @@ while ($true) {
         Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
         while (-not $process.HasExited) {
             Start-Sleep -Seconds 1
-            if ($backupScheduler.LastBackupQueueSize -eq 0) {
+            if ($backupScheduler.LastQueueSize -eq 0) {
                 # 成功处理完所有任务，重置尝试计数
                 $attemptCount = 0
             }
