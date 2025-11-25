@@ -109,7 +109,7 @@ class BackupScheduler {
         $this.Timer.Stop()
 
         if (-not $immediate -and $this.LastExecute.Ticks -gt 0) {
-            # 达到最大延迟时需要立即执行备份
+            # 达到最大延迟时需要立即执行备份    
             $currentTime = Get-Date
             $sinceLastOutput = ($currentTime - $this.LastExecute).TotalSeconds
             if ($sinceLastOutput -gt $this.MaxDelaySecs) {
@@ -251,12 +251,19 @@ while ($true) {
                     $workflows = $workflows[$startOffset..($workflows.Length - 1)] + $workflows[0..($startOffset - 1)]
                 }
                 
+                $seenID = @{}
                 # 逐个发送工作流，每次发送后更新剩余队列
                 for ($i = 0; $i -lt $workflows.Length; $i++) {
                     $workflow = $workflows[$i]
-                    Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1])) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                    $id = $workflow[1]
+                    if ($seenID.ContainsKey($id)) {
+                        Write-Host "跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                        continue
+                    }
+                    $seenID[$id] = $true
+                    Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
                     # 设置剩余未发送的工作流
-                    $backupScheduler.PendingWorkflows = $workflows[$i..($workflows.Length-1)]
+                    $backupScheduler.PendingWorkflows = $workflows[$i..($workflows.Length - 1)]
                     $backupScheduler.IgnoreCount ++
                     Send-Workflow -workflow $workflow -ErrorAction Stop
                 }
