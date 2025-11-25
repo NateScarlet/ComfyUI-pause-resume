@@ -179,7 +179,7 @@ if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
 
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
-$errorCount = 0;
+$attemptCount = 0;
 
 while ($true) {
     # 创建进程对象
@@ -249,7 +249,7 @@ while ($true) {
                 $workflows = $queue.queue_running + $queue.queue_pending
 
                 # 进行偏移，避免一直卡在无法进行的任务上
-                $startOffset = $errorCount % $workflows.Length
+                $startOffset = $attemptCount % $workflows.Length
                 if ($startOffset) {
                     $workflows = $workflows[$startOffset..($workflows.Length - 1)] + $workflows[0..($startOffset - 1)]
                 }
@@ -284,8 +284,8 @@ while ($true) {
         while (-not $process.HasExited) {
             Start-Sleep -Seconds 1
             if ($backupScheduler.LastBackupQueueSize -eq 0) {
-                # 成功处理完所有任务，重置错误计数
-                $errorCount = 0
+                # 成功处理完所有任务，重置尝试计数
+                $attemptCount = 0
             }
         }
         $exitCode = $process.ExitCode
@@ -297,8 +297,7 @@ while ($true) {
   
     }
     catch {
-        $errorCount += 1
-        Write-Host "🚨 服务出错(第 $errorCount 次)：$_ " -ForegroundColor Red
+        Write-Host "🚨 服务出错(第 $($attemptCount+1) 次)：$_ " -ForegroundColor Red
     }
     finally {
         Write-Host "🧹 清理资源..." -ForegroundColor Gray
@@ -319,9 +318,9 @@ while ($true) {
     if ($exitCode -in -1, 0) {
         exit $exitCode
     }
-    else {
-        Write-Host "⚠️ 非正常退出码 $exitCode，$restart_delay_secs 秒后自动重启..." -ForegroundColor Yellow
-        Start-Sleep -Seconds $restart_delay_secs
-    }
+
+    Write-Host "⚠️ 非正常退出码 $exitCode，$restart_delay_secs 秒后自动重启..." -ForegroundColor Yellow
+    Start-Sleep -Seconds $restart_delay_secs
+    $attemptCount ++
 }
 #endregion
