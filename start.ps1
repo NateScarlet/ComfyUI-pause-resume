@@ -243,21 +243,20 @@ while ($true) {
             Write-Host "获取到 $($queue.queue_running.Length) 运行中 + $($queue.queue_pending.Length) 等待中 工作流"
         
             if ($queue.queue_running.Length -gt 0 -or $queue.queue_pending.Length -gt 0) {
-                $pendingWorkflows = $queue.queue_running + $queue.queue_pending
+                $workflows = $queue.queue_running + $queue.queue_pending
 
                 # 进行偏移，避免一直卡在无法进行的任务上
-                $startOffset = $errorCount % $pendingWorkflows.Length
+                $startOffset = $errorCount % $workflows.Length
                 if ($startOffset) {
-                    $pendingWorkflows = $pendingWorkflows[$startOffset..($pendingWorkflows.Length - 1)] + $pendingWorkflows[0..($startOffset - 1)]
+                    $workflows = $workflows[$startOffset..($workflows.Length - 1)] + $workflows[0..($startOffset - 1)]
                 }
                 
                 # 逐个发送工作流，每次发送后更新剩余队列
-                while ($pendingWorkflows) {
-                    $workflow = $pendingWorkflows[0]
-                    $pendingWorkflows = $pendingWorkflows[1..$pendingWorkflows.Length]
-                    Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1])) (剩余 $($pendingWorkflows.Length))" -ForegroundColor Cyan            
+                for ($i = 0; $i -lt $workflows.Length; $i++) {
+                    $workflow = $workflows[$i]
+                    Write-Host "📤 发送工作流 $($workflow[0]) ($($workflow[1])) ($i/$($workflows.Length))" -ForegroundColor Cyan            
                     # 设置剩余未发送的工作流
-                    $backupScheduler.PendingWorkflows = $pendingWorkflows
+                    $backupScheduler.PendingWorkflows = $workflows[$i..($workflows.Length-1)]
                     $backupScheduler.IgnoreCount ++
                     Send-Workflow -workflow $workflow -ErrorAction Stop
                 }
