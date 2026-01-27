@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 #region 配置
 
 $port = $env:COMFYUI_PORT ?? 8188
-$url = "http://localhost:$port"
+$url = "http://127.0.0.1:$port"
 $info_file = "$PSScriptRoot\.process_info"
 $queue_file = "$PSScriptRoot\queue.json"
 $program = "$PSScriptRoot\python_embeded\python.exe"
@@ -22,7 +22,7 @@ function Wait-ServerReady {
     $interval = 1
     $elapsed = 0
 
-    Write-Host "⌛ 等待服务启动 (http://localhost:$port)..." -ForegroundColor Cyan
+    Write-Host "⌛ 等待服务启动 ($url)..." -ForegroundColor Cyan
 
     while ($elapsed -lt $Timeout) {
         try {
