@@ -98,6 +98,7 @@ class BackupScheduler {
     [int]$LastQueueSize = -1
     [array]$PendingWorkflows = @()
     [int]$IgnoreCount = 0
+    [System.Net.Http.HttpClient]$HttpClient
 
     BackupScheduler([int]$debounceIntervalSecs, [int]$maxDelaySecs, [string]$queueFile, [string]$url) {
         $this.MaxDelaySecs = $maxDelaySecs
@@ -107,6 +108,10 @@ class BackupScheduler {
         $this.Timer = New-Object System.Timers.Timer
         $this.Timer.Interval = $debounceIntervalSecs * 1000
         $this.Timer.AutoReset = $false
+
+        $this.HttpClient = New-Object System.Net.Http.HttpClient
+        $this.HttpClient.BaseAddress = [Uri]$url
+
         Register-ObjectEvent -InputObject $this.Timer -EventName Elapsed  -MessageData $this  -Action {
             try {
                 $scheduler = $Event.MessageData
@@ -158,8 +163,18 @@ class BackupScheduler {
         Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
 
         try {
-            Invoke-WebRequest -Uri "$($this.Url)/queue" -Method Get -OutFile $this.QueueTempFile -ErrorAction Stop
-            $data = Get-Content $this.QueueTempFile -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $task = $this.HttpClient.GetAsync("/queue")
+            $task.Wait()
+            $response = $task.Result
+            
+            if (-not $response.IsSuccessStatusCode) {
+                throw "获取队列失败: $($response.StatusCode)"
+            }
+
+            $contentTask = $response.Content.ReadAsStringAsync()
+            $contentTask.Wait()
+            $json = $contentTask.Result
+            $data = $json | ConvertFrom-Json -ErrorAction Stop
             
             # 将未恢复的任务附加到queue_pending后面
             if ($this.PendingWorkflows.Length -gt 0) {
@@ -182,6 +197,7 @@ class BackupScheduler {
 
     [void]Dispose() {
         $this.Timer.Dispose()
+        $this.HttpClient.Dispose()
     }
 }
 
@@ -274,29 +290,20 @@ while ($true) {
                 }
                 
                 $seenID = @{}
-                $httpClient = New-Object System.Net.Http.HttpClient
-                $httpClient.BaseAddress = [Uri]$url
-                $httpClient.Timeout = [TimeSpan]::FromSeconds(10)
-
-                try {
-                    # 逐个发送工作流，每次发送后更新剩余队列
-                    for ($i = 0; $i -lt $workflows.Length; $i++) {
-                        $workflow = $workflows[$i]
-                        $id = $workflow[1]
-                        if ($seenID.ContainsKey($id)) {
-                            Write-Host "⏭️ 跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
-                            continue
-                        }
-                        $seenID[$id] = $true
-                        Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
-                        # 设置剩余未发送的工作流
-                        $backupScheduler.PendingWorkflows = $workflows[($i + 1)..$workflows.Length]
-                        $backupScheduler.IgnoreCount ++
-                        Send-Workflow -workflow $workflow -HttpClient $httpClient -ErrorAction Stop
+                # 逐个发送工作流，每次发送后更新剩余队列
+                for ($i = 0; $i -lt $workflows.Length; $i++) {
+                    $workflow = $workflows[$i]
+                    $id = $workflow[1]
+                    if ($seenID.ContainsKey($id)) {
+                        Write-Host "⏭️ 跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                        continue
                     }
-                }
-                finally {
-                    $httpClient.Dispose()
+                    $seenID[$id] = $true
+                    Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                    # 设置剩余未发送的工作流
+                    $backupScheduler.PendingWorkflows = $workflows[($i + 1)..$workflows.Length]
+                    $backupScheduler.IgnoreCount ++
+                    Send-Workflow -workflow $workflow -HttpClient $backupScheduler.HttpClient -ErrorAction Stop
                 }
                 
 
