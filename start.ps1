@@ -47,7 +47,8 @@ function Wait-ServerReady {
 function Send-Workflow {
     param (
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
-        [PSObject]$workflow
+        [PSObject]$workflow,
+        [System.Net.Http.HttpClient]$HttpClient
     )
     $number, $id, $prompt, $extra_data, $_ = $workflow
     $body = @{
@@ -61,6 +62,23 @@ function Send-Workflow {
     }
     $body = $body | ConvertTo-Json -Compress -Depth 100
     
+    if ($HttpClient) {
+        $content = New-Object System.Net.Http.StringContent($body, [System.Text.Encoding]::UTF8, "application/json")
+        try {
+            $task = $HttpClient.PostAsync("/prompt", $content)
+            $task.Wait()
+            $response = $task.Result
+            
+            if (-not $response.IsSuccessStatusCode) {
+                Write-Error "工作流入列失败 状态码: $($response.StatusCode)"
+            }
+        }
+        finally {
+            $content.Dispose()
+        }
+        return
+    }
+
     $response = Invoke-WebRequest -Uri "$url/prompt" -Method Post -Body $body -ContentType "application/json"
     if ($response.StatusCode -ne 200) {
         Write-Error "工作流入列失败 状态码: $($response.StatusCode), 响应: $($response.Content)"
@@ -182,6 +200,7 @@ $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_b
 $attemptCount = 0;
 
 while ($true) {
+    $errorOccurred = $false
     # 创建进程对象
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo.FileName = $program
@@ -255,20 +274,29 @@ while ($true) {
                 }
                 
                 $seenID = @{}
-                # 逐个发送工作流，每次发送后更新剩余队列
-                for ($i = 0; $i -lt $workflows.Length; $i++) {
-                    $workflow = $workflows[$i]
-                    $id = $workflow[1]
-                    if ($seenID.ContainsKey($id)) {
-                        Write-Host "⏭️ 跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
-                        continue
+                $httpClient = New-Object System.Net.Http.HttpClient
+                $httpClient.BaseAddress = [Uri]$url
+                $httpClient.Timeout = [TimeSpan]::FromSeconds(10)
+
+                try {
+                    # 逐个发送工作流，每次发送后更新剩余队列
+                    for ($i = 0; $i -lt $workflows.Length; $i++) {
+                        $workflow = $workflows[$i]
+                        $id = $workflow[1]
+                        if ($seenID.ContainsKey($id)) {
+                            Write-Host "⏭️ 跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                            continue
+                        }
+                        $seenID[$id] = $true
+                        Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                        # 设置剩余未发送的工作流
+                        $backupScheduler.PendingWorkflows = $workflows[($i + 1)..$workflows.Length]
+                        $backupScheduler.IgnoreCount ++
+                        Send-Workflow -workflow $workflow -HttpClient $httpClient -ErrorAction Stop
                     }
-                    $seenID[$id] = $true
-                    Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
-                    # 设置剩余未发送的工作流
-                    $backupScheduler.PendingWorkflows = $workflows[($i + 1)..$workflows.Length]
-                    $backupScheduler.IgnoreCount ++
-                    Send-Workflow -workflow $workflow -ErrorAction Stop
+                }
+                finally {
+                    $httpClient.Dispose()
                 }
                 
 
@@ -297,6 +325,7 @@ while ($true) {
   
     }
     catch {
+        $errorOccurred = $true
         Write-Host "🚨 服务出错(第 $($attemptCount+1) 次)：$_ " -ForegroundColor Red
     }
     finally {
@@ -315,7 +344,7 @@ while ($true) {
         $backupScheduler.IgnoreCount = 0
     }
 
-    if ($exitCode -in -1, 0) {
+    if (-not $errorOccurred -and $exitCode -in -1, 0) {
         exit $exitCode
     }
 
