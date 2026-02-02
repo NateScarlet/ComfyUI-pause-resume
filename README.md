@@ -2,7 +2,7 @@
 
 将脚本放置在便携版 ComfyUI 的根目录中，使用 `start.cmd` 启动，`stop.cmd` 暂停（保存队列并结束进程），下次使用 `start.cmd` 时会自动恢复之前的队列。
 
-启动参数可以在 `start.ps1` 文件中调整。
+启动配置可以在 `.env` 文件或环境变量中调整。
 
 > **依赖要求**：需要 PowerShell 7 (pwsh7) 或更高版本。
 
@@ -11,7 +11,7 @@
 - **自动恢复**：启动时自动恢复上次暂停时保存的队列
 - **队列备份**：运行过程中自动备份队列，防止意外中断导致任务丢失
 - **进程管理**：完善的进程启动、停止和监控机制
-- **端口配置**：支持通过环境变量 `COMFYUI_PORT` 自定义端口
+- **灵活配置**：支持 `.env` 文件和环境变量配置（如 `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`）
 
 ## 使用说明
 
@@ -44,14 +44,15 @@ save.cmd
 
 ## 配置选项
 
-在 `start.ps1` 文件中可以调整以下参数：
+### 环境变量与 .env
 
-```powershell
-$port = 8188                            # ComfyUI 服务端口
-$backup_debounce_interval_secs = 5      # 队列备份防抖间隔（秒）
-$max_backup_delay_secs = 60            # 最大备份延迟时间（秒）
-$restart_delay_secs = 60               # 进程异常退出后重启延迟（秒）
-```
+支持在脚本同目录下创建 `.env` 文件或直接设置环境变量：
+
+- `COMFYUI_PORT`: 服务端口（默认 `8188`）
+- `COMFYUI_EXTRA_ARGS`: 传递给 ComfyUI 的额外参数（例如 `--preview-method auto`）
+- `COMFYUI_BACKUP_DEBOUNCE_SEC`: 队列备份防抖间隔（秒，默认 `30`）
+- `COMFYUI_MAX_BACKUP_DELAY_SEC`: 最大备份延迟时间（秒，默认 `300`）
+- `COMFYUI_RESTART_DELAY_SEC`: 进程异常退出后重启延迟（秒，默认 `10`）
 
 ## 技术说明
 

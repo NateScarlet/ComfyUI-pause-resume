@@ -3,15 +3,36 @@ $ErrorActionPreference = "Stop"
 
 #region 配置
 
+
+# 加载 .env 文件
+if (Test-Path "$PSScriptRoot\.env") {
+    Get-Content "$PSScriptRoot\.env" | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and $line[0] -ne '#') {
+            $parts = $line -split '=', 2
+            if ($parts.Count -eq 2) {
+                $name = $parts[0].Trim()
+                $value = $parts[1].Trim()
+                # 去除可能的引号
+                if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+                    $value = $value.Substring(1, $value.Length - 2)
+                }
+                [Environment]::SetEnvironmentVariable($name, $value, "Process")
+            }
+        }
+    }
+}
+
 $port = $env:COMFYUI_PORT ?? 8188
 $url = "http://127.0.0.1:$port"
 $info_file = "$PSScriptRoot\.process_info"
 $queue_file = "$PSScriptRoot\queue.json"
 $program = "$PSScriptRoot\python_embeded\python.exe"
-$program_args = @("-s", "ComfyUI\main.py", "--port", $port)
-$backup_debounce_interval_secs = 30
-$max_backup_delay_secs = 300
-$restart_delay_secs = 10
+$extra_args = if ($env:COMFYUI_EXTRA_ARGS) { $env:COMFYUI_EXTRA_ARGS -split "\s+" } else { @() }
+$program_args = @("-s", "ComfyUI\main.py", "--port", $port) + $extra_args
+$backup_debounce_interval_secs = $env:COMFYUI_BACKUP_DEBOUNCE_SEC ?? 30
+$max_backup_delay_secs = $env:COMFYUI_MAX_BACKUP_DELAY_SEC ?? 300
+$restart_delay_secs = $env:COMFYUI_RESTART_DELAY_SEC ?? 10
 
 #endregion
 
