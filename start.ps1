@@ -226,6 +226,17 @@ class BackupScheduler {
 
 #region 主程序
 
+
+# 进程清理钩子：确保关闭窗口时也能结束子进程
+$script:current_process = $null
+$exit_event = "ComfyUI_Process_Exit_Handler"
+Get-EventSubscriber -SourceIdentifier $exit_event -ErrorAction SilentlyContinue | Unregister-Event
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
+    if ($script:current_process -and -not $script:current_process.HasExited) {
+        $script:current_process.Kill()
+    }
+}
+
 # 检查端口占用（服务是否已运行）
 if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
     Write-Host "🚫 端口 $port 正被占用" -ForegroundColor Red
@@ -240,6 +251,7 @@ while ($true) {
     $errorOccurred = $false
     # 创建进程对象
     $process = New-Object System.Diagnostics.Process
+    $script:current_process = $process
     $process.StartInfo.FileName = $program
     $process.StartInfo.Arguments = $program_args -join " "
     $process.StartInfo.WorkingDirectory = $PSScriptRoot
