@@ -73,7 +73,8 @@ function Send-Workflow {
     )
     $number, $id, $prompt, $extra_data, $_ = $workflow
     $body = @{
-        number     = $number
+        # 忽略序号让服务端重新排序
+        # number     = $number 
         prompt     = $prompt
         prompt_id  = $id
         extra_data = $extra_data
