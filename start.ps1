@@ -384,13 +384,13 @@ while ($true) {
                 # 成功处理完所有任务，重置尝试计数
                 $attemptCount = 0
                 if ($wasPreventingSleep) {
-                    Write-Host "💤 队列已空，恢复系统自动休眠" -ForegroundColor Gray
+                    Write-Host "💤 队列已空，允许系统休眠" -ForegroundColor Gray
                     [PowerManagement_54709e2a07a2]::AllowSleep()
                     $wasPreventingSleep = $false
                 }
             } elseif ($backupScheduler.LastQueueSize -gt 0) {
                 if (-not $wasPreventingSleep) {
-                    Write-Host "☕ 队列有任务，已阻止系统休眠" -ForegroundColor Yellow
+                    Write-Host "☕ 队列有任务，阻止系统休眠" -ForegroundColor Yellow
                     [PowerManagement_54709e2a07a2]::PreventSleep()
                     $wasPreventingSleep = $true
                 }
