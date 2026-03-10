@@ -223,6 +223,31 @@ class BackupScheduler {
     }
 }
 
+if (-not ("PowerManagement_54709e2a07a2" -as [type])) {
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class PowerManagement_54709e2a07a2 {
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern uint SetThreadExecutionState(uint esFlags);
+    public const uint ES_CONTINUOUS = 0x80000000;
+    public const uint ES_SYSTEM_REQUIRED = 0x00000001;
+    
+    public static void PreventSleep() {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    }
+    
+    public static void AllowSleep() {
+        SetThreadExecutionState(ES_CONTINUOUS);
+    }
+}
+'@
+    } catch {
+        Write-Host "⚠️ 定义 PowerManagement 类时出错：$_" -ForegroundColor Yellow
+    }
+}
+
 #endregion
 
 #region 主程序
@@ -247,6 +272,7 @@ if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
 $attemptCount = 0;
+[bool]$wasPreventingSleep = $false
 
 while ($true) {
     $errorOccurred = $false
@@ -324,6 +350,8 @@ while ($true) {
                 }
                 
                 $seenID = @{}
+                # 在开始发送前先设置队列大小，确保监控循环立即阻止休眠
+                $backupScheduler.LastQueueSize = $workflows.Length
                 # 逐个发送工作流，每次发送后更新剩余队列
                 for ($i = 0; $i -lt $workflows.Length; $i++) {
                     $workflow = $workflows[$i]
@@ -355,6 +383,17 @@ while ($true) {
             if ($backupScheduler.LastQueueSize -eq 0) {
                 # 成功处理完所有任务，重置尝试计数
                 $attemptCount = 0
+                if ($wasPreventingSleep) {
+                    Write-Host "💤 队列已空，恢复系统自动休眠" -ForegroundColor Gray
+                    [PowerManagement_54709e2a07a2]::AllowSleep()
+                    $wasPreventingSleep = $false
+                }
+            } elseif ($backupScheduler.LastQueueSize -gt 0) {
+                if (-not $wasPreventingSleep) {
+                    Write-Host "☕ 队列有任务，已阻止系统休眠" -ForegroundColor Yellow
+                    [PowerManagement_54709e2a07a2]::PreventSleep()
+                    $wasPreventingSleep = $true
+                }
             }
         }
         $exitCode = $process.ExitCode
@@ -371,6 +410,10 @@ while ($true) {
     }
     finally {
         Write-Host "🧹 清理资源..." -ForegroundColor Gray
+        if ($wasPreventingSleep) {
+            [PowerManagement_54709e2a07a2]::AllowSleep()
+            $wasPreventingSleep = $false
+        }
         if ($process.HasExited) {
             $exitCode = $process.ExitCode
         }
