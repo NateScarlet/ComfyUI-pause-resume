@@ -98,7 +98,9 @@ function Send-Workflow {
             }
         }
         finally {
-            $content.Dispose()
+            if ($null -ne $content) {
+                $content.Dispose()
+            }
         }
         return
     }
@@ -123,6 +125,7 @@ class BackupScheduler {
     [array]$PendingWorkflows = @()
     [int]$IgnoreCount = 0
     [System.Net.Http.HttpClient]$HttpClient
+    [object]$SyncRoot = [object]::new()
 
     BackupScheduler([int]$debounceIntervalSecs, [int]$maxDelaySecs, [string]$queueFile, [string]$url) {
         $this.MaxDelaySecs = $maxDelaySecs
@@ -139,10 +142,16 @@ class BackupScheduler {
         Register-ObjectEvent -InputObject $this.Timer -EventName Elapsed  -MessageData $this  -Action {
             try {
                 $scheduler = $Event.MessageData
-                if ($scheduler.Scheduled) {
-                    $scheduler.Scheduled = $false
-                    Write-Host "计时器触发备份"
-                    $scheduler.Execute()
+                [System.Threading.Monitor]::Enter($scheduler.SyncRoot)
+                try {
+                    if ($scheduler.Scheduled) {
+                        $scheduler.Scheduled = $false
+                        Write-Host "计时器触发备份"
+                        $scheduler.ExecuteLocked()
+                    }
+                }
+                finally {
+                    [System.Threading.Monitor]::Exit($scheduler.SyncRoot)
                 }
             }
             catch {
@@ -152,29 +161,27 @@ class BackupScheduler {
     }
 
     [void]Schedule([bool]$immediate = $false) {
-        $this.Scheduled = $false
-        $this.Timer.Stop()
-
-        if (-not $immediate -and $this.LastExecuted.Ticks -gt 0) {
-            # 达到最大延迟时需要立即执行备份    
-            $currentTime = Get-Date
-            $sinceLastOutput = ($currentTime - $this.LastExecuted).TotalSeconds
-            if ($sinceLastOutput -gt $this.MaxDelaySecs) {
-                $immediate = $true
-                Write-Host "最大时长触发备份（距离上次备份：$sinceLastOutput 秒）"
-            }
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            $this.ScheduleLocked($immediate)
         }
-        if ($immediate) {
-            # 立即执行备份
-            $this.Execute()
-            return
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
         }
-        
-        $this.Scheduled = $true
-        $this.Timer.Start()
     }
 
     [void]Execute() {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            $this.ExecuteLocked()
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    # 内部调用的执行逻辑，假设已持有锁
+    [void]ExecuteLocked() {
         if (-not $this.Enabled) {
             return 
         }
@@ -183,10 +190,15 @@ class BackupScheduler {
             $this.IgnoreCount --
             return
         }
+        # 保存 PendingWorkflows 的快照，避免在网络 IO 时持有锁太久
+        $pending = $this.PendingWorkflows
         $this.LastExecuted = Get-Date
-        Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
-
+        
+        # 释放锁以进行网络操作（可选，但推荐）
+        [System.Threading.Monitor]::Exit($this.SyncRoot)
         try {
+            Write-Host "💾 备份队列到 $($this.QueueFile)" -ForegroundColor Yellow
+
             $task = $this.HttpClient.GetAsync("/queue")
             $task.Wait()
             $response = $task.Result
@@ -201,23 +213,121 @@ class BackupScheduler {
             $data = $json | ConvertFrom-Json -ErrorAction Stop
             
             # 将未恢复的任务附加到queue_pending后面
-            if ($this.PendingWorkflows.Length -gt 0) {
-                Write-Host "📋 附加 $($this.PendingWorkflows.Length) 个未恢复任务到备份队列" -ForegroundColor Cyan
-                $data.queue_pending = $data.queue_pending + $this.PendingWorkflows
+            if ($pending.Length -gt 0) {
+                Write-Host "📋 附加 $($pending.Length) 个未恢复任务到备份队列" -ForegroundColor Cyan
+                $data.queue_pending = $data.queue_pending + $pending
             }
             
-            $this.LastQueueSize = $data.queue_running.Length + $data.queue_pending.Length
+            $queueSize = $data.queue_running.Length + $data.queue_pending.Length
             
             # 将修改后的数据写回临时文件
             $data | ConvertTo-Json -Compress -Depth 100 | Set-Content $this.QueueTempFile -Force
             
             Move-Item $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
-            Write-Host "✅ 队列备份完成 ($($this.LastQueueSize) 任务)" -ForegroundColor Green
+            Write-Host "✅ 队列备份完成 ($($queueSize) 任务)" -ForegroundColor Green
+            
+            # 重新获取锁以更新状态
+            [System.Threading.Monitor]::Enter($this.SyncRoot)
+            try {
+                $this.LastQueueSize = $queueSize
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($this.SyncRoot)
+            }
         }
         catch {
             Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
         }
+        finally {
+            # 重新获取锁以便外部的 finally 能够正确释放它
+            [System.Threading.Monitor]::Enter($this.SyncRoot)
+        }
     }
+    [void]UpdatePending([array]$pending, [int]$ignoreIncrement) {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            $this.PendingWorkflows = $pending
+            $this.IgnoreCount += $ignoreIncrement
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    [int]GetQueueSize() {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            return $this.LastQueueSize
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    [void]SetQueueSize([int]$size) {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            $this.LastQueueSize = $size
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    [void]SetEnabled([bool]$enabled) {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            $this.Enabled = $enabled
+            if (-not $enabled) {
+                $this.Scheduled = $false
+                $this.IgnoreCount = 0
+                $this.PendingWorkflows = @()
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    [datetime]GetLastExecuted() {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try { return $this.LastExecuted } finally { [System.Threading.Monitor]::Exit($this.SyncRoot) }
+    }
+
+    [void]ScheduleIfMatch([datetime]$timeGenerated, [string]$data) {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try {
+            if ($timeGenerated -gt $this.LastExecuted) {
+                $this.ScheduleLocked($data -match "got prompt|Prompt executed in")
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    # 内部调用的调度逻辑，假设已持有锁
+    [void]ScheduleLocked([bool]$immediate) {
+        $this.Scheduled = $false
+        $this.Timer.Stop()
+
+        if (-not $immediate -and $this.LastExecuted.Ticks -gt 0) {
+            $currentTime = Get-Date
+            $sinceLastOutput = ($currentTime - $this.LastExecuted).TotalSeconds
+            if ($sinceLastOutput -gt $this.MaxDelaySecs) {
+                $immediate = $true
+                Write-Host "最大时长触发备份（距离上次备份：$sinceLastOutput 秒）"
+            }
+        }
+        if ($immediate) {
+            $this.ExecuteLocked()
+            return
+        }
+        
+        $this.Scheduled = $true
+        $this.Timer.Start()
+    }
+
 
     [void]Dispose() {
         $this.Timer.Dispose()
@@ -338,11 +448,12 @@ if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
 
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
-$script:programManager = [ExternalProgramManager]::new($idle_program, $busy_program)
 $attemptCount = 0;
 [bool]$wasPreventingSleep = $false
 
 while ($true) {
+    # 每次启动进程时创建程序管理器，确保 disposal 后重启可用
+    $script:programManager = [ExternalProgramManager]::new($idle_program, $busy_program)
     $errorOccurred = $false
     # 创建进程对象
     $process = New-Object System.Diagnostics.Process
@@ -368,10 +479,7 @@ while ($true) {
             [BackupScheduler]$scheduler = $e.MessageData
             $data = $e.SourceEventArgs.Data
             Write-Host $data -ForegroundColor Red
-            if ($e.TimeGenerated -gt $scheduler.LastExecuted) { 
-                # 包含特定消息时直接触发备份
-                $scheduler.Schedule($data -match "got prompt|Prompt executed in")
-            }
+            $scheduler.ScheduleIfMatch($e.TimeGenerated, $data)
         }
         catch {
             Write-Host "STDERR事件回调出错: $_" -ForegroundColor Yellow
@@ -400,7 +508,7 @@ while ($true) {
         Wait-ServerReady
 
         Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval_secs}秒, 最大延迟 ${max_backup_delay_secs}秒" -ForegroundColor Gray
-        $backupScheduler.Enabled = $true
+        $backupScheduler.SetEnabled($true)
 
         # 恢复队列（如果存在）
         if (Test-Path $queue_file) {
@@ -419,7 +527,7 @@ while ($true) {
                 
                 $seenID = @{}
                 # 在开始发送前先设置队列大小，确保监控循环立即阻止休眠
-                $backupScheduler.LastQueueSize = $workflows.Length
+                $backupScheduler.SetQueueSize($workflows.Length)
                 # 逐个发送工作流，每次发送后更新剩余队列
                 for ($i = 0; $i -lt $workflows.Length; $i++) {
                     $workflow = $workflows[$i]
@@ -431,8 +539,7 @@ while ($true) {
                     $seenID[$id] = $true
                     Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
                     # 设置剩余未发送的工作流
-                    $backupScheduler.PendingWorkflows = $workflows[($i + 1)..$workflows.Length]
-                    $backupScheduler.IgnoreCount ++
+                    $backupScheduler.UpdatePending($workflows[($i + 1)..$workflows.Length], 1)
                     Send-Workflow -workflow $workflow -HttpClient $backupScheduler.HttpClient -ErrorAction Stop
                 }
                 
@@ -450,20 +557,25 @@ while ($true) {
             Start-Sleep -Seconds 1
             
             # 更新外部程序状态
-            $script:programManager.UpdateState($backupScheduler.LastQueueSize)
+            $queueSize = $backupScheduler.GetQueueSize()
+            $script:programManager.UpdateState($queueSize)
 
-            if ($backupScheduler.LastQueueSize -eq 0) {
+            if ($queueSize -eq 0) {
                 # 成功处理完所有任务，重置尝试计数
                 $attemptCount = 0
                 if ($wasPreventingSleep) {
                     Write-Host "💤 队列已空，允许系统休眠" -ForegroundColor Gray
-                    [PowerManagement_54709e2a07a2]::AllowSleep()
+                    if ("PowerManagement_54709e2a07a2" -as [type]) {
+                        [PowerManagement_54709e2a07a2]::AllowSleep()
+                    }
                     $wasPreventingSleep = $false
                 }
-            } elseif ($backupScheduler.LastQueueSize -gt 0) {
+            } elseif ($queueSize -gt 0) {
                 if (-not $wasPreventingSleep) {
                     Write-Host "☕ 队列有任务，阻止系统休眠" -ForegroundColor Yellow
-                    [PowerManagement_54709e2a07a2]::PreventSleep()
+                    if ("PowerManagement_54709e2a07a2" -as [type]) {
+                        [PowerManagement_54709e2a07a2]::PreventSleep()
+                    }
                     $wasPreventingSleep = $true
                 }
             }
@@ -482,25 +594,36 @@ while ($true) {
     }
     finally {
         Write-Host "🧹 清理资源..." -ForegroundColor Gray
+        # 1. 注销事件，避免重复注册或重启后旧事件仍在触发
+        if ($stdoutEvent) { Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue }
+        if ($stderrEvent) { Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue }
+        
+        # 2. 检查电源状态
         if ($wasPreventingSleep) {
-            [PowerManagement_54709e2a07a2]::AllowSleep()
+            if ("PowerManagement_54709e2a07a2" -as [type]) {
+                try { [PowerManagement_54709e2a07a2]::AllowSleep() } catch {}
+            }
             $wasPreventingSleep = $false
         }
+
+        # 3. 释放程序管理器（在循环内初始化）
         if ($script:programManager) {
             $script:programManager.Dispose()
+            $script:programManager = $null
         }
-        if ($process.HasExited) {
-            $exitCode = $process.ExitCode
+
+        # 4. 确保子进程被清理并获取最后的退出码
+        if ($process) {
+            if (-not $process.HasExited) {
+                try { $process.Kill() } catch {}
+                $exitCode = -1
+            } else {
+                $exitCode = $process.ExitCode
+            }
         }
-        else {
-            $process.Kill()
-            $exitCode = -1
-        }
-        Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
-        Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
-        $backupScheduler.Enabled = $false
-        $backupScheduler.Scheduled = $false
-        $backupScheduler.IgnoreCount = 0
+
+        # 5. 禁用备份调度器（会重置 IgnoreCount 和 PendingWorkflows，修复问题3）
+        $backupScheduler.SetEnabled($false)
     }
 
     if (-not $errorOccurred -and $exitCode -in -1, 0) {
