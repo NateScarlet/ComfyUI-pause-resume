@@ -363,6 +363,7 @@ class ExternalProgramManager {
     [string]$BusyPath
     [System.Diagnostics.Process]$IdleProcess
     [System.Diagnostics.Process]$BusyProcess
+    [bool]$EverActive = $false # 标记是否自本次启动以来曾有过任务
 
     ExternalProgramManager([string]$idlePath, [string]$busyPath) {
         $this.IdlePath = $idlePath
@@ -374,8 +375,13 @@ class ExternalProgramManager {
 
         if ($queueSize -eq 0) {
             $this.StopBusy()
-            $this.StartIdle()
+            # 只有在曾经有过任务（即发生过从有到无的转变）时才触发闲置程序
+            if ($this.EverActive) {
+                $this.StartIdle()
+            }
         } else {
+            # 标记为曾经有过任务，并执行切换逻辑
+            $this.EverActive = $true
             $this.StopIdle()
             $this.StartBusy()
         }
