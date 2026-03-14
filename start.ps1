@@ -94,7 +94,7 @@ function Send-Workflow {
             $response = $task.Result
             
             if (-not $response.IsSuccessStatusCode) {
-                Write-Error "工作流入列失败 状态码: $($response.StatusCode)"
+                throw "工作流入列失败 状态码: $($response.StatusCode)"
             }
         }
         finally {
@@ -107,7 +107,7 @@ function Send-Workflow {
 
     $response = Invoke-WebRequest -Uri "$url/prompt" -Method Post -Body $body -ContentType "application/json"
     if ($response.StatusCode -ne 200) {
-        Write-Error "工作流入列失败 状态码: $($response.StatusCode), 响应: $($response.Content)"
+        throw "工作流入列失败 状态码: $($response.StatusCode), 响应: $($response.Content)"
     }
 }
 
@@ -226,21 +226,19 @@ class BackupScheduler {
             Move-Item $this.QueueTempFile $this.QueueFile -Force -ErrorAction Stop
             Write-Host "✅ 队列备份完成 ($($queueSize) 任务)" -ForegroundColor Green
             
-            # 重新获取锁以更新状态
+            # 重新获取锁以更新状态并保持锁定状态直到返回
             [System.Threading.Monitor]::Enter($this.SyncRoot)
-            try {
-                $this.LastQueueSize = $queueSize
-            }
-            finally {
-                [System.Threading.Monitor]::Exit($this.SyncRoot)
-            }
+            $this.LastQueueSize = $queueSize
         }
         catch {
             Write-Host "❌ 队列备份失败: $($_.Exception.Message)" -ForegroundColor Red
         }
         finally {
-            # 重新获取锁以便外部的 finally 能够正确释放它
-            [System.Threading.Monitor]::Enter($this.SyncRoot)
+            # 如果 try 块成功，此时已持有锁（从第 230 行开始）
+            # 如果 try 块 catch 并抛出异常，或者直接 catch 到这里，则可能未持有锁
+            if (-not [System.Threading.Monitor]::IsEntered($this.SyncRoot)) {
+                [System.Threading.Monitor]::Enter($this.SyncRoot)
+            }
         }
     }
     [void]UpdatePending([array]$pending, [int]$ignoreIncrement) {
@@ -542,9 +540,15 @@ while ($true) {
                     }
                     $seenID[$id] = $true
                     Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
-                    # 发送工作流并将剩余列表存入调度器，同时增加忽略计数
-                    $backupScheduler.UpdatePending([array]$remaining, 1)
+                    
+                    # 先将包含当前任务的列表存入调度器，防止发送失败丢失数据
+                    $remainingWithCurrent = $workflows | Select-Object -Skip $i
+                    $backupScheduler.UpdatePending([array]$remainingWithCurrent, 1)
+                    
                     Send-Workflow -workflow $workflow -HttpClient $backupScheduler.HttpClient -ErrorAction Stop
+                    
+                    # 发送成功后，更新为不包含当前任务的列表
+                    $backupScheduler.UpdatePending([array]$remaining, 0)
                 }
                 
                 # 循环结束后再次确认清空（修复残留风险）
