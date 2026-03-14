@@ -33,6 +33,8 @@ $program_args = @("-s", "ComfyUI\main.py", "--port", $port) + $extra_args
 $backup_debounce_interval_secs = $env:COMFYUI_BACKUP_DEBOUNCE_SEC ?? 30
 $max_backup_delay_secs = $env:COMFYUI_MAX_BACKUP_DELAY_SEC ?? 300
 $restart_delay_secs = $env:COMFYUI_RESTART_DELAY_SEC ?? 10
+$idle_program = $env:COMFYUI_IDLE_PROGRAM
+$busy_program = $env:COMFYUI_BUSY_PROGRAM
 
 #endregion
 
@@ -248,6 +250,67 @@ public class PowerManagement_54709e2a07a2 {
     }
 }
 
+class ExternalProgramManager {
+    [string]$IdlePath
+    [string]$BusyPath
+    [System.Diagnostics.Process]$IdleProcess
+    [System.Diagnostics.Process]$BusyProcess
+
+    ExternalProgramManager([string]$idlePath, [string]$busyPath) {
+        $this.IdlePath = $idlePath
+        $this.BusyPath = $busyPath
+    }
+
+    [void]UpdateState([int]$queueSize) {
+        if ($queueSize -eq -1) { return }
+
+        if ($queueSize -eq 0) {
+            $this.StopBusy()
+            $this.StartIdle()
+        } else {
+            $this.StopIdle()
+            $this.StartBusy()
+        }
+    }
+
+    [void]StartIdle() {
+        if ($this.IdlePath -and -not ($this.IdleProcess -and -not $this.IdleProcess.HasExited)) {
+            Write-Host "🌙 启动闲置程序: $($this.IdlePath)" -ForegroundColor Gray
+            try { $this.IdleProcess = Start-Process -FilePath $this.IdlePath -PassThru }
+            catch { Write-Host "❌ 启动闲置程序失败: $_" -ForegroundColor Red; $this.IdleProcess = $null }
+        }
+    }
+
+    [void]StopIdle() {
+        if ($this.IdleProcess -and -not $this.IdleProcess.HasExited) {
+            Write-Host "☀️ 停止闲置程序" -ForegroundColor Yellow
+            try { $this.IdleProcess.Kill() } catch {}
+            $this.IdleProcess = $null
+        }
+    }
+
+    [void]StartBusy() {
+        if ($this.BusyPath -and -not ($this.BusyProcess -and -not $this.BusyProcess.HasExited)) {
+            Write-Host "🔥 启动繁忙程序: $($this.BusyPath)" -ForegroundColor Yellow
+            try { $this.BusyProcess = Start-Process -FilePath $this.BusyPath -PassThru }
+            catch { Write-Host "❌ 启动繁忙程序失败: $_" -ForegroundColor Red; $this.BusyProcess = $null }
+        }
+    }
+
+    [void]StopBusy() {
+        if ($this.BusyProcess -and -not $this.BusyProcess.HasExited) {
+            Write-Host "⏸️ 退出繁忙状态，停止程序" -ForegroundColor Gray
+            try { $this.BusyProcess.Kill() } catch {}
+            $this.BusyProcess = $null
+        }
+    }
+
+    [void]Dispose() {
+        $this.StopIdle()
+        $this.StopBusy()
+    }
+}
+
 #endregion
 
 #region 主程序
@@ -255,11 +318,15 @@ public class PowerManagement_54709e2a07a2 {
 
 # 进程清理钩子：确保关闭窗口时也能结束子进程
 $script:current_process = $null
+$script:programManager = $null
 $exit_event = "ComfyUI_Process_Exit_Handler"
 Get-EventSubscriber -SourceIdentifier $exit_event -ErrorAction SilentlyContinue | Unregister-Event
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
     if ($script:current_process -and -not $script:current_process.HasExited) {
         $script:current_process.Kill()
+    }
+    if ($script:programManager) {
+        $script:programManager.Dispose()
     }
 }
 
@@ -271,6 +338,7 @@ if (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue) {
 
 # 创建备份调度器实例
 $backupScheduler = [BackupScheduler]::new($backup_debounce_interval_secs, $max_backup_delay_secs, $queue_file, $url)
+$script:programManager = [ExternalProgramManager]::new($idle_program, $busy_program)
 $attemptCount = 0;
 [bool]$wasPreventingSleep = $false
 
@@ -380,6 +448,10 @@ while ($true) {
         Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
         while (-not $process.HasExited) {
             Start-Sleep -Seconds 1
+            
+            # 更新外部程序状态
+            $script:programManager.UpdateState($backupScheduler.LastQueueSize)
+
             if ($backupScheduler.LastQueueSize -eq 0) {
                 # 成功处理完所有任务，重置尝试计数
                 $attemptCount = 0
@@ -413,6 +485,9 @@ while ($true) {
         if ($wasPreventingSleep) {
             [PowerManagement_54709e2a07a2]::AllowSleep()
             $wasPreventingSleep = $false
+        }
+        if ($script:programManager) {
+            $script:programManager.Dispose()
         }
         if ($process.HasExited) {
             $exitCode = $process.ExitCode
