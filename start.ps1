@@ -532,17 +532,23 @@ while ($true) {
                 for ($i = 0; $i -lt $workflows.Length; $i++) {
                     $workflow = $workflows[$i]
                     $id = $workflow[1]
+                    $remaining = $workflows | Select-Object -Skip ($i + 1)
+                    
                     if ($seenID.ContainsKey($id)) {
                         Write-Host "⏭️ 跳过重复的工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
+                        # 即使跳过也要更新待恢复列表，确保备份状态正确
+                        $backupScheduler.UpdatePending([array]$remaining, 0)
                         continue
                     }
                     $seenID[$id] = $true
                     Write-Host "📤 发送工作流 $($workflow[0]) ($($id)) ($i/$($workflows.Length))" -ForegroundColor Cyan            
-                    # 设置剩余未发送的工作流
-                    $backupScheduler.UpdatePending($workflows[($i + 1)..$workflows.Length], 1)
+                    # 发送工作流并将剩余列表存入调度器，同时增加忽略计数
+                    $backupScheduler.UpdatePending([array]$remaining, 1)
                     Send-Workflow -workflow $workflow -HttpClient $backupScheduler.HttpClient -ErrorAction Stop
                 }
                 
+                # 循环结束后再次确认清空（修复残留风险）
+                $backupScheduler.UpdatePending(@(), 0)
 
                 Write-Host "✅ 队列恢复完成" -ForegroundColor Green
             }
