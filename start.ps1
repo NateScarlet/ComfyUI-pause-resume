@@ -377,22 +377,16 @@ class ExternalProgramManager {
 
         $isBusy = $queueSize -gt 0
         
-        # 仅在状态（繁忙/闲置）发生切换时执行操作，避免重复启动可能是一次性脚本的程序
+        # 仅在状态（繁忙/闲置）发生切换时执行操作
         if (-not $this.Initialized -or ($isBusy -ne $this.LastBusyState)) {
             $this.Initialized = $true
             $this.LastBusyState = $isBusy
             
             if ($isBusy) {
-                # 切换到繁忙：标记曾有过任务，停止闲置程序，并启动繁忙程序
                 $this.EverActive = $true
-                $this.StopIdle()
                 $this.StartBusy()
-            } else {
-                # 切换到闲置：停止繁忙程序，若曾有过任务则启动闲置程序
-                $this.StopBusy()
-                if ($this.EverActive) {
-                    $this.StartIdle()
-                }
+            } elseif ($this.EverActive) {
+                $this.StartIdle()
             }
         }
     }
@@ -405,33 +399,12 @@ class ExternalProgramManager {
         }
     }
 
-    [void]StopIdle() {
-        if ($this.IdleProcess -and -not $this.IdleProcess.HasExited) {
-            Write-Host "☀️ 停止闲置程序" -ForegroundColor Yellow
-            try { $this.IdleProcess.Kill() } catch {}
-            $this.IdleProcess = $null
-        }
-    }
-
     [void]StartBusy() {
         if ($this.BusyPath -and -not ($this.BusyProcess -and -not $this.BusyProcess.HasExited)) {
             Write-Host "🔥 启动繁忙程序: $($this.BusyPath)" -ForegroundColor Yellow
             try { $this.BusyProcess = Start-Process -FilePath $this.BusyPath -PassThru }
             catch { Write-Host "❌ 启动繁忙程序失败: $_" -ForegroundColor Red; $this.BusyProcess = $null }
         }
-    }
-
-    [void]StopBusy() {
-        if ($this.BusyProcess -and -not $this.BusyProcess.HasExited) {
-            Write-Host "⏸️ 退出繁忙状态，停止程序" -ForegroundColor Gray
-            try { $this.BusyProcess.Kill() } catch {}
-            $this.BusyProcess = $null
-        }
-    }
-
-    [void]Dispose() {
-        $this.StopIdle()
-        $this.StopBusy()
     }
 }
 
@@ -634,7 +607,6 @@ while ($true) {
 
         # 3. 释放程序管理器（在循环内初始化）
         if ($script:programManager) {
-            $script:programManager.Dispose()
             $script:programManager = $null
         }
 
