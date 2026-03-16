@@ -364,6 +364,8 @@ class ExternalProgramManager {
     [System.Diagnostics.Process]$IdleProcess
     [System.Diagnostics.Process]$BusyProcess
     [bool]$EverActive = $false # 标记是否自本次启动以来曾有过任务
+    [bool]$LastBusyState = $false # 记录上一次的状态
+    [bool]$Initialized = $false   # 标记是否已经过第一次初始化
 
     ExternalProgramManager([string]$idlePath, [string]$busyPath) {
         $this.IdlePath = $idlePath
@@ -373,17 +375,25 @@ class ExternalProgramManager {
     [void]UpdateState([int]$queueSize) {
         if ($queueSize -eq -1) { return }
 
-        if ($queueSize -eq 0) {
-            $this.StopBusy()
-            # 只有在曾经有过任务（即发生过从有到无的转变）时才触发闲置程序
-            if ($this.EverActive) {
-                $this.StartIdle()
+        $isBusy = $queueSize -gt 0
+        
+        # 仅在状态（繁忙/闲置）发生切换时执行操作，避免重复启动可能是一次性脚本的程序
+        if (-not $this.Initialized -or ($isBusy -ne $this.LastBusyState)) {
+            $this.Initialized = $true
+            $this.LastBusyState = $isBusy
+            
+            if ($isBusy) {
+                # 切换到繁忙：标记曾有过任务，停止闲置程序，并启动繁忙程序
+                $this.EverActive = $true
+                $this.StopIdle()
+                $this.StartBusy()
+            } else {
+                # 切换到闲置：停止繁忙程序，若曾有过任务则启动闲置程序
+                $this.StopBusy()
+                if ($this.EverActive) {
+                    $this.StartIdle()
+                }
             }
-        } else {
-            # 标记为曾经有过任务，并执行切换逻辑
-            $this.EverActive = $true
-            $this.StopIdle()
-            $this.StartBusy()
         }
     }
 
