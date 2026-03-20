@@ -394,7 +394,9 @@ class ExternalProgramManager {
     [void]StartIdle() {
         if ($this.IdlePath -and -not ($this.IdleProcess -and -not $this.IdleProcess.HasExited)) {
             Write-Host "🌙 启动闲置程序: $($this.IdlePath)" -ForegroundColor Gray
-            try { $this.IdleProcess = Start-Process -FilePath $this.IdlePath -PassThru }
+            try { 
+                $this.IdleProcess = Start-Process -FilePath $this.IdlePath -WindowStyle Hidden -PassThru              
+            }
             catch { Write-Host "❌ 启动闲置程序失败: $_" -ForegroundColor Red; $this.IdleProcess = $null }
         }
     }
@@ -402,7 +404,9 @@ class ExternalProgramManager {
     [void]StartBusy() {
         if ($this.BusyPath -and -not ($this.BusyProcess -and -not $this.BusyProcess.HasExited)) {
             Write-Host "🔥 启动繁忙程序: $($this.BusyPath)" -ForegroundColor Yellow
-            try { $this.BusyProcess = Start-Process -FilePath $this.BusyPath -PassThru }
+            try { 
+                $this.BusyProcess = Start-Process -FilePath $this.BusyPath -WindowStyle Hidden -PassThru
+            }
             catch { Write-Host "❌ 启动繁忙程序失败: $_" -ForegroundColor Red; $this.BusyProcess = $null }
         }
     }
