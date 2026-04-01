@@ -53,6 +53,7 @@ save.cmd
 - `COMFYUI_BACKUP_DEBOUNCE_SEC`: 队列备份防抖间隔（秒，默认 `30`）
 - `COMFYUI_MAX_BACKUP_DELAY_SEC`: 最大备份延迟时间（秒，默认 `300`）
 - `COMFYUI_RESTART_DELAY_SEC`: 进程异常退出后重启延迟（秒，默认 `10`）
+- `COMFYUI_IDLE_RESTART_SEC`: 队列空闲后强制重启服务的超时时间（秒，默认 `600`，设置为 0 则禁用）
 - `COMFYUI_IDLE_PROGRAM`: 闲置时启动的程序路径（例如矿工程序，在有任务时会自动停止）
 - `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在闲置时会自动停止）
 

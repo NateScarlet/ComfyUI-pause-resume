@@ -33,6 +33,7 @@ $program_args = @("-s", "ComfyUI\main.py", "--port", $port) + $extra_args
 $backup_debounce_interval_secs = $env:COMFYUI_BACKUP_DEBOUNCE_SEC ?? 30
 $max_backup_delay_secs = $env:COMFYUI_MAX_BACKUP_DELAY_SEC ?? 300
 $restart_delay_secs = $env:COMFYUI_RESTART_DELAY_SEC ?? 10
+$idle_restart_timeout_secs = $env:COMFYUI_IDLE_RESTART_SEC ?? 600
 $idle_program = $env:COMFYUI_IDLE_PROGRAM
 $busy_program = $env:COMFYUI_BUSY_PROGRAM
 
@@ -446,6 +447,7 @@ while ($true) {
     # 每次启动进程时创建程序管理器，确保 disposal 后重启可用
     $script:programManager = [ExternalProgramManager]::new($idle_program, $busy_program)
     $errorOccurred = $false
+    $forceRestart = $false
     # 创建进程对象
     $process = New-Object System.Diagnostics.Process
     $script:current_process = $process
@@ -556,6 +558,7 @@ while ($true) {
     
         # 等待进程退出
         Write-Host "🔍 监控运行中..." -ForegroundColor Cyan
+        $idleStartTime = $null
         while (-not $process.HasExited) {
             Start-Sleep -Seconds 1
             
@@ -566,6 +569,21 @@ while ($true) {
             if ($queueSize -eq 0) {
                 # 成功处理完所有任务，重置尝试计数
                 $attemptCount = 0
+
+                # 检查空闲重启：仅在曾有过任务且配置了超时时
+                if ($script:programManager.EverActive -and $idle_restart_timeout_secs -gt 0) {
+                    if ($null -eq $idleStartTime) {
+                        $idleStartTime = Get-Date
+                    } elseif ((Get-Date) -gt $idleStartTime.AddSeconds($idle_restart_timeout_secs)) {
+                        Write-Host "🕒 队列空闲超时 ($idle_restart_timeout_secs 秒)，强制重启服务端以释放资源..." -ForegroundColor Yellow
+                        $forceRestart = $true
+                        $errorOccurred = $true # 触发重启逻辑并防止退出
+                        break
+                    }
+                } else {
+                    $idleStartTime = $null
+                }
+
                 if ($wasPreventingSleep) {
                     Write-Host "💤 队列已空，允许系统休眠" -ForegroundColor Gray
                     if ("PowerManagement_54709e2a07a2" -as [type]) {
@@ -574,6 +592,9 @@ while ($true) {
                     $wasPreventingSleep = $false
                 }
             } elseif ($queueSize -gt 0) {
+                # 有任务时重置空闲计时
+                $idleStartTime = $null
+
                 if (-not $wasPreventingSleep) {
                     Write-Host "☕ 队列有任务，阻止系统休眠" -ForegroundColor Yellow
                     if ("PowerManagement_54709e2a07a2" -as [type]) {
@@ -583,8 +604,10 @@ while ($true) {
                 }
             }
         }
-        $exitCode = $process.ExitCode
-        Write-Host "🔚 进程已退出，退出码: $exitCode" -ForegroundColor Cyan
+        if ($process.HasExited) {
+            $exitCode = $process.ExitCode
+            Write-Host "🔚 进程已退出，退出码: $exitCode" -ForegroundColor Cyan
+        }
         # 删除进程信息文件
         if (Test-Path $info_file) {
             Remove-Item $info_file -ErrorAction SilentlyContinue
@@ -628,12 +651,14 @@ while ($true) {
         $backupScheduler.SetEnabled($false)
     }
 
-    if (-not $errorOccurred -and $exitCode -in -1, 0) {
+    if ($forceRestart) {
+        # 已在触发重启时打印具体原因，此处不再重复输出
+    } elseif (-not $errorOccurred -and $exitCode -in -1, 0) {
         exit $exitCode
+    } else {
+        Write-Host "⚠️ 非正常退出码 $exitCode，$restart_delay_secs 秒后自动重启..." -ForegroundColor Yellow
+        Start-Sleep -Seconds $restart_delay_secs
+        $attemptCount ++
     }
-
-    Write-Host "⚠️ 非正常退出码 $exitCode，$restart_delay_secs 秒后自动重启..." -ForegroundColor Yellow
-    Start-Sleep -Seconds $restart_delay_secs
-    $attemptCount ++
 }
 #endregion
