@@ -307,6 +307,9 @@ class BackupScheduler {
 
     # 内部调用的调度逻辑，假设已持有锁
     [void]ScheduleLocked([bool]$immediate) {
+        if (-not $this.Enabled) {
+            return
+        }
         $this.Scheduled = $false
         $this.Timer.Stop()
 
@@ -505,6 +508,7 @@ while ($true) {
 
         Write-Host "⏰ 备份配置: 防抖间隔 ${backup_debounce_interval_secs}秒, 最大延迟 ${max_backup_delay_secs}秒" -ForegroundColor Gray
         $backupScheduler.SetEnabled($true)
+        $backupScheduler.Schedule()
 
         # 恢复队列（如果存在）
         if (Test-Path $queue_file) {
