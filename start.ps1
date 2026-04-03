@@ -373,6 +373,12 @@ class ExternalProgramManager {
         $this.BusyPath = $busyPath
     }
 
+    # 检查外部程序是否正在运行
+    [bool]IsRunning() {
+        return ($this.IdleProcess -and -not $this.IdleProcess.HasExited) -or
+               ($this.BusyProcess -and -not $this.BusyProcess.HasExited)
+    }
+
     [void]UpdateState([int]$queueSize) {
         if ($queueSize -eq -1) { return }
 
@@ -426,9 +432,6 @@ Get-EventSubscriber -SourceIdentifier $exit_event -ErrorAction SilentlyContinue 
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
     if ($script:current_process -and -not $script:current_process.HasExited) {
         $script:current_process.Kill()
-    }
-    if ($script:programManager) {
-        $script:programManager.Dispose()
     }
 }
 
@@ -565,6 +568,7 @@ while ($true) {
             # 更新外部程序状态
             $queueSize = $backupScheduler.GetQueueSize()
             $script:programManager.UpdateState($queueSize)
+            $isScriptsRunning = $script:programManager.IsRunning()
 
             if ($queueSize -eq 0) {
                 # 成功处理完所有任务，重置尝试计数
@@ -583,24 +587,30 @@ while ($true) {
                 } else {
                     $idleStartTime = $null
                 }
-
-                if ($wasPreventingSleep) {
-                    Write-Host "💤 队列已空，允许系统休眠" -ForegroundColor Gray
-                    if ("PowerManagement_54709e2a07a2" -as [type]) {
-                        [PowerManagement_54709e2a07a2]::AllowSleep()
-                    }
-                    $wasPreventingSleep = $false
-                }
             } elseif ($queueSize -gt 0) {
                 # 有任务时重置空闲计时
                 $idleStartTime = $null
+            }
 
+            # 休眠控制逻辑：需同时考虑队列状态和外部脚本状态
+            $shouldPreventSleep = ($queueSize -gt 0) -or $isScriptsRunning
+            if ($shouldPreventSleep) {
                 if (-not $wasPreventingSleep) {
-                    Write-Host "☕ 队列有任务，阻止系统休眠" -ForegroundColor Yellow
+                    $reason = if ($queueSize -gt 0) { "队列有任务" } else { "外部脚本运行中" }
+                    Write-Host "☕ $reason，阻止系统休眠" -ForegroundColor Yellow
                     if ("PowerManagement_54709e2a07a2" -as [type]) {
                         [PowerManagement_54709e2a07a2]::PreventSleep()
                     }
                     $wasPreventingSleep = $true
+                }
+            } else {
+                # 状态已空闲（队列为空且外部脚本未运行）
+                if ($wasPreventingSleep) {
+                    Write-Host "💤 队列已空且脚本执行完毕，允许系统休眠" -ForegroundColor Gray
+                    if ("PowerManagement_54709e2a07a2" -as [type]) {
+                        [PowerManagement_54709e2a07a2]::AllowSleep()
+                    }
+                    $wasPreventingSleep = $false
                 }
             }
         }
