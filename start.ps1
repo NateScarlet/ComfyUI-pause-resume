@@ -161,7 +161,11 @@ class BackupScheduler {
         }
     }
 
-    [void]Schedule([bool]$immediate = $false) {
+    [void]Schedule() {
+        $this.Schedule($false)
+    }
+
+    [void]Schedule([bool]$immediate) {
         [System.Threading.Monitor]::Enter($this.SyncRoot)
         try {
             $this.ScheduleLocked($immediate)
