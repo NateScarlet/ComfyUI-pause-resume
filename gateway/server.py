@@ -58,6 +58,8 @@ class GatewayHandlers:
         q: asyncio.Queue[str] = asyncio.Queue()
         self.gateway.sse_clients.add(q)
         try:
+            # 告知浏览器断线后每 3 秒重连一次
+            await response.write(b"retry: 3000\n\n")
             # 立即推送一次当前的初始暂停状态
             initial_data = json.dumps({"paused": self.gateway.paused})
             await response.write(f"data: {initial_data}\n\n".encode("utf-8"))
@@ -653,8 +655,19 @@ class GatewayHandlers:
                                             console.error("Error parsing SSE data", e);
                                         }
                                     };
-                                    eventSource.onerror = (err) => {
-                                        console.error("SSE connection error, retrying...", err);
+                                    eventSource.onerror = () => {
+                                        // EventSource 自身会尝试自动重连，但为防止某些浏览器
+                                        // 在服务器重启后放弃重连，额外添加显式重连作为兜底
+                                        if (eventSource) {
+                                            eventSource.close();
+                                            eventSource = null;
+                                        }
+                                        if (!reconnectTimer) {
+                                            reconnectTimer = setTimeout(() => {
+                                                reconnectTimer = null;
+                                                connectSSE();
+                                            }, RECONNECT_DELAY_MS);
+                                        }
                                     };
                                 }
                                 connectSSE();
