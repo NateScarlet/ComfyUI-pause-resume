@@ -159,10 +159,17 @@ class GatewayHandlers:
                 with self.gateway.queue_lock:
                     number = self.gateway.queue.add_task(prompt_id, prompt, extra_data)
                     
-                self.gateway.update_sleep_and_programs()
-                self.gateway.broadcast_ws_status()
-                
-                logger.info(f"📥 Intercepted workflow {prompt_id} (Queue: {len(self.gateway.queue.get_pending())})")
+                # 异步执行后续的状态变更、WebSocket 广播和日志输出，加速 HTTP 响应返回
+                async def post_process_task():
+                    try:
+                        self.gateway.update_sleep_and_programs()
+                        self.gateway.broadcast_ws_status()
+                        pending_cnt = self.gateway.queue.get_pending_count()
+                        logger.info(f"📥 Intercepted workflow {prompt_id} (Queue: {pending_cnt})")
+                    except Exception as ex:
+                        logger.error(f"Error in post_process_task for {prompt_id}: {ex}")
+
+                asyncio.create_task(post_process_task())
                 
                 return web.json_response({
                     "prompt_id": prompt_id,
@@ -420,7 +427,8 @@ class GatewayHandlers:
                                                     if "data" in data_dict and isinstance(data_dict["data"], dict):
                                                         if "status" in data_dict["data"] and isinstance(data_dict["data"]["status"], dict):
                                                             if "exec_info" in data_dict["data"]["status"] and isinstance(data_dict["data"]["status"]["exec_info"], dict):
-                                                                remaining = len(self.gateway.queue.get_pending()) + len(self.gateway.queue.get_running())
+                                                                # 采用轻量计数方法，避免在广播状态时加载和反序列化所有排队大对象
+                                                                remaining = self.gateway.queue.get_pending_count() + self.gateway.queue.get_running_count()
                                                                 data_dict["data"]["status"]["exec_info"]["queue_remaining"] = remaining
                                                                 data_str = json.dumps(data_dict)
                                         except Exception:

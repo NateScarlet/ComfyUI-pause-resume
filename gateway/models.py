@@ -21,6 +21,16 @@ class TaskQueue(ABC):
         pass
 
     @abstractmethod
+    def get_pending_count(self, limit: Optional[int] = None) -> int:
+        """获取待处理任务数量，支持通过 limit 限制扫描深度以提升性能"""
+        pass
+
+    @abstractmethod
+    def get_running_count(self, limit: Optional[int] = None) -> int:
+        """获取正在运行任务数量，支持通过 limit 限制扫描深度以提升性能"""
+        pass
+
+    @abstractmethod
     def add_task(self, prompt_id: str, prompt: Any, extra_data: Any) -> int:
         """添加新任务到待处理队列，并返回分配的任务编号 number"""
         pass
@@ -113,6 +123,20 @@ class JSONFileQueue(TaskQueue):
     def get_running(self) -> List[List[Any]]:
         with self.lock:
             return list(self.queue_running)
+
+    def get_pending_count(self, limit: Optional[int] = None) -> int:
+        with self.lock:
+            cnt = len(self.pending_queue)
+            if limit is not None:
+                return min(cnt, limit)
+            return cnt
+
+    def get_running_count(self, limit: Optional[int] = None) -> int:
+        with self.lock:
+            cnt = len(self.queue_running)
+            if limit is not None:
+                return min(cnt, limit)
+            return cnt
 
     def add_task(self, prompt_id: str, prompt: Any, extra_data: Any) -> int:
         with self.lock:
@@ -231,6 +255,29 @@ class SQLiteQueue(TaskQueue):
                     logger.error(f"Failed to decode running task from DB: {e}")
             return tasks
 
+    def get_pending_count(self, limit: Optional[int] = None) -> int:
+        with self.lock:
+            cursor = self.conn.cursor()
+            if limit is not None:
+                # 使用限制行数的局部扫描判断是否存在或是否满足数量
+                cursor.execute("SELECT 1 FROM tasks WHERE status = 'pending' LIMIT ?", (limit,))
+                return len(cursor.fetchall())
+            else:
+                cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+                row = cursor.fetchone()
+                return row[0] if row else 0
+
+    def get_running_count(self, limit: Optional[int] = None) -> int:
+        with self.lock:
+            cursor = self.conn.cursor()
+            if limit is not None:
+                cursor.execute("SELECT 1 FROM tasks WHERE status = 'running' LIMIT ?", (limit,))
+                return len(cursor.fetchall())
+            else:
+                cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'")
+                row = cursor.fetchone()
+                return row[0] if row else 0
+
     def _get_next_global_number(self) -> int:
         cursor = self.conn.cursor()
         cursor.execute("SELECT value FROM metadata WHERE key = 'global_number'")
@@ -265,16 +312,17 @@ class SQLiteQueue(TaskQueue):
     def pop_task(self, idx: int) -> Optional[List[Any]]:
         with self.lock:
             cursor = self.conn.cursor()
+            # 仅在数据库中定位当前偏移量的单个任务，避免拉取所有任务的大字段与反序列化开销
             cursor.execute(
-                "SELECT id, number, prompt, extra_data, outputs_to_execute FROM tasks WHERE status = 'pending' ORDER BY position ASC"
+                "SELECT id, number, prompt, extra_data, outputs_to_execute FROM tasks WHERE status = 'pending' ORDER BY position ASC LIMIT 1 OFFSET ?",
+                (idx,)
             )
-            rows = cursor.fetchall()
-            if 0 <= idx < len(rows):
-                target_id = rows[idx][0]
+            row = cursor.fetchone()
+            if row:
+                target_id = row[0]
                 cursor.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (target_id,))
                 self.conn.commit()
                 
-                row = rows[idx]
                 try:
                     prompt = json.loads(row[2])
                     extra_data = json.loads(row[3])

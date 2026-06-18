@@ -54,7 +54,9 @@ class Gateway:
     def update_sleep_and_programs(self) -> None:
         """根据当前的执行状态和暂停状态，更新外部程序管理器及 Windows 的休眠阻止状态"""
         # 如果已被暂停，即使有待处理任务且下游未执行，也不视为繁忙，以便允许系统休眠
-        is_busy = self.downstream_executing or (not self.paused and len(self.queue.get_pending()) > 0)
+        # 使用 limit=1 优化，快速检测是否有待处理任务即可
+        has_pending = self.queue.get_pending_count(limit=1) > 0
+        is_busy = self.downstream_executing or (not self.paused and has_pending)
         self.program_manager.update_state(is_busy)
         
         scripts_running = self.program_manager.is_running()
@@ -90,7 +92,8 @@ class Gateway:
         if self.loop is None:
             return
         try:
-            remaining = len(self.queue.get_pending()) + len(self.queue.get_running())
+            # 采用轻量计数方法，避免在广播状态时加载和反序列化所有排队大对象
+            remaining = self.queue.get_pending_count() + self.queue.get_running_count()
         except Exception:
             remaining = 0
 
@@ -234,8 +237,9 @@ class Gateway:
                         f"Restarting in {self.config.restart_delay_sec} seconds..."
                     )
                     with self.queue_lock:
-                        if self.queue.get_running():
-                            idx = min(self.current_task_idx, len(self.queue.get_pending()))
+                        if self.queue.get_running_count(limit=1) > 0:
+                            # 通过限制 limit 来计算 min(current_task_idx, pending_count)，以避免扫描全表
+                            idx = self.queue.get_pending_count(limit=self.current_task_idx)
                             self.queue.requeue_running(idx)
                             self.attempt_count += 1
                     self.broadcast_ws_status()
@@ -260,9 +264,9 @@ class Gateway:
                 # 判定在非暂停且下游处于就绪且空闲状态时，进行任务派发
                 if not self.paused and not self.downstream_executing and self.downstream_ready:
                     with self.queue_lock:
-                        pending_tasks = self.queue.get_pending()
-                        if len(pending_tasks) > 0:
-                            idx = self.attempt_count % len(pending_tasks)
+                        pending_count = self.queue.get_pending_count()
+                        if pending_count > 0:
+                            idx = self.attempt_count % pending_count
                             task = self.queue.pop_task(idx)
                             self.current_task_idx = idx
                         else:
@@ -329,14 +333,15 @@ class Gateway:
                                                 logger.error(f"Failed to save failed workflow details: {save_err}")
                                         else:
                                             # 如果是其它暂时性服务错误，将其放回待处理队列并进行重试递增
-                                            idx = min(self.current_task_idx, len(self.queue.get_pending()))
+                                            # 同样使用 limit 优化数据库/文件扫描行数
+                                            idx = self.queue.get_pending_count(limit=self.current_task_idx)
                                             self.queue.requeue_running(idx)
                                             self.attempt_count += 1
                                     self.broadcast_ws_status()
                         except Exception as e:
                             logger.error(f"Error sending workflow: {e}")
                             with self.queue_lock:
-                                idx = min(self.current_task_idx, len(self.queue.get_pending()))
+                                idx = self.queue.get_pending_count(limit=self.current_task_idx)
                                 self.queue.requeue_running(idx)
                             self.broadcast_ws_status()
 
