@@ -318,7 +318,8 @@ class Gateway:
                                                     if workflow:
                                                         with open(os.path.join(failed_dir, "workflow.json"), "w", encoding="utf-8") as f:
                                                             json.dump(workflow, f, ensure_ascii=False, indent=2)
-                                                logger.info(f"💾 Failed workflow {_id} saved to failed_workflows/{dir_name}")
+                                                rel_failed_dir = os.path.relpath(failed_dir, BASE_DIR).replace(os.sep, '/')
+                                                logger.info(f"💾 Failed workflow {_id} saved to {rel_failed_dir}")
                                             except Exception as save_err:
                                                 logger.error(f"Failed to save failed workflow details: {save_err}")
                                         else:
