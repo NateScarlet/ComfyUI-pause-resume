@@ -1,2 +1,7 @@
 samples/
 *.local.*
+*.local
+__pycache__
+*.db
+*.db-*
+gateway_data
