@@ -42,13 +42,13 @@ class TaskQueue(ABC):
         pass
 
     @abstractmethod
-    def pop_task(self, idx: int) -> Optional[List[Any]]:
-        """将指定索引的待处理任务移入运行队列，并返回该任务"""
+    def pop_task(self, skip: int = 0) -> Optional[List[Any]]:
+        """跳过前 skip 个待处理任务，将下一个移入运行队列并返回"""
         pass
 
     @abstractmethod
-    def requeue_running(self, idx: int) -> None:
-        """将正在运行的任务放回待处理队列的指定位置，并清空运行队列"""
+    def requeue_running(self) -> None:
+        """将正在运行的任务放回待处理队列（按 number 恢复原位），并清空运行队列"""
         pass
 
     @abstractmethod
@@ -175,36 +175,24 @@ class JSONFileQueue(TaskQueue):
             self._save()
             return number
 
-    def pop_task(self, idx: int) -> Optional[List[Any]]:
+    def pop_task(self, skip: int = 0) -> Optional[List[Any]]:
         with self._lock:
-            if 0 <= idx < len(self._pending_queue):
-                task = self._pending_queue.pop(idx)
+            if 0 <= skip < len(self._pending_queue):
+                task = self._pending_queue.pop(skip)
                 self._queue_running = [task]
                 self._save()
                 return task
             return None
 
-    def requeue_running(self, idx: int) -> None:
+    def requeue_running(self) -> None:
         with self._lock:
             if self._queue_running:
                 task = self._queue_running[0]
-                insert_idx = min(idx, len(self._pending_queue))
-                
-                # 重新计算该任务的 number 属性，使它和被插入的 idx 位置相匹配
-                if not self._pending_queue:
-                    new_num = 1.0
-                elif insert_idx <= 0:
-                    new_num = float(self._pending_queue[0][0]) - 1.0
-                elif insert_idx >= len(self._pending_queue):
-                    new_num = float(self._pending_queue[-1][0]) + 1.0
-                else:
-                    new_num = (float(self._pending_queue[insert_idx - 1][0]) + float(self._pending_queue[insert_idx][0])) / 2.0
-                
-                task[0] = new_num
                 # 确保 task 包含 6 个元素
                 if len(task) == 5:
                     task.append(-1)
-                self._pending_queue.insert(insert_idx, task)
+                # number 未变，直接放回后按 number 排序即可恢复原位
+                self._pending_queue.append(task)
                 self._queue_running.clear()
                 self._pending_queue.sort(key=lambda x: x[0])
                 self._save()
@@ -393,13 +381,13 @@ class SQLiteQueue(TaskQueue):
             self._conn.commit()
             return number
 
-    def pop_task(self, idx: int) -> Optional[List[Any]]:
+    def pop_task(self, skip: int = 0) -> Optional[List[Any]]:
         with self._lock:
             cursor = self._conn.cursor()
-            # 仅在数据库中定位当前偏移量的单个任务，且按 number 升序排序，并包含 create_time
+            # 跳过前 skip 个待处理任务，取下一个
             cursor.execute(
                 "SELECT id, number, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
-                (idx,)
+                (skip,)
             )
             row = cursor.fetchone()
             if row:
@@ -417,31 +405,11 @@ class SQLiteQueue(TaskQueue):
                     logger.error(f"Failed to decode popped task: {e}")
             return None
 
-    def requeue_running(self, idx: int) -> None:
+    def requeue_running(self) -> None:
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute("SELECT id FROM tasks_v2 WHERE status = 'running'")
-            running_rows = cursor.fetchall()
-            if not running_rows:
-                return
-                
-            running_id = running_rows[0][0]
-            
-            # 获取当前所有 pending 任务 of ID and number
-            cursor.execute("SELECT id, number FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC")
-            pending_rows = cursor.fetchall()
-            
-            # 重新计算并更新 number
-            if not pending_rows:
-                new_num = 1.0
-            elif idx <= 0:
-                new_num = float(pending_rows[0][1]) - 1.0
-            elif idx >= len(pending_rows):
-                new_num = float(pending_rows[-1][1]) + 1.0
-            else:
-                new_num = (float(pending_rows[idx-1][1]) + float(pending_rows[idx][1])) / 2.0
-                
-            cursor.execute("UPDATE tasks_v2 SET status = 'pending', number = ? WHERE id = ?", (new_num, running_id))
+            # number 未变，只需将状态改回 pending 即可恢复原位
+            cursor.execute("UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'")
             self._conn.commit()
 
     def clear_running(self) -> None:
@@ -536,7 +504,7 @@ def migrate_json_to_sqlite(json_path: str, sqlite_queue: TaskQueue) -> None:
         for task in running:
             number, prompt_id, prompt, extra_data = task[0], task[1], task[2], task[3]
             sqlite_queue.add_task(prompt_id, prompt, extra_data, number)
-            sqlite_queue.pop_task(0)
+            sqlite_queue.pop_task()
 
         # 2. 导入 pending 任务
         for task in pending:

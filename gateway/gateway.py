@@ -41,7 +41,6 @@ class Gateway:
         )
         self._process: Optional[subprocess.Popen[str]] = None
         self._attempt_count: int = 0
-        self._current_task_idx: int = 0
         self._is_restarting: bool = False
         self.downstream_ready: bool = False
         self.exiting: bool = False
@@ -241,9 +240,7 @@ class Gateway:
                     )
                     with self.queue_lock:
                         if self.queue.get_running_count(limit=1) > 0:
-                            # 通过限制 limit 来计算 min(current_task_idx, pending_count)，以避免扫描全表
-                            idx = self.queue.get_pending_count(limit=self._current_task_idx)
-                            self.queue.requeue_running(idx)
+                            self.queue.requeue_running()
                             self._attempt_count += 1
                     self.broadcast_ws_status()
                     await asyncio.sleep(self.config.restart_delay_sec)
@@ -269,9 +266,8 @@ class Gateway:
                     with self.queue_lock:
                         pending_count = self.queue.get_pending_count()
                         if pending_count > 0:
-                            idx = self._attempt_count % pending_count
-                            task = self.queue.pop_task(idx)
-                            self._current_task_idx = idx
+                            skip = self._attempt_count % pending_count
+                            task = self.queue.pop_task(skip)
                         else:
                             task = None
                             self._attempt_count = 0
@@ -335,17 +331,14 @@ class Gateway:
                                             except Exception as save_err:
                                                 logger.error(f"Failed to save failed workflow details: {save_err}")
                                         else:
-                                            # 如果是其它暂时性服务错误，将其放回待处理队列并进行重试递增
-                                            # 同样使用 limit 优化数据库/文件扫描行数
-                                            idx = self.queue.get_pending_count(limit=self._current_task_idx)
-                                            self.queue.requeue_running(idx)
+                                            # 暂时性服务错误，放回待处理队列并跳过重试
+                                            self.queue.requeue_running()
                                             self._attempt_count += 1
                                     self.broadcast_ws_status()
                         except Exception as e:
                             logger.error(f"Error sending workflow: {e}")
                             with self.queue_lock:
-                                idx = self.queue.get_pending_count(limit=self._current_task_idx)
-                                self.queue.requeue_running(idx)
+                                self.queue.requeue_running()
                             self.broadcast_ws_status()
 
     async def shutdown(self, runner: web.AppRunner) -> None:
