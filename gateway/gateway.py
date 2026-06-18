@@ -133,6 +133,10 @@ class Gateway:
             cmd.extend(self.config.downstream_args)
             
         logger.info(f"🚀 Starting downstream ComfyUI on port {self.downstream_port}")
+        # 复制当前进程的环境变量，并强制设置 Python 编码为 UTF-8，以解决 Windows 环境下 tqdm 进度条等特殊字符输出为乱码的问题
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         self.process = subprocess.Popen(
             cmd,
             cwd=BASE_DIR,  # 重写为 BASE_DIR，防止在 gateway/data 下找不到 main.py
@@ -141,7 +145,8 @@ class Gateway:
             text=True,
             bufsize=1,
             encoding='utf-8',
-            errors='replace'
+            errors='replace',
+            env=env
         )
         
         def log_reader(pipe: Any, is_stderr: bool) -> None:
