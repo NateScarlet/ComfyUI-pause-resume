@@ -614,7 +614,11 @@ class GatewayHandlers:
                                     let btn = document.createElement('button');
                                     btn.onclick = async () => {
                                         let action = proxyPaused ? 'resume' : 'pause';
-                                        await fetch(`/io.github.natescarlet.pause-resume/${action}`, {method: 'POST'});
+                                        let resp = await fetch(`/io.github.natescarlet.pause-resume/${action}`, {method: 'POST'});
+                                        // 直接根据 API 响应立即更新状态，不依赖可能正在重连的 SSE
+                                        let data = await resp.json();
+                                        proxyPaused = data.paused;
+                                        setButtonState(btn);
                                     };
                                     
                                     setButtonState(btn);
