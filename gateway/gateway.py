@@ -13,7 +13,7 @@ from aiohttp import web
 from typing import Optional, Set, Dict, Any, cast
 
 from .config import BASE_DIR, GatewayConfig
-from .models import TaskQueue, GatewayStateManager
+from .models import TaskQueue, GatewayStateManager, raw_json_dumps
 from .utils import PowerManagement
 from .program import ExternalProgramManager
 
@@ -290,17 +290,20 @@ class Gateway:
                     
                     if task:
                         # 准备派发一个任务！
+                        extra_data = json.loads(task.extra_data)
                         body: dict[str, Any] = {
                             "prompt": task.prompt,
                             "prompt_id": task.prompt_id,
                             "extra_data": task.extra_data
                         }
-                        if task.extra_data.get("client_id"):
-                            body["client_id"] = task.extra_data["client_id"]
+                        if extra_data.get("client_id"):
+                            body["client_id"] = extra_data["client_id"]
                         
                         url = f"http://127.0.0.1:{self.downstream_port}/prompt"
                         try:
-                            async with session.post(url, json=body) as resp:
+                            body_str = raw_json_dumps(body)
+                            headers = {"Content-Type": "application/json"}
+                            async with session.post(url, data=body_str, headers=headers) as resp:
                                 if resp.status == 200:
                                     logger.info(f"📤 Sent workflow {task.prompt_id} to downstream")
                                     self._downstream_executing = True 
@@ -329,12 +332,12 @@ class Gateway:
                                                     
                                                 # 获取并单独存盘 workflow JSON
                                                 workflow = None
-                                                extra_pnginfo = task.extra_data.get("extra_pnginfo")
+                                                extra_pnginfo = extra_data.get("extra_pnginfo")
                                                 if isinstance(extra_pnginfo, dict):
                                                     extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
                                                     workflow = extra_pnginfo_dict.get("workflow")
                                                 if not workflow:
-                                                    workflow = task.extra_data.get("workflow")
+                                                    workflow = extra_data.get("workflow")
                                                     
                                                 if workflow:
                                                     with open(os.path.join(failed_dir, "workflow.json"), "w", encoding="utf-8") as f:

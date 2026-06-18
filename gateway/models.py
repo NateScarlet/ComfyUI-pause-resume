@@ -7,24 +7,80 @@ import threading
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Any, Optional, Sequence, Set
+from typing import List, Any, Optional, Sequence, Set, Dict, cast, Generator
 from .config import BASE_DIR, GatewayConfig
 
 logger = logging.getLogger(__name__)
 
 
+class RawJSON(str):
+    """标记一段已经是合法 JSON 的字符串，序列化时直接嵌入不做转义。
+
+    类似 Go 语言的 json.RawMessage，配合 _RawJSONEncoder 使用。
+    """
+    pass
+
+
+class RawJSONEncoder(json.JSONEncoder):
+    """能将 RawJSON 对象作为原始 JSON 嵌入输出的自定义编码器
+
+    配合 json.dump 使用：json.dump(data, f, cls=RawJSONEncoder)。
+    配合 web.json_response 使用 raw_json_dumps 函数作为 dumps 参数。
+    """
+
+    def iterencode(self, o: Any, _one_shot: bool = False) -> Generator[str, None, None]:
+        if isinstance(o, RawJSON):
+            yield o
+            return
+        elif isinstance(o, dict):
+            yield '{'
+            first = True
+            for key, value in cast(Dict[str, Any], o).items():
+                if not first:
+                    yield ', '
+                first = False
+                yield from self.iterencode(key)
+                yield ': '
+                yield from self.iterencode(value)
+            yield '}'
+        elif isinstance(o, list):
+            yield '['
+            first = True
+            for item in cast(List[Any], o):
+                if not first:
+                    yield ', '
+                first = False
+                yield from self.iterencode(item)
+            yield ']'
+        else:
+            yield from super().iterencode(o, _one_shot)
+
+
+def raw_json_dumps(obj: Any, **kwargs: Any) -> str:
+    """json.dumps 替代，将 RawJSON 对象作为原始 JSON 嵌入输出而非转义字符串"""
+    return ''.join(RawJSONEncoder(**kwargs).iterencode(obj))
+
+
 @dataclass(frozen=True)
 class Task:
-    """队列中的一个任务，不可变。"""
+    """队列中的一个任务，不可变。
+
+    prompt 和 extra_data 以 JSON 字符串形式存储，避免在队列读写时做无意义的
+    解析/序列化往返。仅在需要访问内部字段或通过 to_list() 对外输出时才按需解析。
+    """
     number: float
     prompt_id: str
-    prompt: dict[str, Any]
-    extra_data: dict[str, Any]
+    prompt: RawJSON
+    extra_data: RawJSON
     outputs_to_execute: Sequence[str]
     create_time: int
 
     def to_list(self) -> List[Any]:
-        """转换为 ComfyUI /queue 接口期望的 5 项列表格式"""
+        """转换为 ComfyUI /queue 接口期望的 5 项列表格式
+
+        prompt 和 extra_data 是 _RawJSON 类型，配合 _raw_json_dumps
+        或 _RawJSONEncoder 序列化时直接嵌入原始 JSON，避免解析再序列化。
+        """
         return [self.number, self.prompt_id, self.prompt,
                 self.extra_data, list(self.outputs_to_execute)]
 
@@ -108,8 +164,8 @@ class JSONFileQueue(TaskQueue):
         return Task(
             number=q[0],
             prompt_id=str(q[1]),
-            prompt=q[2],
-            extra_data=q[3],
+            prompt=RawJSON(json.dumps(q[2], ensure_ascii=False)),
+            extra_data=RawJSON(json.dumps(q[3], ensure_ascii=False)),
             outputs_to_execute=q[4],
             create_time=create_time,
         )
@@ -152,7 +208,7 @@ class JSONFileQueue(TaskQueue):
             }
             temp_file = self._queue_file + ".tmp"
             with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+                json.dump(data, f, ensure_ascii=False, cls=RawJSONEncoder)
             os.replace(temp_file, self._queue_file)
         except Exception as e:
             logger.error(f"Failed to save queue: {e}")
@@ -308,8 +364,8 @@ class SQLiteQueue(TaskQueue):
         return Task(
             number=row[0],
             prompt_id=row[1],
-            prompt=json.loads(row[2]),
-            extra_data=json.loads(row[3]),
+            prompt=RawJSON(row[2]),
+            extra_data=RawJSON(row[3]),
             outputs_to_execute=json.loads(row[4]),
             create_time=row[5],
         )
@@ -390,14 +446,12 @@ class SQLiteQueue(TaskQueue):
         with self._lock:
             cursor = self._conn.cursor()
             _t_serialize_start = time.perf_counter()
-            prompt_str = json.dumps(task.prompt, ensure_ascii=False)
-            extra_data_str = json.dumps(task.extra_data, ensure_ascii=False)
             outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
             _t_serialize = (time.perf_counter() - _t_serialize_start) * 1000
             
             cursor.execute(
                 "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                (task.prompt_id, task.number, prompt_str, extra_data_str, outputs_str, task.create_time)
+                (task.prompt_id, task.number, task.prompt, task.extra_data, outputs_str, task.create_time)
             )
             _t_commit_start = time.perf_counter()
             self._conn.commit()

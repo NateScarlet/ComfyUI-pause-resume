@@ -9,7 +9,7 @@ from aiohttp import web
 from typing import List, Dict, Any, Set, Union, cast
 
 from .gateway import Gateway
-from .models import Task
+from .models import Task, raw_json_dumps, RawJSON
 
 logger = logging.getLogger(__name__)
 
@@ -178,8 +178,8 @@ class GatewayHandlers:
                     task = Task(
                         number=number,
                         prompt_id=prompt_id,
-                        prompt=prompt,
-                        extra_data=extra_data,
+                        prompt=RawJSON(json.dumps(prompt, ensure_ascii=False)),
+                        extra_data=RawJSON(json.dumps(extra_data, ensure_ascii=False)),
                         outputs_to_execute=[],
                         create_time=create_time,
                     )
@@ -230,7 +230,7 @@ class GatewayHandlers:
                 return web.json_response({
                     "queue_running": [t.to_list() for t in self.gateway.queue.get_running()],
                     "queue_pending": [t.to_list() for t in self.gateway.queue.get_pending()]
-                })
+                }, dumps=raw_json_dumps)
 
         # 拦截 GET /api/jobs (ComfyUI 新版历史队列及排队列表查询端点)
         if method == "GET" and path in ("/api/jobs", "/api/jobs/"):
@@ -253,7 +253,8 @@ class GatewayHandlers:
                 
             def make_job_dict(task: Task, status_str: str) -> Dict[str, Any]:
                 workflow_id = None
-                extra_pnginfo = task.extra_data.get('extra_pnginfo', {})
+                extra_data = json.loads(task.extra_data)
+                extra_pnginfo = extra_data.get('extra_pnginfo', {})
                 if isinstance(extra_pnginfo, dict):
                     extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
                     workflow = extra_pnginfo_dict.get('workflow', {})
@@ -389,7 +390,8 @@ class GatewayHandlers:
                             
                 if target_task:
                     workflow_id = None
-                    extra_pnginfo = target_task.extra_data.get('extra_pnginfo', {})
+                    extra_data = json.loads(target_task.extra_data)
+                    extra_pnginfo = extra_data.get('extra_pnginfo', {})
                     if isinstance(extra_pnginfo, dict):
                         extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
                         workflow = extra_pnginfo_dict.get('workflow', {})
@@ -409,7 +411,7 @@ class GatewayHandlers:
                             'extra_data': target_task.extra_data
                         }
                     }
-                    return web.json_response(job_dict)
+                    return web.json_response(job_dict, dumps=raw_json_dumps)
 
         # 拦截任务的取消和清空操作 POST /queue (带有 clear / delete 属性)
         if method == "POST" and path in ("/queue", "/api/queue"):
