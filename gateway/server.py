@@ -8,6 +8,7 @@ from aiohttp import web
 from typing import List, Dict, Any, Set, Union, cast
 
 from .gateway import Gateway
+from .models import Task
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +193,8 @@ class GatewayHandlers:
         if method == "GET" and path in ("/queue", "/api/queue"):
             with self.gateway.queue_lock:
                 return web.json_response({
-                    "queue_running": self.gateway.queue.get_running(),
-                    "queue_pending": self.gateway.queue.get_pending()
+                    "queue_running": [t.to_list() for t in self.gateway.queue.get_running()],
+                    "queue_pending": [t.to_list() for t in self.gateway.queue.get_pending()]
                 })
 
         # 拦截 GET /api/jobs (ComfyUI 新版历史队列及排队列表查询端点)
@@ -215,24 +216,20 @@ class GatewayHandlers:
             except Exception as e:
                 logger.error(f"Error fetching jobs from downstream: {e}")
                 
-            def make_job_dict(item: List[Any], status_str: str) -> Dict[str, Any]:
-                number, prompt_id, _, extra_data, *_ = item
-                create_time = item[5] if len(item) > 5 else -1
+            def make_job_dict(task: Task, status_str: str) -> Dict[str, Any]:
                 workflow_id = None
-                if isinstance(extra_data, dict):
-                    extra_data_dict = cast(Dict[str, Any], extra_data)
-                    extra_pnginfo = extra_data_dict.get('extra_pnginfo', {})
-                    if isinstance(extra_pnginfo, dict):
-                        extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
-                        workflow = extra_pnginfo_dict.get('workflow', {})
-                        if isinstance(workflow, dict):
-                            workflow_dict = cast(Dict[str, Any], workflow)
-                            workflow_id = workflow_dict.get('id')
+                extra_pnginfo = task.extra_data.get('extra_pnginfo', {})
+                if isinstance(extra_pnginfo, dict):
+                    extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
+                    workflow = extra_pnginfo_dict.get('workflow', {})
+                    if isinstance(workflow, dict):
+                        workflow_dict = cast(Dict[str, Any], workflow)
+                        workflow_id = workflow_dict.get('id')
                 return {
-                    'id': prompt_id,
+                    'id': task.prompt_id,
                     'status': status_str,
-                    'priority': number,
-                    'create_time': create_time,
+                    'priority': task.number,
+                    'create_time': task.create_time,
                     'outputs_count': 0,
                     'workflow_id': workflow_id
                 }
@@ -341,44 +338,40 @@ class GatewayHandlers:
                     running_tasks = self.gateway.queue.get_running()
                     pending_tasks = self.gateway.queue.get_pending()
                     
-                target_task = None
+                target_task: Task | None = None
                 status_str = None
                 for t in running_tasks:
-                    if t[1] == job_id:
+                    if t.prompt_id == job_id:
                         target_task = t
                         status_str = 'in_progress'
                         break
                 if not target_task:
                     for t in pending_tasks:
-                        if t[1] == job_id:
+                        if t.prompt_id == job_id:
                             target_task = t
                             status_str = 'pending'
                             break
                             
                 if target_task:
-                    number, prompt_id, prompt, extra_data, *_ = target_task
-                    create_time = target_task[5] if len(target_task) > 5 else -1
                     workflow_id = None
-                    if isinstance(extra_data, dict):
-                        extra_data_dict = cast(Dict[str, Any], extra_data)
-                        extra_pnginfo = extra_data_dict.get('extra_pnginfo', {})
-                        if isinstance(extra_pnginfo, dict):
-                            extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
-                            workflow = extra_pnginfo_dict.get('workflow', {})
-                            if isinstance(workflow, dict):
-                                workflow_dict = cast(Dict[str, Any], workflow)
-                                workflow_id = workflow_dict.get('id')
+                    extra_pnginfo = target_task.extra_data.get('extra_pnginfo', {})
+                    if isinstance(extra_pnginfo, dict):
+                        extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
+                        workflow = extra_pnginfo_dict.get('workflow', {})
+                        if isinstance(workflow, dict):
+                            workflow_dict = cast(Dict[str, Any], workflow)
+                            workflow_id = workflow_dict.get('id')
                     
                     job_dict: Dict[str, Any] = {
-                        'id': prompt_id,
+                        'id': target_task.prompt_id,
                         'status': status_str,
-                        'priority': number,
-                        'create_time': create_time,
+                        'priority': target_task.number,
+                        'create_time': target_task.create_time,
                         'outputs_count': 0,
                         'workflow_id': workflow_id,
                         'workflow': {
-                            'prompt': prompt,
-                            'extra_data': extra_data
+                            'prompt': target_task.prompt,
+                            'extra_data': target_task.extra_data
                         }
                     }
                     return web.json_response(job_dict)

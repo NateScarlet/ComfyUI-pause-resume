@@ -274,33 +274,32 @@ class Gateway:
                     
                     if task:
                         # 准备派发一个任务！
-                        _, _id, prompt, extra_data, *_ = task
-                        body = {
-                            "prompt": prompt,
-                            "prompt_id": _id,
-                            "extra_data": extra_data
+                        body: dict[str, Any] = {
+                            "prompt": task.prompt,
+                            "prompt_id": task.prompt_id,
+                            "extra_data": task.extra_data
                         }
-                        if extra_data and "client_id" in extra_data:
-                            body["client_id"] = extra_data["client_id"]
+                        if task.extra_data.get("client_id"):
+                            body["client_id"] = task.extra_data["client_id"]
                         
                         url = f"http://127.0.0.1:{self.downstream_port}/prompt"
                         try:
                             async with session.post(url, json=body) as resp:
                                 if resp.status == 200:
-                                    logger.info(f"📤 Sent workflow {_id} to downstream")
+                                    logger.info(f"📤 Sent workflow {task.prompt_id} to downstream")
                                     self._downstream_executing = True 
                                     self.update_sleep_and_programs()
                                     self.broadcast_ws_status()
                                 else:
                                     txt = await resp.text()
-                                    logger.error(f"Failed to send workflow {_id}: {resp.status} - {txt}")
+                                    logger.error(f"Failed to send workflow {task.prompt_id}: {resp.status} - {txt}")
                                     # 如果遇到非法的工作流（例如 400-500 状态码），直接丢弃该任务并将其数据存盘备份以防死循环
                                     with self.queue_lock:
                                         if 400 <= resp.status <= 500:
                                             self.queue.clear_running()
                                             try:
                                                 date_str = datetime.date.today().isoformat()
-                                                dir_name = f"{date_str}-{resp.status}-{_id}"
+                                                dir_name = f"{date_str}-{resp.status}-{task.prompt_id}"
                                                 failed_dir = os.path.join(self.config.data_dir, "failed_workflows", dir_name)
                                                 os.makedirs(failed_dir, exist_ok=True)
                                                 
@@ -314,20 +313,18 @@ class Gateway:
                                                     
                                                 # 获取并单独存盘 workflow JSON
                                                 workflow = None
-                                                if isinstance(extra_data, dict):
-                                                    extra_data_dict = cast(Dict[str, Any], extra_data)
-                                                    extra_pnginfo = extra_data_dict.get("extra_pnginfo")
-                                                    if isinstance(extra_pnginfo, dict):
-                                                        extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
-                                                        workflow = extra_pnginfo_dict.get("workflow")
-                                                    if not workflow:
-                                                        workflow = extra_data_dict.get("workflow")
-                                                        
-                                                    if workflow:
-                                                        with open(os.path.join(failed_dir, "workflow.json"), "w", encoding="utf-8") as f:
-                                                            json.dump(workflow, f, ensure_ascii=False, indent=2)
+                                                extra_pnginfo = task.extra_data.get("extra_pnginfo")
+                                                if isinstance(extra_pnginfo, dict):
+                                                    extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
+                                                    workflow = extra_pnginfo_dict.get("workflow")
+                                                if not workflow:
+                                                    workflow = task.extra_data.get("workflow")
+                                                    
+                                                if workflow:
+                                                    with open(os.path.join(failed_dir, "workflow.json"), "w", encoding="utf-8") as f:
+                                                        json.dump(workflow, f, ensure_ascii=False, indent=2)
                                                 rel_failed_dir = os.path.relpath(failed_dir, BASE_DIR).replace(os.sep, '/')
-                                                logger.info(f"💾 Failed workflow {_id} saved to {rel_failed_dir}")
+                                                logger.info(f"💾 Failed workflow {task.prompt_id} saved to {rel_failed_dir}")
                                             except Exception as save_err:
                                                 logger.error(f"Failed to save failed workflow details: {save_err}")
                                         else:
