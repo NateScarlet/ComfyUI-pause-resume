@@ -127,7 +127,10 @@ class Gateway:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(('127.0.0.1', 0))
             self.downstream_port = s.getsockname()[1]
-        
+
+        # 初始启动时将可能残留的运行中任务放回待处理队列
+        self.queue.requeue_running()
+
         python_exe = sys.executable
         cmd = [
             python_exe,

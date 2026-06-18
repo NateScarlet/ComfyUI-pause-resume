@@ -486,79 +486,46 @@ class GatewayStateManager:
             self._conn.close()
 
 
-def migrate_json_to_sqlite(json_path: str, sqlite_queue: TaskQueue) -> None:
-    """自动将 JSON 队列中的遗留数据导入 SQLite 中，并对原文件改名备份"""
-    if not os.path.exists(json_path):
-        return
+def transfer_tasks(source: TaskQueue, dest: TaskQueue) -> None:
+    """将源队列中的所有任务转移到目标队列的待处理中（迁移时下游未启动，所有任务均视为待处理）"""
+    pending = source.get_pending()
+    running = source.get_running()
 
-    logger.info(f"📦 Found legacy queue file {json_path}. Migrating to SQLite...")
-    try:
-        legacy_queue = JSONFileQueue(json_path)
-        pending = legacy_queue.get_pending()
-        running = legacy_queue.get_running()
-
-        # 使用 TaskQueue 公开接口来清空并重新填充任务
-        sqlite_queue.clear_running()
-        sqlite_queue.clear_pending()
-
-        # 1. 导入 running 任务，并移入 running 状态
-        for task in running:
-            sqlite_queue.add_task(task)
-            sqlite_queue.pop_task()
-
-        # 2. 导入 pending 任务
-        for task in pending:
-            sqlite_queue.add_task(task)
-
-        # 重命名原 JSON 队列文件，防止再次触发迁移
-        bak_path = json_path + ".bak"
-        if os.path.exists(bak_path):
-            os.remove(bak_path)
-        os.rename(json_path, bak_path)
-        logger.info(f"✅ Migration successful! Legacy queue file renamed to {bak_path}")
-    except Exception as e:
-        logger.error(f"❌ Migration failed: {e}")
+    for task in running:
+        dest.add_task(task)
+    for task in pending:
+        dest.add_task(task)
 
 
 def init_queue(config: GatewayConfig) -> TaskQueue:
-    """根据配置初始化并实例化 TaskQueue，提供从旧当前目录中 queue.json 数据迁移的支持"""
+    """根据配置初始化并实例化 TaskQueue，支持从旧 BASE_DIR 下 queue.json 数据迁移"""
     os.makedirs(config.data_dir, exist_ok=True)
-    
-    new_json_path = os.path.join(config.data_dir, "queue.json")
-    old_json_path = os.path.join(BASE_DIR, "queue.json")
-    
+
     if config.queue_type == "json":
         logger.info("💾 Using JSONFileQueue.")
-        # 如果新路径没有，但旧路径有，迁移至新数据目录
-        if not os.path.exists(new_json_path) and os.path.exists(old_json_path):
-            logger.info(f"🚚 Moving legacy JSON queue from {old_json_path} to {new_json_path}...")
-            try:
-                with open(old_json_path, 'r', encoding='utf-8') as f:
-                    data = f.read()
-                with open(new_json_path, 'w', encoding='utf-8') as f:
-                    f.write(data)
-                
-                # 在旧位置生成 .bak 备份
-                bak_path = old_json_path + ".bak"
-                if os.path.exists(bak_path):
-                    os.remove(bak_path)
-                os.rename(old_json_path, bak_path)
-            except Exception as e:
-                logger.error(f"Failed to migrate legacy JSON queue: {e}")
-        return JSONFileQueue(new_json_path)
+        queue: TaskQueue = JSONFileQueue(os.path.join(config.data_dir, "queue.json"))
     else:
         if config.queue_type != "sqlite":
             logger.warning(f"⚠️ Unknown queue type '{config.queue_type}'. Defaulting to 'sqlite'.")
         db_path = os.path.join(config.data_dir, "queue.db")
         logger.info(f"🗃️ Using SQLiteQueue. DB path: {db_path}")
-        sqlite_queue = SQLiteQueue(db_path)
-        
-        # 尝试从新目录的遗留 json 迁移
-        if os.path.exists(new_json_path):
-            migrate_json_to_sqlite(new_json_path, sqlite_queue)
-            
-        # 尝试从老根目录下的 json 迁移
-        if os.path.exists(old_json_path):
-            migrate_json_to_sqlite(old_json_path, sqlite_queue)
-            
-        return sqlite_queue
+        queue = SQLiteQueue(db_path)
+
+    # 从旧位置迁移遗留的 JSON 队列数据
+    old_json_path = os.path.join(BASE_DIR, "queue.json")
+    if os.path.exists(old_json_path):
+        logger.info(f"📦 Found legacy queue file {old_json_path}. Migrating...")
+        try:
+            legacy_queue = JSONFileQueue(old_json_path)
+            transfer_tasks(legacy_queue, queue)
+            legacy_queue.close()
+
+            bak_path = old_json_path + ".bak"
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+            os.rename(old_json_path, bak_path)
+            logger.info(f"✅ Migration successful! Legacy queue file renamed to {bak_path}")
+        except Exception as e:
+            logger.error(f"❌ Migration failed: {e}")
+
+    return queue
