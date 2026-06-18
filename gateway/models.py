@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import List, Any, Optional, Set
 from .config import BASE_DIR, GatewayConfig
@@ -142,6 +143,11 @@ class JSONFileQueue(TaskQueue):
         with self.lock:
             number = self.global_number
             self.global_number += 1
+            if not isinstance(extra_data, dict):
+                extra_data = {}
+            # 网关本身记录任务创建时间
+            if "create_time" not in extra_data:
+                extra_data["create_time"] = int(time.time() * 1000)
             item: List[Any] = [number, prompt_id, prompt, extra_data, []]
             self.pending_queue.append(item)
             self._save()
@@ -291,6 +297,12 @@ class SQLiteQueue(TaskQueue):
             cursor = self.conn.cursor()
             number = self._get_next_global_number()
             
+            if not isinstance(extra_data, dict):
+                extra_data = {}
+            # 网关本身记录任务创建时间
+            if "create_time" not in extra_data:
+                extra_data["create_time"] = int(time.time() * 1000)
+                
             prompt_str = json.dumps(prompt, ensure_ascii=False)
             extra_data_str = json.dumps(extra_data, ensure_ascii=False)
             outputs_str = json.dumps([], ensure_ascii=False)

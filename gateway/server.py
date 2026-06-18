@@ -154,6 +154,11 @@ class GatewayHandlers:
                 body = await request.json()
                 prompt = body.get("prompt", {})
                 extra_data = body.get("extra_data", {})
+                if not isinstance(extra_data, dict):
+                    extra_data = {}
+                # 网关本身记录任务创建时间，若请求中未携带则由网关填充当前时间
+                if "create_time" not in extra_data:
+                    extra_data["create_time"] = int(time.time() * 1000)
                 
                 prompt_id = str(body.get("prompt_id", uuid.uuid4()))
                 with self.gateway.queue_lock:
@@ -223,7 +228,8 @@ class GatewayHandlers:
                             workflow_dict = cast(Dict[str, Any], workflow)
                             workflow_id = workflow_dict.get('id')
                 if create_time is None:
-                    create_time = int(time.time() * 1000)
+                    # 如果时间不可用，返回 -1 代表不可用，避免使用当前时间产生误导
+                    create_time = -1
                 return {
                     'id': prompt_id,
                     'status': status_str,
@@ -366,7 +372,8 @@ class GatewayHandlers:
                                 workflow_dict = cast(Dict[str, Any], workflow)
                                 workflow_id = workflow_dict.get('id')
                     if create_time is None:
-                        create_time = int(time.time() * 1000)
+                        # 如果时间不可用，返回 -1 代表不可用，避免使用当前时间产生误导
+                        create_time = -1
                     
                     job_dict: Dict[str, Any] = {
                         'id': prompt_id,
