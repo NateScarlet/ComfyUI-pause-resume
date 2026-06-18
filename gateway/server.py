@@ -151,17 +151,26 @@ class GatewayHandlers:
 
         # 拦截并重写 POST /prompt，以便网关自主接管任务队列
         if method == "POST" and path in ("/prompt", "/api/prompt"):
+            _t_total_start = time.perf_counter()
             try:
+                _t_json_start = time.perf_counter()
                 body = await request.json()
+                _t_json = (time.perf_counter() - _t_json_start) * 1000
                 prompt = body.get("prompt", {})
                 extra_data_raw = body.get("extra_data", {})
                 extra_data: dict[str, Any] = dict(cast(dict[str, Any], extra_data_raw)) if isinstance(extra_data_raw, dict) else {}
                 prompt_id = str(body.get("prompt_id", uuid.uuid4()))
+                
+                _t_number: float = 0.0
+                _t_lock_wait = time.perf_counter()
                 with self.gateway.queue_lock:
+                    _t_lock_acquired = (time.perf_counter() - _t_lock_wait) * 1000
                     if "number" in body:
                         number = float(body["number"])
                     else:
+                        _t_number_start = time.perf_counter()
                         number = float(self.gateway.queue.new_task_number())
+                        _t_number = (time.perf_counter() - _t_number_start) * 1000
                         if body.get("front", False):
                             number = -number
                     
@@ -174,15 +183,32 @@ class GatewayHandlers:
                         outputs_to_execute=[],
                         create_time=create_time,
                     )
+                    _t_add_start = time.perf_counter()
                     self.gateway.queue.add_task(task)
+                    _t_add = (time.perf_counter() - _t_add_start) * 1000
+                    
+                _t_total = (time.perf_counter() - _t_total_start) * 1000
+                logger.info(
+                    f"📥 Intercepted workflow {prompt_id} "
+                    f"(json={_t_json:.1f}ms lock_wait={_t_lock_acquired:.1f}ms "
+                    f"new_number={_t_number:.1f}ms add_task={_t_add:.1f}ms total={_t_total:.1f}ms)"
+                )
                     
                 # 异步执行后续的状态变更、WebSocket 广播和日志输出，加速 HTTP 响应返回
                 async def post_process_task():
+                    _t_post_start = time.perf_counter()
                     try:
                         self.gateway.update_sleep_and_programs()
+                        _t_sleep_done = (time.perf_counter() - _t_post_start) * 1000
                         self.gateway.broadcast_ws_status()
+                        _t_broadcast = (time.perf_counter() - _t_post_start) * 1000 - _t_sleep_done
                         pending_cnt = self.gateway.queue.get_pending_count()
-                        logger.info(f"📥 Intercepted workflow {prompt_id} (Queue: {pending_cnt})")
+                        _t_post_total = (time.perf_counter() - _t_post_start) * 1000
+                        logger.info(
+                            f"📬 Post-process {prompt_id} "
+                            f"(sleep={_t_sleep_done:.1f}ms broadcast={_t_broadcast:.1f}ms "
+                            f"total={_t_post_total:.1f}ms Queue: {pending_cnt})"
+                        )
                     except Exception as ex:
                         logger.error(f"Error in post_process_task for {prompt_id}: {ex}")
 

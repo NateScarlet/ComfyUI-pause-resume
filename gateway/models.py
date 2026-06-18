@@ -2,6 +2,7 @@ import os
 import json
 import random
 import sqlite3
+import time
 import threading
 import logging
 from abc import ABC, abstractmethod
@@ -342,27 +343,37 @@ class SQLiteQueue(TaskQueue):
             return tasks
 
     def get_pending_count(self, limit: Optional[int] = None) -> int:
+        _t_start = time.perf_counter()
         with self._lock:
             cursor = self._conn.cursor()
             if limit is not None:
                 # 使用限制行数的局部扫描判断是否存在或是否满足数量
                 cursor.execute("SELECT 1 FROM tasks_v2 WHERE status = 'pending' LIMIT ?", (limit,))
-                return len(cursor.fetchall())
+                result = len(cursor.fetchall())
             else:
                 cursor.execute("SELECT COUNT(*) FROM tasks_v2 WHERE status = 'pending'")
                 row = cursor.fetchone()
-                return row[0] if row else 0
+                result = row[0] if row else 0
+        _t_total = (time.perf_counter() - _t_start) * 1000
+        if _t_total > 10:  # 超过 10ms 才记录，避免日志噪音
+            logger.debug(f"SQLite get_pending_count(limit={limit}) = {result} took {_t_total:.1f}ms")
+        return result
 
     def get_running_count(self, limit: Optional[int] = None) -> int:
+        _t_start = time.perf_counter()
         with self._lock:
             cursor = self._conn.cursor()
             if limit is not None:
                 cursor.execute("SELECT 1 FROM tasks_v2 WHERE status = 'running' LIMIT ?", (limit,))
-                return len(cursor.fetchall())
+                result = len(cursor.fetchall())
             else:
                 cursor.execute("SELECT COUNT(*) FROM tasks_v2 WHERE status = 'running'")
                 row = cursor.fetchone()
-                return row[0] if row else 0
+                result = row[0] if row else 0
+        _t_total = (time.perf_counter() - _t_start) * 1000
+        if _t_total > 10:
+            logger.debug(f"SQLite get_running_count(limit={limit}) = {result} took {_t_total:.1f}ms")
+        return result
 
     def new_task_number(self) -> int:
         with self._lock:
@@ -375,17 +386,27 @@ class SQLiteQueue(TaskQueue):
             return number
 
     def add_task(self, task: Task) -> None:
+        _t_start = time.perf_counter()
         with self._lock:
             cursor = self._conn.cursor()
+            _t_serialize_start = time.perf_counter()
             prompt_str = json.dumps(task.prompt, ensure_ascii=False)
             extra_data_str = json.dumps(task.extra_data, ensure_ascii=False)
             outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
+            _t_serialize = (time.perf_counter() - _t_serialize_start) * 1000
             
             cursor.execute(
                 "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
                 (task.prompt_id, task.number, prompt_str, extra_data_str, outputs_str, task.create_time)
             )
+            _t_commit_start = time.perf_counter()
             self._conn.commit()
+            _t_commit = (time.perf_counter() - _t_commit_start) * 1000
+        _t_total = (time.perf_counter() - _t_start) * 1000
+        logger.debug(
+            f"SQLite add_task {task.prompt_id}: "
+            f"serialize={_t_serialize:.1f}ms commit={_t_commit:.1f}ms total={_t_total:.1f}ms"
+        )
 
     def pop_task(self, skip: int = 0) -> Optional[Task]:
         with self._lock:
