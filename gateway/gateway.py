@@ -275,7 +275,7 @@ class Gateway:
                     
                     if task:
                         # 准备派发一个任务！
-                        _, _id, prompt, extra_data, _ = task
+                        _, _id, prompt, extra_data, *_ = task
                         body = {
                             "prompt": prompt,
                             "prompt_id": _id,

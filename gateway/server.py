@@ -3,7 +3,6 @@ import logging
 import traceback
 import asyncio
 import uuid
-import time
 import aiohttp
 from aiohttp import web
 from typing import List, Dict, Any, Set, Union, cast
@@ -156,13 +155,17 @@ class GatewayHandlers:
                 extra_data = body.get("extra_data", {})
                 if not isinstance(extra_data, dict):
                     extra_data = {}
-                # 网关本身记录任务创建时间，若请求中未携带则由网关填充当前时间
-                if "create_time" not in extra_data:
-                    extra_data["create_time"] = int(time.time() * 1000)
-                
                 prompt_id = str(body.get("prompt_id", uuid.uuid4()))
                 with self.gateway.queue_lock:
-                    number = self.gateway.queue.add_task(prompt_id, prompt, extra_data)
+                    next_num = self.gateway.queue.get_next_global_number()
+                    if "number" in body:
+                        number = float(body["number"])
+                    else:
+                        number = float(next_num)
+                        if body.get("front", False):
+                            number = -number
+                    
+                    self.gateway.queue.add_task(prompt_id, prompt, extra_data, number)
                     
                 # 异步执行后续的状态变更、WebSocket 广播和日志输出，加速 HTTP 响应返回
                 async def post_process_task():
@@ -214,12 +217,11 @@ class GatewayHandlers:
                 logger.error(f"Error fetching jobs from downstream: {e}")
                 
             def make_job_dict(item: List[Any], status_str: str) -> Dict[str, Any]:
-                number, prompt_id, _, extra_data, _ = item
-                create_time = None
+                number, prompt_id, _, extra_data, *_ = item
+                create_time = item[5] if len(item) > 5 else -1
                 workflow_id = None
                 if isinstance(extra_data, dict):
                     extra_data_dict = cast(Dict[str, Any], extra_data)
-                    create_time = extra_data_dict.get('create_time')
                     extra_pnginfo = extra_data_dict.get('extra_pnginfo', {})
                     if isinstance(extra_pnginfo, dict):
                         extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
@@ -227,9 +229,6 @@ class GatewayHandlers:
                         if isinstance(workflow, dict):
                             workflow_dict = cast(Dict[str, Any], workflow)
                             workflow_id = workflow_dict.get('id')
-                if create_time is None:
-                    # 如果时间不可用，返回 -1 代表不可用，避免使用当前时间产生误导
-                    create_time = -1
                 return {
                     'id': prompt_id,
                     'status': status_str,
@@ -358,12 +357,11 @@ class GatewayHandlers:
                             break
                             
                 if target_task:
-                    number, prompt_id, prompt, extra_data, _ = target_task
-                    create_time = None
+                    number, prompt_id, prompt, extra_data, *_ = target_task
+                    create_time = target_task[5] if len(target_task) > 5 else -1
                     workflow_id = None
                     if isinstance(extra_data, dict):
                         extra_data_dict = cast(Dict[str, Any], extra_data)
-                        create_time = extra_data_dict.get('create_time')
                         extra_pnginfo = extra_data_dict.get('extra_pnginfo', {})
                         if isinstance(extra_pnginfo, dict):
                             extra_pnginfo_dict = cast(Dict[str, Any], extra_pnginfo)
@@ -371,9 +369,6 @@ class GatewayHandlers:
                             if isinstance(workflow, dict):
                                 workflow_dict = cast(Dict[str, Any], workflow)
                                 workflow_id = workflow_dict.get('id')
-                    if create_time is None:
-                        # 如果时间不可用，返回 -1 代表不可用，避免使用当前时间产生误导
-                        create_time = -1
                     
                     job_dict: Dict[str, Any] = {
                         'id': prompt_id,
