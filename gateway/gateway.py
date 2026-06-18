@@ -50,6 +50,10 @@ class Gateway:
         self.sse_clients: Set[asyncio.Queue[str]] = set()
         self.ws_clients: Set[web.WebSocketResponse] = set()
         self.queue_lock = threading.Lock()
+        
+        # WS 状态广播防抖：避免每次提交任务都触发一次广播
+        self._broadcast_ws_scheduled: bool = False
+        self._broadcast_ws_debounce_sec: float = 0.1
 
     def update_sleep_and_programs(self) -> None:
         """根据当前的执行状态和暂停状态，更新外部程序管理器及 Windows 的休眠阻止状态"""
@@ -88,30 +92,39 @@ class Gateway:
 
     def broadcast_ws_status(self) -> None:
         """
-        主动广播最新的队列剩余数状态给所有活跃的前端 WebSocket 连接。
+        主动广播最新的队列剩余数状态给所有活跃的前端 WebSocket 连接（带防抖）。
         本方法可以在外部线程中被安全调用（如 STDOUT/STDERR 读取线程）。
         """
         if self.loop is None:
             return
-        try:
-            # 采用轻量计数方法，避免在广播状态时加载和反序列化所有排队大对象
-            remaining = self.queue.get_pending_count() + self.queue.get_running_count()
-        except Exception:
-            remaining = 0
+        self.loop.call_soon_threadsafe(self._schedule_broadcast_ws_status)
 
-        msg = {
-            "type": "status",
-            "data": {
-                "status": {
-                    "exec_info": {
-                        "queue_remaining": remaining
+    def _schedule_broadcast_ws_status(self) -> None:
+        """在事件循环中调度防抖的 WS 状态广播，合并短时间内的多次调用"""
+        if self._broadcast_ws_scheduled:
+            return
+        self._broadcast_ws_scheduled = True
+
+        async def _do_broadcast():
+            await asyncio.sleep(self._broadcast_ws_debounce_sec)
+            self._broadcast_ws_scheduled = False
+            try:
+                remaining = self.queue.get_pending_count() + self.queue.get_running_count()
+            except Exception:
+                remaining = 0
+
+            msg = {
+                "type": "status",
+                "data": {
+                    "status": {
+                        "exec_info": {
+                            "queue_remaining": remaining
+                        }
                     }
                 }
             }
-        }
-        msg_str = json.dumps(msg)
+            msg_str = json.dumps(msg)
 
-        async def send_to_all():
             for ws in list(self.ws_clients):
                 try:
                     if not ws.closed:
@@ -119,7 +132,7 @@ class Gateway:
                 except Exception:
                     pass
 
-        self.loop.call_soon_threadsafe(lambda: asyncio.create_task(send_to_all()))
+        asyncio.create_task(_do_broadcast())
 
     def start_downstream(self) -> None:
         """在随机可用端口上异步启动下游 ComfyUI 进程，并启动日志监听线程"""
