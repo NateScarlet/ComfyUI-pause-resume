@@ -32,6 +32,7 @@ class Gateway:
         self.downstream_port: int = 0
         self._preventing_sleep: bool = False
         self._idle_start_time: Optional[float] = None
+        self._ever_active: bool = False
         
         # 实例化外部空闲与繁忙程序管理器
         self._program_manager = ExternalProgramManager(
@@ -57,7 +58,9 @@ class Gateway:
         # 使用 limit=1 优化，快速检测是否有待处理任务即可
         has_pending = self.queue.get_pending_count(limit=1) > 0
         is_busy = self._downstream_executing or (not self.paused and has_pending)
-        self._program_manager.update_state(is_busy)
+        if is_busy:
+            self._ever_active = True
+        self._program_manager.update_state(is_busy, self._ever_active)
         
         scripts_running = self._program_manager.is_running()
         should_prevent_sleep = is_busy or scripts_running
@@ -69,7 +72,7 @@ class Gateway:
                 PowerManagement.prevent_sleep()
                 self._preventing_sleep = True
         else:
-            if self._program_manager.ever_active and self.config.idle_restart_timeout > 0:
+            if self._ever_active and self.config.idle_restart_timeout > 0:
                 if self._idle_start_time is None:
                     self._idle_start_time = time.time()
                     
@@ -249,7 +252,7 @@ class Gateway:
                     
                 # 检查队列空闲强制重启以释放显存/内存资源
                 if (not self._preventing_sleep and 
-                    self._program_manager.ever_active and 
+                    self._ever_active and 
                     self.config.idle_restart_timeout > 0 and 
                     self._idle_start_time is not None and 
                     time.time() - self._idle_start_time > self.config.idle_restart_timeout):

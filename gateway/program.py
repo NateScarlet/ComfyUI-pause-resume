@@ -14,8 +14,7 @@ class ExternalProgramManager:
         self._idle_process: Optional[subprocess.Popen[Any]] = None
         self._busy_process: Optional[subprocess.Popen[Any]] = None
         self._initialized = False
-        self._last_busy_state = False
-        self.ever_active = False
+        self._last_state: tuple[bool, bool] | None = None
 
     def is_running(self) -> bool:
         """检查是否有任何由本管理器启动的外部程序正在运行"""
@@ -26,16 +25,15 @@ class ExternalProgramManager:
             running = True
         return running
 
-    def update_state(self, is_busy: bool) -> None:
+    def update_state(self, is_busy: bool, ever_active: bool) -> None:
         """根据网关当前是繁忙还是空闲，更新并调度外部程序的启动/停止状态"""
-        if not self._initialized or is_busy != self._last_busy_state:
-            self._initialized = True
-            self._last_busy_state = is_busy
+        state = (is_busy, ever_active)
+        if state != self._last_state:
+            self._last_state = state
             
             if is_busy:
-                self.ever_active = True
                 self._start_busy()
-            elif self.ever_active:
+            elif ever_active:
                 self._start_idle()
 
     def _run_program(self, cmd_str: str) -> Optional[subprocess.Popen[Any]]:
