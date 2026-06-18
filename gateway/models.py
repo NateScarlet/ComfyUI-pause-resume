@@ -74,28 +74,28 @@ class TaskQueue(ABC):
 
 class JSONFileQueue(TaskQueue):
     def __init__(self, queue_file: str):
-        self.queue_file = queue_file
-        self.lock = threading.Lock()
-        self.pending_queue: List[List[Any]] = []
-        self.queue_running: List[List[Any]] = []
-        self.next_task_number = 1
+        self._queue_file = queue_file
+        self._lock = threading.Lock()
+        self._pending_queue: List[List[Any]] = []
+        self._queue_running: List[List[Any]] = []
+        self._next_task_number = 1
         self._load()
 
     def _load(self) -> None:
-        if os.path.exists(self.queue_file):
+        if os.path.exists(self._queue_file):
             try:
-                with open(self.queue_file, "r", encoding="utf-8") as f:
+                with open(self._queue_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 pending = data.get("queue_pending", [])
                 running = data.get("queue_running", [])
                 
-                self.pending_queue = running + pending
-                self.queue_running = []
+                self._pending_queue = running + pending
+                self._queue_running = []
                 
                 # 去重并滤除异常结构
                 seen_ids: Set[str] = set()
                 new_q: List[List[Any]] = []
-                for q in self.pending_queue:
+                for q in self._pending_queue:
                     if len(q) < 2:
                         continue
                     _id = str(q[1])
@@ -110,119 +110,119 @@ class JSONFileQueue(TaskQueue):
                             q[5] = int(q[5])
                         
                         new_q.append(q)
-                self.pending_queue = new_q
+                self._pending_queue = new_q
                 
                 # 按 number 升序排序待处理队列，以保证符合 number 升序
-                self.pending_queue.sort(key=lambda x: x[0])
+                self._pending_queue.sort(key=lambda x: x[0])
                 
                 if new_q:
                     # q[0] 可能是正数、负数或浮点数，我们取绝对值的最大值作为自增计数器的基础
-                    self.next_task_number = max(int(abs(float(q[0]))) for q in new_q) + 1
+                    self._next_task_number = max(int(abs(float(q[0]))) for q in new_q) + 1
             except Exception as e:
                 logger.error(f"Failed to load queue.json: {e}")
 
     def _save(self) -> None:
         try:
             data = {
-                "queue_running": self.queue_running,
-                "queue_pending": self.pending_queue
+                "queue_running": self._queue_running,
+                "queue_pending": self._pending_queue
             }
-            temp_file = self.queue_file + ".tmp"
+            temp_file = self._queue_file + ".tmp"
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
-            os.replace(temp_file, self.queue_file)
+            os.replace(temp_file, self._queue_file)
         except Exception as e:
             logger.error(f"Failed to save queue: {e}")
 
     def get_pending(self) -> List[List[Any]]:
-        with self.lock:
-            return list(self.pending_queue)
+        with self._lock:
+            return list(self._pending_queue)
 
     def get_running(self) -> List[List[Any]]:
-        with self.lock:
-            return list(self.queue_running)
+        with self._lock:
+            return list(self._queue_running)
 
     def get_pending_count(self, limit: Optional[int] = None) -> int:
-        with self.lock:
-            cnt = len(self.pending_queue)
+        with self._lock:
+            cnt = len(self._pending_queue)
             if limit is not None:
                 return min(cnt, limit)
             return cnt
 
     def get_running_count(self, limit: Optional[int] = None) -> int:
-        with self.lock:
-            cnt = len(self.queue_running)
+        with self._lock:
+            cnt = len(self._queue_running)
             if limit is not None:
                 return min(cnt, limit)
             return cnt
 
     def new_task_number(self) -> int:
-        with self.lock:
-            number = self.next_task_number
-            self.next_task_number += 1
+        with self._lock:
+            number = self._next_task_number
+            self._next_task_number += 1
             return number
 
     def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
-        with self.lock:
+        with self._lock:
             extra_dict: dict[str, Any] = {}
             if isinstance(extra_data, dict):
                 extra_dict = dict(cast(Dict[str, Any], extra_data))  # 拷贝以避免副作用
                 
             create_time = int(extra_dict.pop("create_time", int(time.time() * 1000)))
             item: List[Any] = [number, prompt_id, prompt, extra_dict, [], create_time]
-            self.pending_queue.append(item)
-            self.pending_queue.sort(key=lambda x: x[0])
+            self._pending_queue.append(item)
+            self._pending_queue.sort(key=lambda x: x[0])
             self._save()
             return number
 
     def pop_task(self, idx: int) -> Optional[List[Any]]:
-        with self.lock:
-            if 0 <= idx < len(self.pending_queue):
-                task = self.pending_queue.pop(idx)
-                self.queue_running = [task]
+        with self._lock:
+            if 0 <= idx < len(self._pending_queue):
+                task = self._pending_queue.pop(idx)
+                self._queue_running = [task]
                 self._save()
                 return task
             return None
 
     def requeue_running(self, idx: int) -> None:
-        with self.lock:
-            if self.queue_running:
-                task = self.queue_running[0]
-                insert_idx = min(idx, len(self.pending_queue))
+        with self._lock:
+            if self._queue_running:
+                task = self._queue_running[0]
+                insert_idx = min(idx, len(self._pending_queue))
                 
                 # 重新计算该任务的 number 属性，使它和被插入的 idx 位置相匹配
-                if not self.pending_queue:
+                if not self._pending_queue:
                     new_num = 1.0
                 elif insert_idx <= 0:
-                    new_num = float(self.pending_queue[0][0]) - 1.0
-                elif insert_idx >= len(self.pending_queue):
-                    new_num = float(self.pending_queue[-1][0]) + 1.0
+                    new_num = float(self._pending_queue[0][0]) - 1.0
+                elif insert_idx >= len(self._pending_queue):
+                    new_num = float(self._pending_queue[-1][0]) + 1.0
                 else:
-                    new_num = (float(self.pending_queue[insert_idx - 1][0]) + float(self.pending_queue[insert_idx][0])) / 2.0
+                    new_num = (float(self._pending_queue[insert_idx - 1][0]) + float(self._pending_queue[insert_idx][0])) / 2.0
                 
                 task[0] = new_num
                 # 确保 task 包含 6 个元素
                 if len(task) == 5:
                     task.append(-1)
-                self.pending_queue.insert(insert_idx, task)
-                self.queue_running.clear()
-                self.pending_queue.sort(key=lambda x: x[0])
+                self._pending_queue.insert(insert_idx, task)
+                self._queue_running.clear()
+                self._pending_queue.sort(key=lambda x: x[0])
                 self._save()
 
     def clear_running(self) -> None:
-        with self.lock:
-            self.queue_running.clear()
+        with self._lock:
+            self._queue_running.clear()
             self._save()
 
     def clear_pending(self) -> None:
-        with self.lock:
-            self.pending_queue.clear()
+        with self._lock:
+            self._pending_queue.clear()
             self._save()
 
     def delete_pending(self, prompt_ids: List[str]) -> None:
-        with self.lock:
+        with self._lock:
             to_delete = set(prompt_ids)
-            self.pending_queue = [q for q in self.pending_queue if q[1] not in to_delete]
+            self._pending_queue = [q for q in self._pending_queue if q[1] not in to_delete]
             self._save()
 
     def close(self) -> None:
@@ -231,18 +231,18 @@ class JSONFileQueue(TaskQueue):
 
 class SQLiteQueue(TaskQueue):
     def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.lock = threading.Lock()
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
         self._init_db()
 
     def _init_db(self) -> None:
-        with self.lock:
+        with self._lock:
             # 开启 WAL 模式提高读写并发性能
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-            self.conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
             
-            cursor = self.conn.cursor()
+            cursor = self._conn.cursor()
             cursor.execute("PRAGMA user_version")
             db_version = cursor.fetchone()[0]
             
@@ -275,8 +275,8 @@ class SQLiteQueue(TaskQueue):
                 
                 if old_tasks_exists:
                     logger.info("🔧 Migrating SQLite schema: Migrating data from 'tasks' to 'tasks_v2'...")
-                    select_cursor = self.conn.cursor()
-                    insert_cursor = self.conn.cursor()
+                    select_cursor = self._conn.cursor()
+                    insert_cursor = self._conn.cursor()
                     select_cursor.execute("SELECT id, number, prompt, extra_data, outputs_to_execute, status FROM tasks")
                     for row in select_cursor:
                         task_id, number, prompt_str, extra_data_str, outputs_str, status = row
@@ -299,11 +299,11 @@ class SQLiteQueue(TaskQueue):
                 
                 # 标记版本为 2
                 cursor.execute("PRAGMA user_version = 2")
-                self.conn.commit()
+                self._conn.commit()
 
     def get_pending(self) -> List[List[Any]]:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC"
             )
@@ -321,8 +321,8 @@ class SQLiteQueue(TaskQueue):
             return tasks
 
     def get_running(self) -> List[List[Any]]:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'running'"
             )
@@ -340,8 +340,8 @@ class SQLiteQueue(TaskQueue):
             return tasks
 
     def get_pending_count(self, limit: Optional[int] = None) -> int:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             if limit is not None:
                 # 使用限制行数的局部扫描判断是否存在或是否满足数量
                 cursor.execute("SELECT 1 FROM tasks_v2 WHERE status = 'pending' LIMIT ?", (limit,))
@@ -352,8 +352,8 @@ class SQLiteQueue(TaskQueue):
                 return row[0] if row else 0
 
     def get_running_count(self, limit: Optional[int] = None) -> int:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             if limit is not None:
                 cursor.execute("SELECT 1 FROM tasks_v2 WHERE status = 'running' LIMIT ?", (limit,))
                 return len(cursor.fetchall())
@@ -363,18 +363,18 @@ class SQLiteQueue(TaskQueue):
                 return row[0] if row else 0
 
     def new_task_number(self) -> int:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute("SELECT value FROM metadata WHERE key = 'next_task_number'")
             row = cursor.fetchone()
             number = int(row[0]) if row else 1
             cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('next_task_number', ?)", (str(number + 1),))
-            self.conn.commit()
+            self._conn.commit()
             return number
 
     def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             
             extra_dict: dict[str, Any] = {}
             if isinstance(extra_data, dict):
@@ -390,12 +390,12 @@ class SQLiteQueue(TaskQueue):
                 "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
                 (prompt_id, number, prompt_str, extra_data_str, outputs_str, create_time)
             )
-            self.conn.commit()
+            self._conn.commit()
             return number
 
     def pop_task(self, idx: int) -> Optional[List[Any]]:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             # 仅在数据库中定位当前偏移量的单个任务，且按 number 升序排序，并包含 create_time
             cursor.execute(
                 "SELECT id, number, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
@@ -405,7 +405,7 @@ class SQLiteQueue(TaskQueue):
             if row:
                 target_id = row[0]
                 cursor.execute("UPDATE tasks_v2 SET status = 'running' WHERE id = ?", (target_id,))
-                self.conn.commit()
+                self._conn.commit()
                 
                 try:
                     prompt = json.loads(row[2])
@@ -418,8 +418,8 @@ class SQLiteQueue(TaskQueue):
             return None
 
     def requeue_running(self, idx: int) -> None:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute("SELECT id FROM tasks_v2 WHERE status = 'running'")
             running_rows = cursor.fetchall()
             if not running_rows:
@@ -442,62 +442,62 @@ class SQLiteQueue(TaskQueue):
                 new_num = (float(pending_rows[idx-1][1]) + float(pending_rows[idx][1])) / 2.0
                 
             cursor.execute("UPDATE tasks_v2 SET status = 'pending', number = ? WHERE id = ?", (new_num, running_id))
-            self.conn.commit()
+            self._conn.commit()
 
     def clear_running(self) -> None:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute("DELETE FROM tasks_v2 WHERE status = 'running'")
-            self.conn.commit()
+            self._conn.commit()
 
     def clear_pending(self) -> None:
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute("DELETE FROM tasks_v2 WHERE status = 'pending'")
-            self.conn.commit()
+            self._conn.commit()
 
     def delete_pending(self, prompt_ids: List[str]) -> None:
         if not prompt_ids:
             return
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             placeholders = ",".join("?" for _ in prompt_ids)
             cursor.execute(
                 f"DELETE FROM tasks_v2 WHERE status = 'pending' AND id IN ({placeholders})",
                 tuple(prompt_ids)
             )
-            self.conn.commit()
+            self._conn.commit()
 
     def close(self) -> None:
-        with self.lock:
-            self.conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 class GatewayStateManager:
     """持久化保存网关状态属性（如暂停/恢复状态）"""
     def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.lock = threading.Lock()
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
         self._init_db()
 
     def _init_db(self) -> None:
-        with self.lock:
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-            self.conn.execute("PRAGMA synchronous=NORMAL;")
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
             
-            self.conn.execute("""
+            self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS state (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
-            self.conn.commit()
+            self._conn.commit()
 
     def get_paused(self) -> bool:
         """获取网关暂停状态"""
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self._lock:
+            cursor = self._conn.cursor()
             cursor.execute("SELECT value FROM state WHERE key = 'paused'")
             row = cursor.fetchone()
             if row is not None:
@@ -506,15 +506,15 @@ class GatewayStateManager:
 
     def set_paused(self, paused: bool) -> None:
         """持久化保存网关的暂停状态"""
-        with self.lock:
+        with self._lock:
             val = 'true' if paused else 'false'
-            self.conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('paused', ?)", (val,))
-            self.conn.commit()
+            self._conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('paused', ?)", (val,))
+            self._conn.commit()
 
     def close(self) -> None:
         """关闭数据库连接"""
-        with self.lock:
-            self.conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 def migrate_json_to_sqlite(json_path: str, sqlite_queue: TaskQueue) -> None:

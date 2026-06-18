@@ -28,20 +28,20 @@ class Gateway:
         
         # 运行时状态变量
         self.paused: bool = state_manager.get_paused()
-        self.downstream_executing: bool = False
+        self._downstream_executing: bool = False
         self.downstream_port: int = 0
-        self.preventing_sleep: bool = False
-        self.idle_start_time: Optional[float] = None
+        self._preventing_sleep: bool = False
+        self._idle_start_time: Optional[float] = None
         
         # 实例化外部空闲与繁忙程序管理器
-        self.program_manager = ExternalProgramManager(
+        self._program_manager = ExternalProgramManager(
             config.idle_program, 
             config.busy_program
         )
-        self.process: Optional[subprocess.Popen[str]] = None
-        self.attempt_count: int = 0
-        self.current_task_idx: int = 0
-        self.is_restarting: bool = False
+        self._process: Optional[subprocess.Popen[str]] = None
+        self._attempt_count: int = 0
+        self._current_task_idx: int = 0
+        self._is_restarting: bool = False
         self.downstream_ready: bool = False
         self.exiting: bool = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -56,27 +56,27 @@ class Gateway:
         # 如果已被暂停，即使有待处理任务且下游未执行，也不视为繁忙，以便允许系统休眠
         # 使用 limit=1 优化，快速检测是否有待处理任务即可
         has_pending = self.queue.get_pending_count(limit=1) > 0
-        is_busy = self.downstream_executing or (not self.paused and has_pending)
-        self.program_manager.update_state(is_busy)
+        is_busy = self._downstream_executing or (not self.paused and has_pending)
+        self._program_manager.update_state(is_busy)
         
-        scripts_running = self.program_manager.is_running()
+        scripts_running = self._program_manager.is_running()
         should_prevent_sleep = is_busy or scripts_running
         
         if should_prevent_sleep:
-            self.idle_start_time = None
-            if not self.preventing_sleep:
+            self._idle_start_time = None
+            if not self._preventing_sleep:
                 logger.info("☕ Preventing system sleep")
                 PowerManagement.prevent_sleep()
-                self.preventing_sleep = True
+                self._preventing_sleep = True
         else:
-            if self.program_manager.ever_active and self.config.idle_restart_timeout > 0:
-                if self.idle_start_time is None:
-                    self.idle_start_time = time.time()
+            if self._program_manager.ever_active and self.config.idle_restart_timeout > 0:
+                if self._idle_start_time is None:
+                    self._idle_start_time = time.time()
                     
-            if self.preventing_sleep:
+            if self._preventing_sleep:
                 logger.info("💤 Allowing system sleep")
                 PowerManagement.allow_sleep()
-                self.preventing_sleep = False
+                self._preventing_sleep = False
 
     def broadcast_state(self) -> None:
         """将最新的网关暂停/恢复状态广播给所有连接的 SSE 客户端"""
@@ -140,7 +140,7 @@ class Gateway:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
-        self.process = subprocess.Popen(
+        self._process = subprocess.Popen(
             cmd,
             cwd=BASE_DIR,  # 重写为 BASE_DIR，防止在 gateway/data 下找不到 main.py
             stdout=subprocess.PIPE,
@@ -164,18 +164,18 @@ class Gateway:
                 
                 # 监控日志以更新工作流的执行状态
                 if "got prompt" in line:
-                    self.downstream_executing = True
+                    self._downstream_executing = True
                     self.update_sleep_and_programs()
                 elif "Prompt executed in" in line:
                     with self.queue_lock:
-                        self.downstream_executing = False
+                        self._downstream_executing = False
                         self.queue.clear_running()
-                        self.attempt_count = 0
+                        self._attempt_count = 0
                     self.update_sleep_and_programs()
                     self.broadcast_ws_status()
                     
-        threading.Thread(target=log_reader, args=(self.process.stdout, False), daemon=True).start()
-        threading.Thread(target=log_reader, args=(self.process.stderr, True), daemon=True).start()
+        threading.Thread(target=log_reader, args=(self._process.stdout, False), daemon=True).start()
+        threading.Thread(target=log_reader, args=(self._process.stderr, True), daemon=True).start()
 
     async def wait_downstream_ready(self) -> None:
         """向启动的下游服务发送 GET 请求，以轮询等待其完全就绪"""
@@ -195,27 +195,27 @@ class Gateway:
         logger.error("❌ Downstream wait timeout")
         sys.exit(1)
 
-    async def restart_downstream_async(self) -> None:
+    async def restart_downstream(self) -> None:
         """异步重启下游服务进程，并安全释放相关资源"""
-        self.is_restarting = True
+        self._is_restarting = True
         self.downstream_ready = False
         try:
-            if self.process:
+            if self._process:
                 try:
-                    self.process.kill()
+                    self._process.kill()
                     # 等待老进程退出以释放独占资源和显存
                     for _ in range(100):
-                        if self.process.poll() is not None:
+                        if self._process.poll() is not None:
                             break
                         await asyncio.sleep(0.1)
                 except Exception:
                     pass
-                self.process = None
-            self.downstream_executing = False
+                self._process = None
+            self._downstream_executing = False
             self.start_downstream()
             await self.wait_downstream_ready()
         finally:
-            self.is_restarting = False
+            self._is_restarting = False
 
     async def queue_dispatcher(self) -> None:
         """后台队列调度轮询器：负责将队列中的任务推送至下游，并检查服务是否发生异常奔溃"""
@@ -230,8 +230,8 @@ class Gateway:
                 self.update_sleep_and_programs()
                 
                 # 仅在非主动重启期间，监控并检查下游进程是否发生了意外退出
-                if not self.is_restarting and self.process and self.process.poll() is not None:
-                    exit_code = self.process.poll()
+                if not self._is_restarting and self._process and self._process.poll() is not None:
+                    exit_code = self._process.poll()
                     logger.error(
                         f"❌ Downstream process exited unexpectedly with code {exit_code}. "
                         f"Restarting in {self.config.restart_delay_sec} seconds..."
@@ -239,39 +239,39 @@ class Gateway:
                     with self.queue_lock:
                         if self.queue.get_running_count(limit=1) > 0:
                             # 通过限制 limit 来计算 min(current_task_idx, pending_count)，以避免扫描全表
-                            idx = self.queue.get_pending_count(limit=self.current_task_idx)
+                            idx = self.queue.get_pending_count(limit=self._current_task_idx)
                             self.queue.requeue_running(idx)
-                            self.attempt_count += 1
+                            self._attempt_count += 1
                     self.broadcast_ws_status()
                     await asyncio.sleep(self.config.restart_delay_sec)
-                    await self.restart_downstream_async()
+                    await self.restart_downstream()
                     continue
                     
                 # 检查队列空闲强制重启以释放显存/内存资源
-                if (not self.preventing_sleep and 
-                    self.program_manager.ever_active and 
+                if (not self._preventing_sleep and 
+                    self._program_manager.ever_active and 
                     self.config.idle_restart_timeout > 0 and 
-                    self.idle_start_time is not None and 
-                    time.time() - self.idle_start_time > self.config.idle_restart_timeout):
+                    self._idle_start_time is not None and 
+                    time.time() - self._idle_start_time > self.config.idle_restart_timeout):
                     
                     logger.info(
                         f"🕒 Idle timeout ({self.config.idle_restart_timeout}s), "
                         f"restarting downstream to free resources..."
                     )
-                    await self.restart_downstream_async()
-                    self.idle_start_time = None
+                    await self.restart_downstream()
+                    self._idle_start_time = None
 
                 # 判定在非暂停且下游处于就绪且空闲状态时，进行任务派发
-                if not self.paused and not self.downstream_executing and self.downstream_ready:
+                if not self.paused and not self._downstream_executing and self.downstream_ready:
                     with self.queue_lock:
                         pending_count = self.queue.get_pending_count()
                         if pending_count > 0:
-                            idx = self.attempt_count % pending_count
+                            idx = self._attempt_count % pending_count
                             task = self.queue.pop_task(idx)
-                            self.current_task_idx = idx
+                            self._current_task_idx = idx
                         else:
                             task = None
-                            self.attempt_count = 0
+                            self._attempt_count = 0
                     
                     if task:
                         # 准备派发一个任务！
@@ -289,7 +289,7 @@ class Gateway:
                             async with session.post(url, json=body) as resp:
                                 if resp.status == 200:
                                     logger.info(f"📤 Sent workflow {_id} to downstream")
-                                    self.downstream_executing = True 
+                                    self._downstream_executing = True 
                                     self.update_sleep_and_programs()
                                     self.broadcast_ws_status()
                                 else:
@@ -334,14 +334,14 @@ class Gateway:
                                         else:
                                             # 如果是其它暂时性服务错误，将其放回待处理队列并进行重试递增
                                             # 同样使用 limit 优化数据库/文件扫描行数
-                                            idx = self.queue.get_pending_count(limit=self.current_task_idx)
+                                            idx = self.queue.get_pending_count(limit=self._current_task_idx)
                                             self.queue.requeue_running(idx)
-                                            self.attempt_count += 1
+                                            self._attempt_count += 1
                                     self.broadcast_ws_status()
                         except Exception as e:
                             logger.error(f"Error sending workflow: {e}")
                             with self.queue_lock:
-                                idx = self.queue.get_pending_count(limit=self.current_task_idx)
+                                idx = self.queue.get_pending_count(limit=self._current_task_idx)
                                 self.queue.requeue_running(idx)
                             self.broadcast_ws_status()
 
@@ -383,16 +383,16 @@ class Gateway:
                 self.queue.close()
             except Exception:
                 pass
-        if self.process:
+        if self._process:
             try:
                 logger.info("Cleaning up downstream process...")
-                self.process.kill()
+                self._process.kill()
             except Exception:
                 pass
-        if self.program_manager:
+        if self._program_manager:
             try:
                 logger.info("Cleaning up external programs...")
-                self.program_manager.cleanup()
+                self._program_manager.cleanup()
             except Exception:
                 pass
         PowerManagement.allow_sleep()
