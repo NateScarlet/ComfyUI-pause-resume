@@ -157,11 +157,10 @@ class GatewayHandlers:
                     extra_data = {}
                 prompt_id = str(body.get("prompt_id", uuid.uuid4()))
                 with self.gateway.queue_lock:
-                    next_num = self.gateway.queue.get_next_global_number()
                     if "number" in body:
                         number = float(body["number"])
                     else:
-                        number = float(next_num)
+                        number = float(self.gateway.queue.new_task_number())
                         if body.get("front", False):
                             number = -number
                     

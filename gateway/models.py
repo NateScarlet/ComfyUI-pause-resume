@@ -32,8 +32,8 @@ class TaskQueue(ABC):
         pass
 
     @abstractmethod
-    def get_next_global_number(self) -> int:
-        """获取下一个自增任务编号"""
+    def new_task_number(self) -> int:
+        """分配一个新的唯一任务编号，每次调用保证返回不同的值"""
         pass
 
     @abstractmethod
@@ -78,7 +78,7 @@ class JSONFileQueue(TaskQueue):
         self.lock = threading.Lock()
         self.pending_queue: List[List[Any]] = []
         self.queue_running: List[List[Any]] = []
-        self.global_number = 1
+        self.next_task_number = 1
         self._load()
 
     def _load(self) -> None:
@@ -117,7 +117,7 @@ class JSONFileQueue(TaskQueue):
                 
                 if new_q:
                     # q[0] 可能是正数、负数或浮点数，我们取绝对值的最大值作为自增计数器的基础
-                    self.global_number = max(int(abs(float(q[0]))) for q in new_q) + 1
+                    self.next_task_number = max(int(abs(float(q[0]))) for q in new_q) + 1
             except Exception as e:
                 logger.error(f"Failed to load queue.json: {e}")
 
@@ -156,14 +156,14 @@ class JSONFileQueue(TaskQueue):
                 return min(cnt, limit)
             return cnt
 
-    def get_next_global_number(self) -> int:
+    def new_task_number(self) -> int:
         with self.lock:
-            return self.global_number
+            number = self.next_task_number
+            self.next_task_number += 1
+            return number
 
     def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
         with self.lock:
-            # 存储层仅原样存入 number 并维护 global_number 大于等于 number 绝对值加 1
-            self.global_number = max(self.global_number, int(abs(number)) + 1)
             extra_dict: dict[str, Any] = {}
             if isinstance(extra_data, dict):
                 extra_dict = dict(cast(Dict[str, Any], extra_data))  # 拷贝以避免副作用
@@ -362,25 +362,19 @@ class SQLiteQueue(TaskQueue):
                 row = cursor.fetchone()
                 return row[0] if row else 0
 
-    def _get_next_global_number(self) -> int:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT value FROM metadata WHERE key = 'global_number'")
-        row = cursor.fetchone()
-        if row:
-            return int(row[0])
-        return 1
-
-    def get_next_global_number(self) -> int:
+    def new_task_number(self) -> int:
         with self.lock:
-            return self._get_next_global_number()
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'next_task_number'")
+            row = cursor.fetchone()
+            number = int(row[0]) if row else 1
+            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('next_task_number', ?)", (str(number + 1),))
+            self.conn.commit()
+            return number
 
     def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
         with self.lock:
             cursor = self.conn.cursor()
-            
-            # 更新元数据中的 global_number 计数，使其至少为 abs(number) + 1
-            current_global = self._get_next_global_number()
-            next_global = max(current_global, int(abs(number)) + 1)
             
             extra_dict: dict[str, Any] = {}
             if isinstance(extra_data, dict):
@@ -392,12 +386,10 @@ class SQLiteQueue(TaskQueue):
             extra_data_str = json.dumps(extra_dict, ensure_ascii=False)
             outputs_str = json.dumps([], ensure_ascii=False)
             
-            # 插入独立的 create_time
             cursor.execute(
                 "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
                 (prompt_id, number, prompt_str, extra_data_str, outputs_str, create_time)
             )
-            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('global_number', ?)", (str(next_global),))
             self.conn.commit()
             return number
 
