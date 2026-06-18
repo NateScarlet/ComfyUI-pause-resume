@@ -4,3 +4,7 @@ if (Test-Path $envFile) {
 }
 
 & pyright
+if ($LASTEXITCODE) {
+    exit $LASTEXITCODE
+}   
+& black gateway/

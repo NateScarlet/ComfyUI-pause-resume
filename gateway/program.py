@@ -6,8 +6,10 @@ from typing import Optional, Any
 
 logger = logging.getLogger(__name__)
 
+
 class ExternalProgramManager:
     """管理在空闲和繁忙状态下需要运行的外部程序（例如挖矿程序、风扇控制或 GPU 监控等）"""
+
     def __init__(self, idle_path: str, busy_path: str):
         self._idle_path = idle_path
         self._busy_path = busy_path
@@ -30,7 +32,7 @@ class ExternalProgramManager:
         state = (is_busy, ever_active)
         if state != self._last_state:
             self._last_state = state
-            
+
             if is_busy:
                 self._start_busy()
             elif ever_active:
@@ -40,20 +42,20 @@ class ExternalProgramManager:
         """在后台静默运行指定的命令字符串，避免弹出 Windows 黑色命令行窗口"""
         if not cmd_str or not cmd_str.strip():
             return None
-            
+
         is_win = sys.platform == "win32"
         startupinfo = None
         if is_win:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = 0  # 隐藏窗口样式
-            
+
         try:
             args = shlex.split(cmd_str, posix=not is_win)
             if not args:
                 return None
             # Windows 下 .bat 和 .cmd 批处理文件需要通过 cmd.exe 显式调用
-            if is_win and args[0].lower().endswith(('.bat', '.cmd')):
+            if is_win and args[0].lower().endswith((".bat", ".cmd")):
                 args = ["cmd", "/c"] + args
             return subprocess.Popen(args, startupinfo=startupinfo)
         except Exception as e:
@@ -69,7 +71,9 @@ class ExternalProgramManager:
                 pass
             self._busy_process = None
 
-        if self._idle_path and (not self._idle_process or self._idle_process.poll() is not None):
+        if self._idle_path and (
+            not self._idle_process or self._idle_process.poll() is not None
+        ):
             logger.info(f"🌙 Starting idle program: {self._idle_path}")
             self._idle_process = self._run_program(self._idle_path)
 
@@ -82,7 +86,9 @@ class ExternalProgramManager:
                 pass
             self._idle_process = None
 
-        if self._busy_path and (not self._busy_process or self._busy_process.poll() is not None):
+        if self._busy_path and (
+            not self._busy_process or self._busy_process.poll() is not None
+        ):
             logger.info(f"🔥 Starting busy program: {self._busy_path}")
             self._busy_process = self._run_program(self._busy_path)
 

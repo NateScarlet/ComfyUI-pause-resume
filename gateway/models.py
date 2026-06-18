@@ -18,6 +18,7 @@ class RawJSON(str):
 
     类似 Go 语言的 json.RawMessage，配合 _RawJSONEncoder 使用。
     """
+
     pass
 
 
@@ -33,32 +34,32 @@ class RawJSONEncoder(json.JSONEncoder):
             yield o
             return
         elif isinstance(o, dict):
-            yield '{'
+            yield "{"
             first = True
             for key, value in cast(Dict[str, Any], o).items():
                 if not first:
-                    yield ', '
+                    yield ", "
                 first = False
                 yield from self.iterencode(key)
-                yield ': '
+                yield ": "
                 yield from self.iterencode(value)
-            yield '}'
+            yield "}"
         elif isinstance(o, list):
-            yield '['
+            yield "["
             first = True
             for item in cast(List[Any], o):
                 if not first:
-                    yield ', '
+                    yield ", "
                 first = False
                 yield from self.iterencode(item)
-            yield ']'
+            yield "]"
         else:
             yield from super().iterencode(o, _one_shot)
 
 
 def raw_json_dumps(obj: Any, **kwargs: Any) -> str:
     """json.dumps 替代，将 RawJSON 对象作为原始 JSON 嵌入输出而非转义字符串"""
-    return ''.join(RawJSONEncoder(**kwargs).iterencode(obj))
+    return "".join(RawJSONEncoder(**kwargs).iterencode(obj))
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class Task:
     prompt 和 extra_data 以 JSON 字符串形式存储，避免在队列读写时做无意义的
     解析/序列化往返。仅在需要访问内部字段或通过 to_list() 对外输出时才按需解析。
     """
+
     number: float
     prompt_id: str
     prompt: RawJSON
@@ -81,8 +83,14 @@ class Task:
         prompt 和 extra_data 是 _RawJSON 类型，配合 _raw_json_dumps
         或 _RawJSONEncoder 序列化时直接嵌入原始 JSON，避免解析再序列化。
         """
-        return [self.number, self.prompt_id, self.prompt,
-                self.extra_data, list(self.outputs_to_execute)]
+        return [
+            self.number,
+            self.prompt_id,
+            self.prompt,
+            self.extra_data,
+            list(self.outputs_to_execute),
+        ]
+
 
 class TaskQueue(ABC):
     @abstractmethod
@@ -177,7 +185,7 @@ class JSONFileQueue(TaskQueue):
                     data = json.load(f)
                 raw_pending: list[list[Any]] = data.get("queue_pending", [])
                 raw_running: list[list[Any]] = data.get("queue_running", [])
-                
+
                 # 去重并滤除异常结构
                 seen_ids: Set[str] = set()
                 tasks: List[Task] = []
@@ -188,15 +196,17 @@ class JSONFileQueue(TaskQueue):
                     if task.prompt_id not in seen_ids:
                         seen_ids.add(task.prompt_id)
                         tasks.append(task)
-                
+
                 # 按 number 升序排序
                 tasks.sort(key=lambda t: t.number)
                 self._pending_queue = tasks
                 self._queue_running = []
-                
+
                 if tasks:
                     # number 可能是正数、负数或浮点数，取绝对值最大值作为自增计数器基础
-                    self._next_task_number = max(int(abs(float(t.number))) for t in tasks) + 1
+                    self._next_task_number = (
+                        max(int(abs(float(t.number))) for t in tasks) + 1
+                    )
             except Exception as e:
                 logger.error(f"Failed to load queue.json: {e}")
 
@@ -204,7 +214,7 @@ class JSONFileQueue(TaskQueue):
         try:
             data = {
                 "queue_running": [t.to_list() for t in self._queue_running],
-                "queue_pending": [t.to_list() for t in self._pending_queue]
+                "queue_pending": [t.to_list() for t in self._pending_queue],
             }
             temp_file = self._queue_file + ".tmp"
             with open(temp_file, "w", encoding="utf-8") as f:
@@ -279,7 +289,9 @@ class JSONFileQueue(TaskQueue):
     def delete_pending(self, prompt_ids: List[str]) -> None:
         with self._lock:
             to_delete = set(prompt_ids)
-            self._pending_queue = [t for t in self._pending_queue if t.prompt_id not in to_delete]
+            self._pending_queue = [
+                t for t in self._pending_queue if t.prompt_id not in to_delete
+            ]
             self._save()
 
     def close(self) -> None:
@@ -290,7 +302,9 @@ class SQLiteQueue(TaskQueue):
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
+        self._conn = sqlite3.connect(
+            self._db_path, check_same_thread=False, timeout=30.0
+        )
         self._init_db()
 
     def _init_db(self) -> None:
@@ -298,11 +312,11 @@ class SQLiteQueue(TaskQueue):
             # 开启 WAL 模式提高读写并发性能
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
-            
+
             cursor = self._conn.cursor()
             cursor.execute("PRAGMA user_version")
             db_version = cursor.fetchone()[0]
-            
+
             SUPPORTED_VERSION = 2
             if db_version > SUPPORTED_VERSION:
                 raise RuntimeError(
@@ -310,7 +324,7 @@ class SQLiteQueue(TaskQueue):
                     f"but the current code only supports up to version {SUPPORTED_VERSION}. "
                     f"Please upgrade your application."
                 )
-            
+
             # 单向步进升级
             if db_version < 2:
                 # 无论如何先创建 V2 结构表
@@ -325,27 +339,50 @@ class SQLiteQueue(TaskQueue):
                         create_time INTEGER
                     )
                 """)
-                
+
                 # 检查是否存在遗留的 v1 tasks 表以做平滑迁移
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
+                )
                 old_tasks_exists = cursor.fetchone()
-                
+
                 if old_tasks_exists:
-                    logger.info("🔧 Migrating SQLite schema: Migrating data from 'tasks' to 'tasks_v2'...")
+                    logger.info(
+                        "🔧 Migrating SQLite schema: Migrating data from 'tasks' to 'tasks_v2'..."
+                    )
                     select_cursor = self._conn.cursor()
                     insert_cursor = self._conn.cursor()
-                    select_cursor.execute("SELECT id, number, prompt, extra_data, outputs_to_execute, status FROM tasks")
+                    select_cursor.execute(
+                        "SELECT id, number, prompt, extra_data, outputs_to_execute, status FROM tasks"
+                    )
                     for row in select_cursor:
-                        task_id, number, prompt_str, extra_data_str, outputs_str, status = row
+                        (
+                            task_id,
+                            number,
+                            prompt_str,
+                            extra_data_str,
+                            outputs_str,
+                            status,
+                        ) = row
                         create_time = -1
                         insert_cursor.execute(
                             "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (task_id, number, prompt_str, extra_data_str, outputs_str, status, create_time)
+                            (
+                                task_id,
+                                number,
+                                prompt_str,
+                                extra_data_str,
+                                outputs_str,
+                                status,
+                                create_time,
+                            ),
                         )
                     # 删除旧 tasks 表
                     cursor.execute("DROP TABLE tasks")
-                    logger.info("✅ SQLite schema migration to version 2 completed successfully.")
-                
+                    logger.info(
+                        "✅ SQLite schema migration to version 2 completed successfully."
+                    )
+
                 # 4. 创建 metadata 元数据表
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS metadata (
@@ -353,7 +390,7 @@ class SQLiteQueue(TaskQueue):
                         value TEXT
                     )
                 """)
-                
+
                 # 标记版本为 2
                 cursor.execute("PRAGMA user_version = 2")
                 self._conn.commit()
@@ -404,7 +441,9 @@ class SQLiteQueue(TaskQueue):
             cursor = self._conn.cursor()
             if limit is not None:
                 # 使用限制行数的局部扫描判断是否存在或是否满足数量
-                cursor.execute("SELECT 1 FROM tasks_v2 WHERE status = 'pending' LIMIT ?", (limit,))
+                cursor.execute(
+                    "SELECT 1 FROM tasks_v2 WHERE status = 'pending' LIMIT ?", (limit,)
+                )
                 result = len(cursor.fetchall())
             else:
                 cursor.execute("SELECT COUNT(*) FROM tasks_v2 WHERE status = 'pending'")
@@ -412,7 +451,9 @@ class SQLiteQueue(TaskQueue):
                 result = row[0] if row else 0
         _t_total = (time.perf_counter() - _t_start) * 1000
         if _t_total > 10:  # 超过 10ms 才记录，避免日志噪音
-            logger.debug(f"SQLite get_pending_count(limit={limit}) = {result} took {_t_total:.1f}ms")
+            logger.debug(
+                f"SQLite get_pending_count(limit={limit}) = {result} took {_t_total:.1f}ms"
+            )
         return result
 
     def get_running_count(self, limit: Optional[int] = None) -> int:
@@ -420,7 +461,9 @@ class SQLiteQueue(TaskQueue):
         with self._lock:
             cursor = self._conn.cursor()
             if limit is not None:
-                cursor.execute("SELECT 1 FROM tasks_v2 WHERE status = 'running' LIMIT ?", (limit,))
+                cursor.execute(
+                    "SELECT 1 FROM tasks_v2 WHERE status = 'running' LIMIT ?", (limit,)
+                )
                 result = len(cursor.fetchall())
             else:
                 cursor.execute("SELECT COUNT(*) FROM tasks_v2 WHERE status = 'running'")
@@ -428,7 +471,9 @@ class SQLiteQueue(TaskQueue):
                 result = row[0] if row else 0
         _t_total = (time.perf_counter() - _t_start) * 1000
         if _t_total > 10:
-            logger.debug(f"SQLite get_running_count(limit={limit}) = {result} took {_t_total:.1f}ms")
+            logger.debug(
+                f"SQLite get_running_count(limit={limit}) = {result} took {_t_total:.1f}ms"
+            )
         return result
 
     def new_task_number(self) -> int:
@@ -437,7 +482,10 @@ class SQLiteQueue(TaskQueue):
             cursor.execute("SELECT value FROM metadata WHERE key = 'next_task_number'")
             row = cursor.fetchone()
             number = int(row[0]) if row else 1
-            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('next_task_number', ?)", (str(number + 1),))
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('next_task_number', ?)",
+                (str(number + 1),),
+            )
             self._conn.commit()
             return number
 
@@ -448,10 +496,17 @@ class SQLiteQueue(TaskQueue):
             _t_serialize_start = time.perf_counter()
             outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
             _t_serialize = (time.perf_counter() - _t_serialize_start) * 1000
-            
+
             cursor.execute(
                 "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                (task.prompt_id, task.number, task.prompt, task.extra_data, outputs_str, task.create_time)
+                (
+                    task.prompt_id,
+                    task.number,
+                    task.prompt,
+                    task.extra_data,
+                    outputs_str,
+                    task.create_time,
+                ),
             )
             _t_commit_start = time.perf_counter()
             self._conn.commit()
@@ -468,14 +523,16 @@ class SQLiteQueue(TaskQueue):
             # 跳过前 skip 个待处理任务，取下一个
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
-                (skip,)
+                (skip,),
             )
             row = cursor.fetchone()
             if row:
                 target_id = row[1]
-                cursor.execute("UPDATE tasks_v2 SET status = 'running' WHERE id = ?", (target_id,))
+                cursor.execute(
+                    "UPDATE tasks_v2 SET status = 'running' WHERE id = ?", (target_id,)
+                )
                 self._conn.commit()
-                
+
                 try:
                     return self._row_to_task(row)
                 except Exception as e:
@@ -486,7 +543,9 @@ class SQLiteQueue(TaskQueue):
         with self._lock:
             cursor = self._conn.cursor()
             # number 未变，只需将状态改回 pending 即可恢复原位
-            cursor.execute("UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'")
+            cursor.execute(
+                "UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'"
+            )
             self._conn.commit()
 
     def clear_running(self) -> None:
@@ -509,7 +568,7 @@ class SQLiteQueue(TaskQueue):
             placeholders = ",".join("?" for _ in prompt_ids)
             cursor.execute(
                 f"DELETE FROM tasks_v2 WHERE status = 'pending' AND id IN ({placeholders})",
-                tuple(prompt_ids)
+                tuple(prompt_ids),
             )
             self._conn.commit()
 
@@ -520,17 +579,20 @@ class SQLiteQueue(TaskQueue):
 
 class GatewayStateManager:
     """持久化保存网关状态属性（如暂停/恢复状态）"""
+
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
+        self._conn = sqlite3.connect(
+            self._db_path, check_same_thread=False, timeout=30.0
+        )
         self._init_db()
 
     def _init_db(self) -> None:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
-            
+
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS state (
                     key TEXT PRIMARY KEY,
@@ -546,14 +608,16 @@ class GatewayStateManager:
             cursor.execute("SELECT value FROM state WHERE key = 'paused'")
             row = cursor.fetchone()
             if row is not None:
-                return row[0] == 'true'
+                return row[0] == "true"
             return False
 
     def set_paused(self, paused: bool) -> None:
         """持久化保存网关的暂停状态"""
         with self._lock:
-            val = 'true' if paused else 'false'
-            self._conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('paused', ?)", (val,))
+            val = "true" if paused else "false"
+            self._conn.execute(
+                "INSERT OR REPLACE INTO state (key, value) VALUES ('paused', ?)", (val,)
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -582,7 +646,9 @@ def init_queue(config: GatewayConfig) -> TaskQueue:
         queue: TaskQueue = JSONFileQueue(os.path.join(config.data_dir, "queue.json"))
     else:
         if config.queue_type != "sqlite":
-            logger.warning(f"⚠️ Unknown queue type '{config.queue_type}'. Defaulting to 'sqlite'.")
+            logger.warning(
+                f"⚠️ Unknown queue type '{config.queue_type}'. Defaulting to 'sqlite'."
+            )
         db_path = os.path.join(config.data_dir, "queue.db")
         logger.info(f"🗃️ Using SQLiteQueue. DB path: {db_path}")
         queue = SQLiteQueue(db_path)
@@ -597,10 +663,12 @@ def init_queue(config: GatewayConfig) -> TaskQueue:
             legacy_queue.close()
 
             # 使用随机后缀避免覆盖已有备份
-            suffix = ''.join(random.choices('0123456789abcdef', k=8))
+            suffix = "".join(random.choices("0123456789abcdef", k=8))
             bak_path = f"{old_json_path}~{suffix}"
             os.rename(old_json_path, bak_path)
-            logger.info(f"✅ Migration successful! Legacy queue file renamed to {bak_path}")
+            logger.info(
+                f"✅ Migration successful! Legacy queue file renamed to {bak_path}"
+            )
         except Exception as e:
             logger.error(f"❌ Migration failed: {e}")
 

@@ -58,38 +58,46 @@ class TestRawJSONDumps(unittest.TestCase):
 
     def test_mixed_raw_and_regular(self):
         """RawJSON 与普通类型混合"""
-        result = raw_json_dumps({
-            "id": "abc",
-            "data": RawJSON('{"x": 1, "y": 2}'),
-            "count": 3,
-        })
+        result = raw_json_dumps(
+            {
+                "id": "abc",
+                "data": RawJSON('{"x": 1, "y": 2}'),
+                "count": 3,
+            }
+        )
         self.assertEqual(result, '{"id": "abc", "data": {"x": 1, "y": 2}, "count": 3}')
 
     def test_nested_list_with_rawjson(self):
         """嵌套列表中包含 RawJSON"""
-        result = raw_json_dumps([
-            "hello",
-            RawJSON('{"a": 1}'),
-            42,
-        ])
+        result = raw_json_dumps(
+            [
+                "hello",
+                RawJSON('{"a": 1}'),
+                42,
+            ]
+        )
         self.assertEqual(result, '["hello", {"a": 1}, 42]')
 
     def test_rawjson_in_sublist(self):
         """深层嵌套中的 RawJSON"""
-        result = raw_json_dumps({
-            "rows": [
-                [1, RawJSON('"embedded"')],
-                [2, RawJSON("null")],
-            ]
-        })
+        result = raw_json_dumps(
+            {
+                "rows": [
+                    [1, RawJSON('"embedded"')],
+                    [2, RawJSON("null")],
+                ]
+            }
+        )
         self.assertEqual(result, '{"rows": [[1, "embedded"], [2, null]]}')
 
     def test_multiple_rawjson(self):
         """多个 RawJSON 对象"""
-        result = raw_json_dumps({
-            "prompt": RawJSON('{"nodes": [1, 2]}'),
-            "extra_data": RawJSON('{"client_id": "abc"}'),
-        })
+        result = raw_json_dumps(
+            {
+                "prompt": RawJSON('{"nodes": [1, 2]}'),
+                "extra_data": RawJSON('{"client_id": "abc"}'),
+            }
+        )
         self.assertEqual(
             result,
             '{"prompt": {"nodes": [1, 2]}, "extra_data": {"client_id": "abc"}}',
@@ -97,15 +105,20 @@ class TestRawJSONDumps(unittest.TestCase):
 
     def test_roundtrip_parseable(self):
         """序列化结果可以被 json.loads 重新解析"""
-        result = raw_json_dumps({
-            "prompt": RawJSON('{"nodes": [1, 2]}'),
-            "extra_data": RawJSON('{"client_id": "abc"}'),
-        })
+        result = raw_json_dumps(
+            {
+                "prompt": RawJSON('{"nodes": [1, 2]}'),
+                "extra_data": RawJSON('{"client_id": "abc"}'),
+            }
+        )
         parsed = json.loads(result)
-        self.assertEqual(parsed, {
-            "prompt": {"nodes": [1, 2]},
-            "extra_data": {"client_id": "abc"},
-        })
+        self.assertEqual(
+            parsed,
+            {
+                "prompt": {"nodes": [1, 2]},
+                "extra_data": {"client_id": "abc"},
+            },
+        )
 
     def test_empty_rawjson(self):
         """空 JSON 对象/数组的 RawJSON"""
@@ -133,9 +146,7 @@ class TestRawJSONEncoder(unittest.TestCase):
         """json.dump 嵌套结构"""
         buf = io.StringIO()
         data: dict[str, list[list[Any]]] = {
-            "queue_running": [
-                [1.0, "id", RawJSON('{"a": 1}'), RawJSON('{"b": 2}'), []]
-            ]
+            "queue_running": [[1.0, "id", RawJSON('{"a": 1}'), RawJSON('{"b": 2}'), []]]
         }
         json.dump(data, buf, ensure_ascii=False, cls=RawJSONEncoder)
         self.assertEqual(
@@ -168,7 +179,7 @@ class TestRawJSONPerformance(unittest.TestCase):
         r = RawJSON(large_json)
 
         result = raw_json_dumps({"data": r})
-        expected = '{"data": ' + large_json + '}'
+        expected = '{"data": ' + large_json + "}"
         self.assertEqual(result, expected)
 
 

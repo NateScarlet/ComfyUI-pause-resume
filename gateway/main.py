@@ -14,11 +14,7 @@ from .gateway import Gateway
 from .server import GatewayHandlers, setup_routes
 
 logging.basicConfig(
-    level=(
-        logging.DEBUG
-        if os.getenv("GATEWAY_DEBUG") == "true"
-        else logging.INFO
-    ),
+    level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
     format="[GATEWAY] %(message)s",
 )
 logger = logging.getLogger(__name__)
