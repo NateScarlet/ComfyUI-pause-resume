@@ -174,7 +174,7 @@ class GatewayHandlers:
                         if body.get("front", False):
                             number = -number
                     
-                    create_time = int(extra_data.pop("create_time", int(time.time() * 1000)))
+                    create_time = int(time.time() * 1000)
                     task = Task(
                         number=number,
                         prompt_id=prompt_id,
