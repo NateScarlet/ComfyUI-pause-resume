@@ -3,10 +3,9 @@ import json
 import sqlite3
 import threading
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Any, Optional, Sequence, Set, Dict, cast
+from typing import List, Any, Optional, Sequence, Set
 from .config import BASE_DIR, GatewayConfig
 
 logger = logging.getLogger(__name__)
@@ -54,8 +53,8 @@ class TaskQueue(ABC):
         pass
 
     @abstractmethod
-    def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
-        """添加新任务到待处理队列，并返回分配的任务编号 number"""
+    def add_task(self, task: Task) -> None:
+        """添加新任务到待处理队列"""
         pass
 
     @abstractmethod
@@ -184,25 +183,11 @@ class JSONFileQueue(TaskQueue):
             self._next_task_number += 1
             return number
 
-    def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
+    def add_task(self, task: Task) -> None:
         with self._lock:
-            extra_dict: dict[str, Any] = {}
-            if isinstance(extra_data, dict):
-                extra_dict = dict(cast(Dict[str, Any], extra_data))  # 拷贝以避免副作用
-                
-            create_time = int(extra_dict.pop("create_time", int(time.time() * 1000)))
-            task = Task(
-                number=number,
-                prompt_id=prompt_id,
-                prompt=prompt,
-                extra_data=extra_dict,
-                outputs_to_execute=[],
-                create_time=create_time,
-            )
             self._pending_queue.append(task)
             self._pending_queue.sort(key=lambda t: t.number)
             self._save()
-            return number
 
     def pop_task(self, skip: int = 0) -> Optional[Task]:
         with self._lock:
@@ -388,26 +373,18 @@ class SQLiteQueue(TaskQueue):
             self._conn.commit()
             return number
 
-    def add_task(self, prompt_id: str, prompt: Any, extra_data: Any, number: float) -> float:
+    def add_task(self, task: Task) -> None:
         with self._lock:
             cursor = self._conn.cursor()
-            
-            extra_dict: dict[str, Any] = {}
-            if isinstance(extra_data, dict):
-                extra_dict = dict(cast(Dict[str, Any], extra_data))
-                
-            create_time = int(extra_dict.pop("create_time", int(time.time() * 1000)))
-                
-            prompt_str = json.dumps(prompt, ensure_ascii=False)
-            extra_data_str = json.dumps(extra_dict, ensure_ascii=False)
-            outputs_str = json.dumps([], ensure_ascii=False)
+            prompt_str = json.dumps(task.prompt, ensure_ascii=False)
+            extra_data_str = json.dumps(task.extra_data, ensure_ascii=False)
+            outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
             
             cursor.execute(
                 "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                (prompt_id, number, prompt_str, extra_data_str, outputs_str, create_time)
+                (task.prompt_id, task.number, prompt_str, extra_data_str, outputs_str, task.create_time)
             )
             self._conn.commit()
-            return number
 
     def pop_task(self, skip: int = 0) -> Optional[Task]:
         with self._lock:
@@ -526,12 +503,12 @@ def migrate_json_to_sqlite(json_path: str, sqlite_queue: TaskQueue) -> None:
 
         # 1. 导入 running 任务，并移入 running 状态
         for task in running:
-            sqlite_queue.add_task(task.prompt_id, task.prompt, task.extra_data, task.number)
+            sqlite_queue.add_task(task)
             sqlite_queue.pop_task()
 
         # 2. 导入 pending 任务
         for task in pending:
-            sqlite_queue.add_task(task.prompt_id, task.prompt, task.extra_data, task.number)
+            sqlite_queue.add_task(task)
 
         # 重命名原 JSON 队列文件，防止再次触发迁移
         bak_path = json_path + ".bak"

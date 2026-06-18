@@ -2,6 +2,7 @@ import json
 import logging
 import traceback
 import asyncio
+import time
 import uuid
 import aiohttp
 from aiohttp import web
@@ -153,9 +154,8 @@ class GatewayHandlers:
             try:
                 body = await request.json()
                 prompt = body.get("prompt", {})
-                extra_data = body.get("extra_data", {})
-                if not isinstance(extra_data, dict):
-                    extra_data = {}
+                extra_data_raw = body.get("extra_data", {})
+                extra_data: dict[str, Any] = dict(cast(dict[str, Any], extra_data_raw)) if isinstance(extra_data_raw, dict) else {}
                 prompt_id = str(body.get("prompt_id", uuid.uuid4()))
                 with self.gateway.queue_lock:
                     if "number" in body:
@@ -165,7 +165,16 @@ class GatewayHandlers:
                         if body.get("front", False):
                             number = -number
                     
-                    self.gateway.queue.add_task(prompt_id, prompt, extra_data, number)
+                    create_time = int(extra_data.pop("create_time", int(time.time() * 1000)))
+                    task = Task(
+                        number=number,
+                        prompt_id=prompt_id,
+                        prompt=prompt,
+                        extra_data=extra_data,
+                        outputs_to_execute=[],
+                        create_time=create_time,
+                    )
+                    self.gateway.queue.add_task(task)
                     
                 # 异步执行后续的状态变更、WebSocket 广播和日志输出，加速 HTTP 响应返回
                 async def post_process_task():
