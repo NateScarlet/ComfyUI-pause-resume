@@ -5,3 +5,4 @@ __pycache__
 *.db
 *.db-*
 gateway_data
+.env.ps1
