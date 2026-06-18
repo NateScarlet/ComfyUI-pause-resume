@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import sqlite3
 import threading
 import logging
@@ -520,9 +521,9 @@ def init_queue(config: GatewayConfig) -> TaskQueue:
             transfer_tasks(legacy_queue, queue)
             legacy_queue.close()
 
-            bak_path = old_json_path + ".bak"
-            if os.path.exists(bak_path):
-                os.remove(bak_path)
+            # 使用随机后缀避免覆盖已有备份
+            suffix = ''.join(random.choices('0123456789abcdef', k=8))
+            bak_path = f"{old_json_path}~{suffix}"
             os.rename(old_json_path, bak_path)
             logger.info(f"✅ Migration successful! Legacy queue file renamed to {bak_path}")
         except Exception as e:

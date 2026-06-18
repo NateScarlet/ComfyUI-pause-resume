@@ -29,7 +29,7 @@ start.cmd
   - `queue.json` - 传统 JSON 格式的保存队列文件（禁用 SQLite 队列时自动生成）
   - `queue.json.tmp` - 队列保存时产生的临时文件
   - `failed_workflows/` - 保存提交失败（如 400-500 错误）的任务信息的目录
-- `queue.json.bak` - 旧版本 JSON 队列数据自动迁移到新数据目录后的备份文件（生成于根目录）
+- `queue.json~<随机后缀>` - 旧版本 JSON 队列数据自动迁移到新数据目录后的备份文件（生成于根目录）
 
 ## 配置选项
 
