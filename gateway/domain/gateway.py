@@ -72,8 +72,8 @@ class Gateway:
             lambda ev: self.set_downstream_ready(ev.ready),
         )
 
-    def sync_infrastructure(self) -> None:
-        """根据网关当前的业务决策，同步阻止系统休眠、空闲重启超时与外挂脚本状态。"""
+    def refresh(self) -> None:
+        """根据网关当前的业务决策，刷新阻止系统休眠、空闲重启超时与外挂脚本状态。"""
         has_pending = self._queue_reader.get_pending_count(limit=1) > 0
         scripts_running = self._process_manager.is_running()
 
@@ -130,7 +130,7 @@ class Gateway:
         self._state_repo.set_paused(True)
 
         self._event_bus.publish(StateChangedEvent(paused=True))
-        self.sync_infrastructure()
+        self.refresh()
 
         # 如果在此之前系统已经处于空闲状态（且请求立即重启），由于 sync_infrastructure
         # 不会重复触发 _on_idle_entered，因此我们需要在这里直接触发重启
@@ -145,7 +145,7 @@ class Gateway:
         self._state_repo.set_paused(False)
 
         self._event_bus.publish(StateChangedEvent(paused=False))
-        self.sync_infrastructure()
+        self.refresh()
         self._dispatcher.try_dispatch()
 
     def set_downstream_executing(self, executing: bool) -> None:
@@ -156,10 +156,10 @@ class Gateway:
         self.downstream_executing = executing
         if executing:
             self.ever_active = True
-            self.sync_infrastructure()
+            self.refresh()
         else:
             self.attempt_count = 0
-            self.sync_infrastructure()
+            self.refresh()
             self._event_bus.publish(StatusChangedEvent())
             self._dispatcher.try_dispatch()
 
@@ -188,13 +188,13 @@ class Gateway:
 
     def on_task_added(self) -> None:
         """当新任务入队时的业务逻辑与副作用驱动。"""
-        self.sync_infrastructure()
+        self.refresh()
         self._event_bus.publish(StatusChangedEvent())
         self._dispatcher.try_dispatch()
 
     def on_queue_modified(self) -> None:
         """当队列内容被修改时的业务逻辑与副作用驱动。"""
-        self.sync_infrastructure()
+        self.refresh()
         self._event_bus.publish(StatusChangedEvent())
         self._dispatcher.try_dispatch()
 

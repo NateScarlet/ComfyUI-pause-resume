@@ -201,7 +201,7 @@ class TestDomainGateway(unittest.TestCase):
         # 1. 模拟进入空闲
         g._mock_reader.get_pending_count.return_value = 0
         g._mock_pm.is_running.return_value = False
-        g.sync_infrastructure()
+        g.refresh()
 
         self.assertTrue(g._is_idle)
         self.assertIsNotNone(timer_callback)
@@ -215,11 +215,11 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_timer.start_timeout.side_effect = mock_start_timeout
         g._mock_reader.get_pending_count.return_value = 0
         g._mock_pm.is_running.return_value = False
-        g.sync_infrastructure()
+        g.refresh()
 
         # 离开空闲 (如因为有排队任务)
         g._mock_reader.get_pending_count.return_value = 1
-        g.sync_infrastructure()
+        g.refresh()
 
         self.assertFalse(g._is_idle)
         self.assertTrue(cancelled)  # 成功调用了 cancel 闭包

@@ -125,7 +125,7 @@ async def main() -> None:
     event_bus.subscribe(DownstreamCrashedEvent, handle_crashed)
 
     # 11. 根据初始状态，同步阻止系统休眠和外挂脚本行为
-    gateway.sync_infrastructure()
+    gateway.refresh()
 
     # 12. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
     app_facade = AppFacade.create(
