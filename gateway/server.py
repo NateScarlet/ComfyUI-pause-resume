@@ -3,14 +3,13 @@ import logging
 import traceback
 import asyncio
 import time
-import uuid
 from pathlib import Path
 import aiohttp
 from aiohttp import web
 from typing import List, Dict, Any, Set, Union, cast
 
 from .gateway import Gateway
-from .models import Task, raw_json_dumps, RawJSON
+from .models import Task, raw_json_dumps
 
 # 预加载静态资源文件，避免每次请求时重复读取磁盘
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -133,74 +132,47 @@ class GatewayHandlers:
                 _t_json_start = time.perf_counter()
                 body = await request.json()
                 _t_json = (time.perf_counter() - _t_json_start) * 1000
+
                 prompt = body.get("prompt", {})
                 extra_data_raw = body.get("extra_data", {})
-                extra_data: dict[str, Any] = (
+                extra_data = (
                     dict(cast(dict[str, Any], extra_data_raw))
                     if isinstance(extra_data_raw, dict)
                     else {}
                 )
-                prompt_id = str(body.get("prompt_id", uuid.uuid4()))
+                prompt_id = body.get("prompt_id")
+                if prompt_id is not None:
+                    prompt_id = str(prompt_id)
 
-                _t_number: float = 0.0
-                _t_lock_wait = time.perf_counter()
-                with self.gateway.queue_lock:
-                    _t_lock_acquired = (time.perf_counter() - _t_lock_wait) * 1000
-                    if "number" in body:
+                number = None
+                if "number" in body:
+                    try:
                         number = float(body["number"])
-                    else:
-                        _t_number_start = time.perf_counter()
-                        number = float(self.gateway.queue.new_task_number())
-                        _t_number = (time.perf_counter() - _t_number_start) * 1000
-                        if body.get("front", False):
-                            number = -number
+                    except (ValueError, TypeError):
+                        pass
 
-                    create_time = int(time.time() * 1000)
-                    task = Task(
-                        number=number,
-                        prompt_id=prompt_id,
-                        prompt=RawJSON(json.dumps(prompt, ensure_ascii=False)),
-                        extra_data=RawJSON(json.dumps(extra_data, ensure_ascii=False)),
-                        outputs_to_execute=[],
-                        create_time=create_time,
-                    )
-                    _t_add_start = time.perf_counter()
-                    self.gateway.queue.add_task(task)
-                    _t_add = (time.perf_counter() - _t_add_start) * 1000
+                front = bool(body.get("front", False))
+
+                result = self.gateway.add_task(
+                    prompt=prompt,
+                    extra_data=extra_data,
+                    prompt_id=prompt_id,
+                    number=number,
+                    front=front,
+                )
 
                 _t_total = (time.perf_counter() - _t_total_start) * 1000
                 logger.info(
-                    f"📥 Intercepted workflow {prompt_id} "
-                    f"(json={_t_json:.1f}ms lock_wait={_t_lock_acquired:.1f}ms "
-                    f"new_number={_t_number:.1f}ms add_task={_t_add:.1f}ms total={_t_total:.1f}ms)"
+                    f"📥 Intercepted workflow {result['prompt_id']} "
+                    f"(json={_t_json:.1f}ms total={_t_total:.1f}ms)"
                 )
 
-                # 异步执行后续的状态变更、WebSocket 广播和日志输出，加速 HTTP 响应返回
-                async def post_process_task():
-                    _t_post_start = time.perf_counter()
-                    try:
-                        self.gateway.update_sleep_and_programs()
-                        _t_sleep_done = (time.perf_counter() - _t_post_start) * 1000
-                        self.gateway.broadcast_ws_status()
-                        _t_broadcast = (
-                            time.perf_counter() - _t_post_start
-                        ) * 1000 - _t_sleep_done
-                        pending_cnt = self.gateway.queue.get_pending_count()
-                        _t_post_total = (time.perf_counter() - _t_post_start) * 1000
-                        logger.info(
-                            f"📬 Post-process {prompt_id} "
-                            f"(sleep={_t_sleep_done:.1f}ms broadcast={_t_broadcast:.1f}ms "
-                            f"total={_t_post_total:.1f}ms Queue: {pending_cnt})"
-                        )
-                    except Exception as ex:
-                        logger.error(
-                            f"Error in post_process_task for {prompt_id}: {ex}"
-                        )
-
-                asyncio.create_task(post_process_task())
-
                 return web.json_response(
-                    {"prompt_id": prompt_id, "number": number, "node_errors": {}}
+                    {
+                        "prompt_id": result["prompt_id"],
+                        "number": result["number"],
+                        "node_errors": {},
+                    }
                 )
             except Exception as e:
                 logger.error(f"Error processing {path}: {e}")
@@ -437,18 +409,13 @@ class GatewayHandlers:
             except Exception:
                 body_json = {}
 
-            with self.gateway.queue_lock:
-                if body_json.get("clear"):
-                    self.gateway.queue.clear_pending()
-                raw_delete = body_json.get("delete")
-                if isinstance(raw_delete, list):
-                    delete_list: List[str] = [
-                        str(item) for item in cast(List[Any], raw_delete)
-                    ]
-                    self.gateway.queue.delete_pending(delete_list)
+            clear = bool(body_json.get("clear"))
+            raw_delete = body_json.get("delete")
+            delete_ids = None
+            if isinstance(raw_delete, list):
+                delete_ids = [str(item) for item in cast(List[Any], raw_delete)]
 
-            self.gateway.update_sleep_and_programs()
-            self.gateway.broadcast_ws_status()
+            self.gateway.modify_queue(clear=clear, delete_ids=delete_ids)
             return web.Response(status=200)
 
         # 代理 WebSocket 连接，并在推送状态数据包中合并网关的队列信息

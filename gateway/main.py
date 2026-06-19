@@ -105,7 +105,7 @@ async def main() -> None:
     logger.info(f"🌐 Proxy server running on {config.proxy_host}:{config.proxy_port}")
 
     # 8. 启动队列分发与监控后台进程
-    asyncio.create_task(gateway.queue_dispatcher())
+    asyncio.create_task(gateway.monitor_downstream())
 
     # 9. 挂起并等待退出信号触发优雅退出机制
     try:

@@ -3,6 +3,7 @@ import sys
 import socket
 import time
 import json
+import uuid
 import asyncio
 import logging
 import datetime
@@ -13,7 +14,7 @@ from aiohttp import web
 from typing import Optional, Set, Dict, Any, cast
 
 from .config import BASE_DIR, GatewayConfig
-from .models import TaskQueue, GatewayStateManager, raw_json_dumps
+from .models import Task, RawJSON, TaskQueue, GatewayStateManager, raw_json_dumps
 from .utils import PowerManagement
 from .program import ExternalProgramManager
 
@@ -62,12 +63,14 @@ class Gateway:
         self._broadcast_ws_scheduled: bool = False
         self._broadcast_ws_debounce_sec: float = 0.1
 
-        # 事件驱动的任务派发（由 log_reader 在任务完成时触发，queue_dispatcher 轮询兜底）
-        self._session: Optional[aiohttp.ClientSession] = None
+        # 事件驱动的任务派发（由业务方法在状态变更时触发）
         self._dispatching: bool = False
+        self._idle_timeout_task: Optional[asyncio.Task[None]] = None
 
-    def update_sleep_and_programs(self) -> None:
+    def _update_sleep_and_programs(self) -> None:
         """根据当前的执行状态和暂停状态，更新外部程序管理器及 Windows 的休眠阻止状态"""
+        was_idle = self._idle_start_time is not None and not self._preventing_sleep
+
         # 如果已被暂停，即使有待处理任务且下游未执行，也不视为繁忙，以便允许系统休眠
         # 使用 limit=1 优化，快速检测是否有待处理任务即可
         has_pending = self.queue.get_pending_count(limit=1) > 0
@@ -94,11 +97,80 @@ class Gateway:
                 PowerManagement.allow_sleep()
                 self._preventing_sleep = False
 
-    def broadcast_state(self) -> None:
+        is_idle = self._idle_start_time is not None and not self._preventing_sleep
+        if not was_idle and is_idle:
+            self._on_idle_entered()
+        elif was_idle and not is_idle:
+            self._on_idle_exited()
+
+    def _on_idle_entered(self) -> None:
+        """进入闲置状态时：检查暂停后重启、启动空闲超时计时"""
+        if self._restart_after_idle_on_pause:
+            logger.info(
+                "🔄 Pause-and-restart: system idle, "
+                "restarting downstream immediately..."
+            )
+            self._restart_after_idle_on_pause = False
+            asyncio.create_task(self.restart_downstream())
+            return
+
+        if self._ever_active and self.config.idle_restart_timeout > 0:
+            self._idle_timeout_task = asyncio.create_task(self._idle_timeout_wait())
+
+    def _on_idle_exited(self) -> None:
+        """退出闲置状态时：取消空闲超时计时"""
+        if self._idle_timeout_task:
+            self._idle_timeout_task.cancel()
+            self._idle_timeout_task = None
+
+    async def _idle_timeout_wait(self) -> None:
+        """等待闲置超时，超时后若仍闲置则重启下游"""
+        idle_start = self._idle_start_time
+        timeout = self.config.idle_restart_timeout
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+        if self._idle_start_time == idle_start and not self._preventing_sleep:
+            logger.info(
+                f"🕒 Idle timeout ({timeout}s), "
+                f"restarting downstream to free resources..."
+            )
+            await self.restart_downstream()
+
+    def _broadcast_state(self) -> None:
         """将最新的网关暂停/恢复状态广播给所有连接的 SSE 客户端"""
         data = json.dumps({"paused": self.paused})
         for q in list(self.sse_clients):
             q.put_nowait(data)
+
+    # ─── 下游执行状态管理（状态源 → 状态变更 → 业务决策）──────────
+
+    def _set_downstream_executing(self, value: bool) -> None:
+        """设置下游执行状态（线程安全），状态变更时触发业务逻辑
+
+        log_reader 等状态源通过此方法汇报状态变更，不直接调用业务方法。
+        """
+        if self._downstream_executing == value:
+            return
+        self._downstream_executing = value
+        if value:
+            self._on_downstream_busy()
+        else:
+            self._on_downstream_idle()
+
+    def _on_downstream_busy(self) -> None:
+        """下游开始繁忙"""
+        self._update_sleep_and_programs()
+
+    def _on_downstream_idle(self) -> None:
+        """下游完成执行：清理运行队列、更新状态、广播、触发派发"""
+        with self.queue_lock:
+            self.queue.clear_running()
+            self._attempt_count = 0
+        self._update_sleep_and_programs()
+        self._broadcast_ws_status()
+        self._try_dispatch()
 
     # ─── 业务方法：供 server 层调用 ────────────────────────────────
 
@@ -118,7 +190,7 @@ class Gateway:
             )
             self._restart_after_idle_on_pause = False
             asyncio.create_task(self.restart_downstream())
-            self.broadcast_state()
+            self._broadcast_state()
             return
 
         self.paused = True
@@ -128,8 +200,8 @@ class Gateway:
             logger.info("⏸️ Queue Paused (will restart downstream when idle)")
         else:
             logger.info("⏸️ Queue Paused")
-        self.update_sleep_and_programs()
-        self.broadcast_state()
+        self._update_sleep_and_programs()
+        self._broadcast_state()
 
     def resume(self) -> None:
         """恢复队列"""
@@ -137,10 +209,81 @@ class Gateway:
         self.state_manager.set_paused(False)
         self._restart_after_idle_on_pause = False
         logger.info("▶️ Queue Resumed")
-        self.update_sleep_and_programs()
-        self.broadcast_state()
+        self._update_sleep_and_programs()
+        self._broadcast_state()
+        self._try_dispatch()
 
-    def broadcast_ws_status(self) -> None:
+    def _on_task_submitted(self) -> None:
+        """任务提交到队列后的统一入口"""
+        self._update_sleep_and_programs()
+        self._broadcast_ws_status()
+        self._try_dispatch()
+
+    def _on_queue_modified(self) -> None:
+        """队列被清除/删除后的统一入口"""
+        self._update_sleep_and_programs()
+        self._broadcast_ws_status()
+        self._try_dispatch()
+
+    # ─── 领域方法：供接口层调用 ──────────────────────────────────
+
+    def add_task(
+        self,
+        prompt: dict[str, Any],
+        extra_data: Optional[dict[str, Any]] = None,
+        prompt_id: Optional[str] = None,
+        number: Optional[float] = None,
+        front: bool = False,
+    ) -> dict[str, Any]:
+        """领域方法：添加任务到队列，返回 prompt_id 和 number"""
+        if extra_data is None:
+            extra_data = {}
+        if prompt_id is None:
+            prompt_id = str(uuid.uuid4())
+
+        with self.queue_lock:
+            if number is not None:
+                task_number = number
+            else:
+                task_number = float(self.queue.new_task_number())
+                if front:
+                    task_number = -task_number
+
+            create_time = int(time.time() * 1000)
+            task = Task(
+                number=task_number,
+                prompt_id=prompt_id,
+                prompt=RawJSON(json.dumps(prompt, ensure_ascii=False)),
+                extra_data=RawJSON(json.dumps(extra_data, ensure_ascii=False)),
+                outputs_to_execute=[],
+                create_time=create_time,
+            )
+            self.queue.add_task(task)
+
+        self._on_task_submitted()
+        return {"prompt_id": prompt_id, "number": task_number}
+
+    def modify_queue(
+        self,
+        clear: bool = False,
+        delete_ids: Optional[list[str]] = None,
+    ) -> None:
+        """领域方法：清空/删除队列中的任务"""
+        with self.queue_lock:
+            if clear:
+                self.queue.clear_pending()
+            if delete_ids:
+                self.queue.delete_pending(delete_ids)
+        self._on_queue_modified()
+
+    def _try_dispatch(self) -> None:
+        """线程安全地触发一次任务派发尝试"""
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._try_send_task())
+            )
+
+    def _broadcast_ws_status(self) -> None:
         """
         主动广播最新的队列剩余数状态给所有活跃的前端 WebSocket 连接（带防抖）。
         本方法可以在外部线程中被安全调用（如 STDOUT/STDERR 读取线程）。
@@ -222,19 +365,11 @@ class Gateway:
                 else:
                     print(f"[{self.downstream_port}] STDOUT: {line}")
 
-                # 监控日志以更新工作流的执行状态
+                # 纯状态源：仅汇报下游执行状态变更，不直接调用业务方法
                 if "got prompt" in line:
-                    self._downstream_executing = True
-                    self.update_sleep_and_programs()
+                    self._set_downstream_executing(True)
                 elif "Prompt executed in" in line:
-                    with self.queue_lock:
-                        self._downstream_executing = False
-                        self.queue.clear_running()
-                        self._attempt_count = 0
-                    self.update_sleep_and_programs()
-                    self.broadcast_ws_status()
-                    # 工作流完成，立即触发下一次派发（事件驱动，避免轮询竞态）
-                    self._schedule_try_send_task()
+                    self._set_downstream_executing(False)
 
         threading.Thread(
             target=log_reader, args=(self._process.stdout, False), daemon=True
@@ -291,84 +426,34 @@ class Gateway:
         finally:
             self._is_restarting = False
 
-    async def queue_dispatcher(self) -> None:
-        """后台队列调度轮询器：监控下游进程崩溃与重启，兜底触发任务派发"""
-        async with aiohttp.ClientSession() as session:
-            self._session = session
-            try:
-                while True:
-                    if self.exiting:
-                        break
-                    await asyncio.sleep(0.5)
-                    if self.exiting:
-                        break
-
-                    self.update_sleep_and_programs()
-
-                    # 仅在非主动重启期间，监控并检查下游进程是否发生了意外退出
-                    if (
-                        not self._is_restarting
-                        and self._process
-                        and self._process.poll() is not None
-                    ):
-                        exit_code = self._process.poll()
-                        logger.error(
-                            f"❌ Downstream process exited unexpectedly with code {exit_code}. "
-                            f"Restarting in {self.config.restart_delay_sec} seconds..."
-                        )
-                        with self.queue_lock:
-                            if self.queue.get_running_count(limit=1) > 0:
-                                self.queue.requeue_running()
-                                self._attempt_count += 1
-                        self.broadcast_ws_status()
-                        await asyncio.sleep(self.config.restart_delay_sec)
-                        await self.restart_downstream()
-                        continue
-
-                    # 暂停后等待闲置立即重启：当系统进入闲置状态时立即触发重启
-                    if (
-                        self._restart_after_idle_on_pause
-                        and not self._preventing_sleep
-                        and self._idle_start_time is not None
-                    ):
-                        logger.info(
-                            "🔄 Pause-and-restart: system idle, "
-                            "restarting downstream immediately..."
-                        )
-                        self._restart_after_idle_on_pause = False
-                        await self.restart_downstream()
-                        self._idle_start_time = None
-                        continue
-
-                    # 检查队列空闲强制重启以释放显存/内存资源
-                    if (
-                        not self._preventing_sleep
-                        and self._ever_active
-                        and self.config.idle_restart_timeout > 0
-                        and self._idle_start_time is not None
-                        and time.time() - self._idle_start_time
-                        > self.config.idle_restart_timeout
-                    ):
-
-                        logger.info(
-                            f"🕒 Idle timeout ({self.config.idle_restart_timeout}s), "
-                            f"restarting downstream to free resources..."
-                        )
-                        await self.restart_downstream()
-                        self._idle_start_time = None
-
-                    # 轮询兜底：尝试派发任务（主路径由 log_reader 在任务完成时事件驱动）
-                    await self._try_send_task()
-            finally:
-                self._session = None
+    async def monitor_downstream(self) -> None:
+        """事件驱动监控下游进程（用 process.wait() 替代轮询 process.poll()）"""
+        while not self.exiting:
+            if self._process and not self._is_restarting:
+                await asyncio.get_event_loop().run_in_executor(None, self._process.wait)
+                if self.exiting or self._is_restarting:
+                    continue
+                exit_code = self._process.poll()
+                logger.error(
+                    f"❌ Downstream process exited unexpectedly with code {exit_code}. "
+                    f"Restarting in {self.config.restart_delay_sec} seconds..."
+                )
+                with self.queue_lock:
+                    if self.queue.get_running_count(limit=1) > 0:
+                        self.queue.requeue_running()
+                        self._attempt_count += 1
+                self._broadcast_ws_status()
+                await asyncio.sleep(self.config.restart_delay_sec)
+                await self.restart_downstream()
+            else:
+                await asyncio.sleep(1)  # 进程尚未启动时短暂等待
 
     async def _try_send_task(self) -> None:
         """尝试从待处理队列中取出一个任务并发送至下游
 
-        由 log_reader 在任务完成时直接触发，也由 queue_dispatcher 轮询兜底。
-        内置并发保护，防止多次同时派发。
+        由业务方法在状态变更时触发，内置并发保护防止多次同时派发。
         """
-        if self._dispatching or self.exiting or self._session is None:
+        if self._dispatching or self.exiting:
             return
         self._dispatching = True
         try:
@@ -401,106 +486,106 @@ class Gateway:
             try:
                 body_str = raw_json_dumps(body)
                 headers = {"Content-Type": "application/json"}
-                async with self._session.post(
-                    url, data=body_str, headers=headers
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info(f"📤 Sent workflow {task.prompt_id} to downstream")
-                        self.broadcast_ws_status()
-                    else:
-                        txt = await resp.text()
-                        logger.error(
-                            f"Failed to send workflow {task.prompt_id}: {resp.status} - {txt}"
-                        )
-                        # 如果遇到非法的工作流（例如 400-500 状态码），直接丢弃该任务并将其数据存盘备份以防死循环
-                        with self.queue_lock:
-                            if 400 <= resp.status <= 500:
-                                self.queue.clear_running()
-                                try:
-                                    date_str = datetime.date.today().isoformat()
-                                    dir_name = (
-                                        f"{date_str}-{resp.status}-{task.prompt_id}"
-                                    )
-                                    failed_dir = os.path.join(
-                                        self.config.data_dir,
-                                        "failed_workflows",
-                                        dir_name,
-                                    )
-                                    os.makedirs(failed_dir, exist_ok=True)
-
-                                    # 保存报错信息
-                                    with open(
-                                        os.path.join(failed_dir, "error.txt"),
-                                        "w",
-                                        encoding="utf-8",
-                                    ) as f:
-                                        f.write(txt)
-
-                                    # 保存原始请求数据
-                                    with open(
-                                        os.path.join(failed_dir, "request.json"),
-                                        "w",
-                                        encoding="utf-8",
-                                    ) as f:
-                                        json.dump(
-                                            body,
-                                            f,
-                                            ensure_ascii=False,
-                                            indent=2,
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url, data=body_str, headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            logger.info(
+                                f"📤 Sent workflow {task.prompt_id} to downstream"
+                            )
+                            self._broadcast_ws_status()
+                        else:
+                            txt = await resp.text()
+                            logger.error(
+                                f"Failed to send workflow {task.prompt_id}: {resp.status} - {txt}"
+                            )
+                            # 如果遇到非法的工作流（例如 400-500 状态码），直接丢弃该任务并将其数据存盘备份以防死循环
+                            with self.queue_lock:
+                                if 400 <= resp.status <= 500:
+                                    self.queue.clear_running()
+                                    try:
+                                        date_str = datetime.date.today().isoformat()
+                                        dir_name = (
+                                            f"{date_str}-{resp.status}-{task.prompt_id}"
                                         )
-
-                                    # 获取并单独存盘 workflow JSON
-                                    workflow = None
-                                    extra_pnginfo = extra_data.get("extra_pnginfo")
-                                    if isinstance(extra_pnginfo, dict):
-                                        extra_pnginfo_dict = cast(
-                                            Dict[str, Any], extra_pnginfo
+                                        failed_dir = os.path.join(
+                                            self.config.data_dir,
+                                            "failed_workflows",
+                                            dir_name,
                                         )
-                                        workflow = extra_pnginfo_dict.get("workflow")
-                                    if not workflow:
-                                        workflow = extra_data.get("workflow")
+                                        os.makedirs(failed_dir, exist_ok=True)
 
-                                    if workflow:
+                                        # 保存报错信息
                                         with open(
-                                            os.path.join(failed_dir, "workflow.json"),
+                                            os.path.join(failed_dir, "error.txt"),
+                                            "w",
+                                            encoding="utf-8",
+                                        ) as f:
+                                            f.write(txt)
+
+                                        # 保存原始请求数据
+                                        with open(
+                                            os.path.join(failed_dir, "request.json"),
                                             "w",
                                             encoding="utf-8",
                                         ) as f:
                                             json.dump(
-                                                workflow,
+                                                body,
                                                 f,
                                                 ensure_ascii=False,
                                                 indent=2,
                                             )
-                                    rel_failed_dir = os.path.relpath(
-                                        failed_dir, BASE_DIR
-                                    ).replace(os.sep, "/")
-                                    logger.info(
-                                        f"💾 Failed workflow {task.prompt_id} saved to {rel_failed_dir}"
-                                    )
-                                except Exception as save_err:
-                                    logger.error(
-                                        f"Failed to save failed workflow details: {save_err}"
-                                    )
-                            else:
-                                # 暂时性服务错误，放回待处理队列并跳过重试
-                                self.queue.requeue_running()
-                                self._attempt_count += 1
-                        self.broadcast_ws_status()
+
+                                        # 获取并单独存盘 workflow JSON
+                                        workflow = None
+                                        extra_pnginfo = extra_data.get("extra_pnginfo")
+                                        if isinstance(extra_pnginfo, dict):
+                                            extra_pnginfo_dict = cast(
+                                                Dict[str, Any], extra_pnginfo
+                                            )
+                                            workflow = extra_pnginfo_dict.get(
+                                                "workflow"
+                                            )
+                                        if not workflow:
+                                            workflow = extra_data.get("workflow")
+
+                                        if workflow:
+                                            with open(
+                                                os.path.join(
+                                                    failed_dir, "workflow.json"
+                                                ),
+                                                "w",
+                                                encoding="utf-8",
+                                            ) as f:
+                                                json.dump(
+                                                    workflow,
+                                                    f,
+                                                    ensure_ascii=False,
+                                                    indent=2,
+                                                )
+                                        rel_failed_dir = os.path.relpath(
+                                            failed_dir, BASE_DIR
+                                        ).replace(os.sep, "/")
+                                        logger.info(
+                                            f"💾 Failed workflow {task.prompt_id} saved to {rel_failed_dir}"
+                                        )
+                                    except Exception as save_err:
+                                        logger.error(
+                                            f"Failed to save failed workflow details: {save_err}"
+                                        )
+                                else:
+                                    # 暂时性服务错误，放回待处理队列并跳过重试
+                                    self.queue.requeue_running()
+                                    self._attempt_count += 1
+                            self._broadcast_ws_status()
             except Exception as e:
                 logger.error(f"Error sending workflow: {e}")
                 with self.queue_lock:
                     self.queue.requeue_running()
-                self.broadcast_ws_status()
+                self._broadcast_ws_status()
         finally:
             self._dispatching = False
-
-    def _schedule_try_send_task(self) -> None:
-        """线程安全地调度一次任务派发尝试（供 log_reader 线程调用）"""
-        if self.loop is not None and not self._dispatching:
-            self.loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(self._try_send_task())
-            )
 
     async def shutdown(self, runner: web.AppRunner) -> None:
         """在网关结束或拦截退出信号时，关闭外部服务，退出客户端并优雅清理所有连接和资源"""
