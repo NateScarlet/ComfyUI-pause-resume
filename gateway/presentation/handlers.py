@@ -380,6 +380,9 @@ class GatewayHandlers:
                         t1 = asyncio.create_task(ws_forward(ws_server, ws_client))
                         t2 = asyncio.create_task(ws_forward(ws_client, ws_server))
                         await asyncio.gather(t1, t2)
+                except ConnectionResetError:
+                    # 客户端正常关闭页面时，传输层已关闭，写入失败属于正常行为
+                    pass
                 except Exception as e:
                     logger.error(f"WebSocket Error: {e}")
                 finally:
