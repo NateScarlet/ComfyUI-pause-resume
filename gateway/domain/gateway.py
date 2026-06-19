@@ -336,10 +336,12 @@ class Gateway:
             if not self._paused:
                 self._dispatcher.dispatch(self.get_dispatch_skip())
         else:
-            # 当下游变为不可用时，取消处于等待中的延迟重试
+            # 当下游变为不可用时，取消处于等待中的延迟重试，并重置派发跳过状态
             if self._cancel_dispatch_retry:
                 self._cancel_dispatch_retry()
                 self._cancel_dispatch_retry = None
+            self._dispatch_skip_offset = 0
+            self._last_failed_task_id = None
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
