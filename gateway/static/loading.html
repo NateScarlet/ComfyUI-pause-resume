@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ComfyUI Gateway</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background-color: #121212;
+            color: #e0e0e0;
+            margin: 0;
+        }
+        .loader {
+            border: 4px solid #222;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+        h2 {
+            font-weight: 500;
+            margin: 10px 0;
+        }
+        p {
+            color: #888;
+            font-size: 14px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    <script>
+        // 每隔两秒自动刷新以监测下游服务是否已就绪
+        setTimeout(() => {
+            window.location.reload();
+        }, 2000);
+    </script>
+</head>
+<body>
+    <div class="loader"></div>
+    <h2>ComfyUI 正在启动中...</h2>
+    <p>代理网关已就绪。您可以照常提交任务，本页面将在服务就绪后自动载入。</p>
+</body>
+</html>

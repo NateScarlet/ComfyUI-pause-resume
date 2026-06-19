@@ -4,12 +4,18 @@ import traceback
 import asyncio
 import time
 import uuid
+from pathlib import Path
 import aiohttp
 from aiohttp import web
 from typing import List, Dict, Any, Set, Union, cast
 
 from .gateway import Gateway
 from .models import Task, raw_json_dumps, RawJSON
+
+# 预加载静态资源文件，避免每次请求时重复读取磁盘
+_STATIC_DIR = Path(__file__).parent / "static"
+_LOADING_HTML = (_STATIC_DIR / "loading.html").read_text(encoding="utf-8")
+_INJECT_JS = (_STATIC_DIR / "inject.js").read_text(encoding="utf-8")
 
 logger = logging.getLogger(__name__)
 
@@ -107,60 +113,7 @@ class GatewayHandlers:
             ):
                 return web.Response(
                     content_type="text/html",
-                    text="""<!DOCTYPE html>
-<html>
-<head>
-    <title>ComfyUI Gateway</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            background-color: #121212;
-            color: #e0e0e0;
-            margin: 0;
-        }
-        .loader {
-            border: 4px solid #222;
-            border-top: 4px solid #3498db;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin-bottom: 20px;
-        }
-        h2 {
-            font-weight: 500;
-            margin: 10px 0;
-        }
-        p {
-            color: #888;
-            font-size: 14px;
-        }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-    </style>
-    <script>
-        // 每隔两秒自动刷新以监测下游服务是否已就绪
-        setTimeout(() => {
-            window.location.reload();
-        }, 2000);
-    </script>
-</head>
-<body>
-    <div class="loader"></div>
-    <h2>ComfyUI 正在启动中...</h2>
-    <p>代理网关已就绪。您可以照常提交任务，本页面将在服务就绪后自动载入。</p>
-</body>
-</html>
-""",
+                    text=_LOADING_HTML,
                 )
             return web.Response(
                 status=503, text="Service Unavailable: Downstream is booting up"
@@ -593,146 +546,9 @@ class GatewayHandlers:
                         html = body.decode("utf-8", errors="replace")
 
                         # 注入控制按钮及前端 SSE 同步监听逻辑
-                        injection = """
-                        <script type="module">
-                        import { app } from "/scripts/app.js";
-
-                        const EXT_NAMESPACE = "io.github.natescarlet.pause-resume";
-
-                        app.registerExtension({
-                            name: EXT_NAMESPACE,
-                            // ─── 注册命令，供 ComfyUI 快捷键系统使用 ───────────────
-                            commands: [
-                                {
-                                    id: `${EXT_NAMESPACE}.pause`,
-                                    label: "Pause Queue",
-                                    function: async () => {
-                                        await fetch(`/io.github.natescarlet.pause-resume/pause`, { method: "POST" });
-                                    },
-                                },
-                                {
-                                    id: `${EXT_NAMESPACE}.resume`,
-                                    label: "Resume Queue",
-                                    function: async () => {
-                                        await fetch(`/io.github.natescarlet.pause-resume/resume`, { method: "POST" });
-                                    },
-                                },
-                                {
-                                    id: `${EXT_NAMESPACE}.pause_and_restart`,
-                                    label: "Pause and Restart",
-                                    function: async () => {
-                                        await fetch(`/io.github.natescarlet.pause-resume/pause`, {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ restart_after_idle: true }),
-                                        });
-                                    },
-                                },
-                            ],
-                            async setup() {
-                                let proxyPaused = false;
-                                let btnPause = null;
-
-                                function setButtonState(btn) {
-                                    if (!btn) return;
-                                    const isNewUI = !!document.getElementById('vue-app');
-                                    if (isNewUI) {
-                                        btn.className = "relative inline-flex items-center justify-center gap-1.5 cursor-pointer touch-manipulation whitespace-nowrap appearance-none border-none font-medium font-inter transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 h-8 rounded-lg p-2 text-xs px-3 " + 
-                                            (proxyPaused 
-                                                ? "bg-destructive-background text-base-foreground hover:bg-destructive-background-hover" 
-                                                : "bg-secondary-background text-secondary-foreground hover:bg-secondary-background-hover");
-                                    } else {
-                                        btn.className = "";
-                                        btn.style.backgroundColor = 'var(--bg-color)';
-                                        btn.style.color = 'var(--fg-color)';
-                                        btn.style.border = proxyPaused ? '1px solid #e74c3c' : '1px solid #2ecc71';
-                                    }
-                                    btn.innerText = proxyPaused ? '▶️ Resume' : '⏸️ Pause';
-                                }
-
-                                function createPauseButton() {
-                                    let btn = document.createElement('button');
-                                    btn.title = 'Ctrl+Click: Pause and restart when idle';
-                                    btn.onclick = async (e) => {
-                                        const ctrlPressed = e.ctrlKey || e.metaKey;
-                                        if (proxyPaused) {
-                                            let resp = await fetch(`/io.github.natescarlet.pause-resume/resume`, { method: 'POST' });
-                                            let data = await resp.json();
-                                            proxyPaused = data.paused;
-                                            setButtonState(btn);
-                                        } else {
-                                            let body = ctrlPressed ? JSON.stringify({ restart_after_idle: true }) : undefined;
-                                            let opts = { method: 'POST' };
-                                            if (body) {
-                                                opts.headers = { 'Content-Type': 'application/json' };
-                                                opts.body = body;
-                                            }
-                                            let resp = await fetch(`/io.github.natescarlet.pause-resume/pause`, opts);
-                                            let data = await resp.json();
-                                            proxyPaused = data.paused;
-                                            setButtonState(btn);
-                                        }
-                                    };
-
-                                    setButtonState(btn);
-                                    return btn;
-                                }
-
-                                const isNewUI = !!document.getElementById('vue-app');
-
-                                if (isNewUI) {
-                                    if (app.menu && app.menu.settingsGroup && app.menu.settingsGroup.element) {
-                                        btnPause = createPauseButton();
-                                        btnPause.style.alignSelf = 'center';
-                                        app.menu.settingsGroup.element.appendChild(btnPause);
-                                    }
-                                } else {
-                                    let qMenu = document.querySelector('.comfy-menu');
-                                    if (qMenu) {
-                                        btnPause = createPauseButton();
-                                        btnPause.style.marginTop = '4px';
-                                        qMenu.appendChild(btnPause);
-                                    }
-                                }
-
-                                let eventSource = null;
-                                let reconnectTimer = null;
-                                const RECONNECT_DELAY_MS = 3000;
-
-                                function connectSSE() {
-                                    if (eventSource) {
-                                        eventSource.close();
-                                    }
-                                    eventSource = new EventSource('/io.github.natescarlet.pause-resume/sse');
-                                    eventSource.onmessage = (event) => {
-                                        try {
-                                            let data = JSON.parse(event.data);
-                                            proxyPaused = data.paused;
-                                            if (btnPause) {
-                                                setButtonState(btnPause);
-                                            }
-                                        } catch (e) {
-                                            console.error("Error parsing SSE data", e);
-                                        }
-                                    };
-                                    eventSource.onerror = () => {
-                                        if (eventSource) {
-                                            eventSource.close();
-                                            eventSource = null;
-                                        }
-                                        if (!reconnectTimer) {
-                                            reconnectTimer = setTimeout(() => {
-                                                reconnectTimer = null;
-                                                connectSSE();
-                                            }, RECONNECT_DELAY_MS);
-                                        }
-                                    };
-                                }
-                                connectSSE();
-                            }
-                        });
-                        </script>
-                        """
+                        injection = (
+                            '\n<script type="module">\n' + _INJECT_JS + "\n</script>\n"
+                        )
                         if "</body>" in html:
                             html = html.replace("</body>", injection + "</body>")
                         else:
