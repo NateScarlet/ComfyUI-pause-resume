@@ -60,11 +60,18 @@ class Gateway:
         self._restart_after_idle_on_pause = restart_after_idle_on_pause
         self._downstream_executing = downstream_executing
         self._downstream_ready = downstream_ready
+
+        # _ever_active 指的是下游在当前运行生命周期内是否曾经收到或执行过任务（即决定是否占用了显存/系统资源）。
+        # 当下游发生重启（包括空闲超时重启、被动崩溃重启）时，代表下游进程返回干净的初始状态，
+        # 此时该标志必须被重置为 False，直到下游下一次真正开始执行任务时才置为 True。
         self._ever_active = ever_active
+
         self._attempt_count = attempt_count
 
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
+        self._refreshing = False
+        self._crashed_executing = False
 
         self._downstream = downstream
         self._dispatcher = dispatcher
@@ -110,42 +117,52 @@ class Gateway:
 
     def _refresh(self) -> None:
         """根据网关当前的业务决策，刷新阻止系统休眠、空闲重启超时与外挂脚本状态。"""
-        pending_count = self._queue_reader.get_pending_count(limit=1)
-        has_pending = pending_count > 0
-        scripts_running = self._process_manager.is_running()
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            pending_count = self._queue_reader.get_pending_count(limit=1)
+            has_pending = pending_count > 0
 
-        # 如果没有排队任务，重置尝试计数
-        if not has_pending:
-            self._attempt_count = 0
+            # 如果没有排队任务，重置尝试计数
+            if not has_pending:
+                self._attempt_count = 0
 
-        should_prevent = self._should_prevent_sleep(has_pending, scripts_running)
-        is_busy = self._is_busy(has_pending)
+            is_busy = self._is_busy(has_pending)
 
-        # 更新空闲/繁忙外挂脚本运行状态
-        self._process_manager.update_state(is_busy, self._ever_active)
+            # 更新空闲/繁忙外挂脚本运行状态
+            self._process_manager.update_state(is_busy, self._ever_active)
 
-        if should_prevent:
-            self._power_controller.prevent_sleep()
-        else:
-            self._power_controller.allow_sleep()
+            # 必须在 update_state 触发运行状态变更之后，重新获取外挂脚本最新的实际运行状态，以保证后续判断基于最新数据
+            scripts_running = self._process_manager.is_running()
 
-        self._downstream.on_sleep_prevention_changed(should_prevent)
+            should_prevent = self._should_prevent_sleep(has_pending, scripts_running)
 
-        # 检测并触发进入或退出空闲状态
-        is_idle = not should_prevent
-        if is_idle and not self._is_idle:
-            self._is_idle = True
-            self._on_idle_entered()
-        elif not is_idle and self._is_idle:
-            self._is_idle = False
-            self._on_idle_exited()
+            if should_prevent:
+                self._power_controller.prevent_sleep()
+            else:
+                self._power_controller.allow_sleep()
+
+            # 检测并触发进入或退出空闲状态
+            is_idle = not should_prevent
+            if is_idle and not self._is_idle:
+                self._is_idle = True
+                self._on_idle_entered()
+            elif not is_idle and self._is_idle:
+                self._is_idle = False
+                self._on_idle_exited()
+        finally:
+            self._refreshing = False
 
     def _on_idle_entered(self) -> None:
         """进入业务空闲状态时的决策逻辑。"""
         if self._restart_after_idle_on_pause:
             self._restart_after_idle_on_pause = False
+            # 重启下游代表重启到干净状态，重置 _ever_active
+            self._ever_active = False
             self._downstream.restart()
             self._event_bus.publish(StateChangedEvent(paused=self._paused))
+            self._refresh()
             return
 
         if self._ever_active and self._idle_restart_timeout > 0:
@@ -161,8 +178,14 @@ class Gateway:
 
     def _on_idle_timeout(self) -> None:
         """空闲超时到达时的自动重启决策。"""
+        # 超时回调执行时必须进行防竞态空闲状态校验
+        if not self._is_idle:
+            return
         self._cancel_idle_timeout = None
+        # 重启下游代表重启到干净状态，重置 _ever_active
+        self._ever_active = False
         self._downstream.restart()
+        self._refresh()
 
     def pause(self, restart_after_idle: bool) -> None:
         """暂停队列。"""
@@ -177,7 +200,10 @@ class Gateway:
         # 不会重复触发 _on_idle_entered，因此我们需要在这里直接触发重启
         if restart_after_idle and self._is_idle and self._restart_after_idle_on_pause:
             self._restart_after_idle_on_pause = False
+            # 重启下游代表重启到干净状态，重置 _ever_active
+            self._ever_active = False
             self._downstream.restart()
+            self._refresh()
 
     def resume(self) -> None:
         """恢复队列，并自动触发副作用。"""
@@ -199,10 +225,15 @@ class Gateway:
 
         self._downstream_executing = executing
         if executing:
+            # 只有在下游真正开始执行任务时，才将 _ever_active 设为 True
             self._ever_active = True
             self._refresh()
         else:
-            self._attempt_count = 0
+            # 如果是因为崩溃导致的执行结束，不能清零失败计数，否则无法完成崩溃跳过逻辑
+            if self._crashed_executing:
+                self._crashed_executing = False
+            else:
+                self._attempt_count = 0
             self._refresh()
             self._event_bus.publish(StatusChangedEvent())
             self._dispatcher.try_dispatch()
@@ -217,6 +248,10 @@ class Gateway:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
         if self._queue_writer.requeue_running_if_exists():
             self._attempt_count += 1
+        # 记录崩溃导致的执行中断，以便在随后的 executing=False 事件中保留 attempt_count
+        self._crashed_executing = True
+        # 崩溃后会被重新拉起，拉起后重置为干净状态，因此将 _ever_active 设为 False
+        self._ever_active = False
         self._event_bus.publish(StatusChangedEvent())
         self._refresh()
 

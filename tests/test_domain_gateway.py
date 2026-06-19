@@ -336,6 +336,77 @@ class TestDomainGateway(unittest.TestCase):
         self.assertEqual(g._mock_reader.get_pending_count.call_count, 2)
         self.assertEqual(g._mock_pm.is_running.call_count, 2)
 
+    def test_refresh_reentrancy_prevention(self):
+        """测试 _refresh 能够有效防范事件回调触发的无限递归。"""
+        g = _make_gateway(paused=False)
+        
+        # 模拟在 update_state 触发时再次执行 _refresh (比如触发了 ScriptStateChangedEvent)
+        # 如果没有防重入机制，这里会造成无限递归导致栈溢出
+        call_count = 0
+        def mock_update_state(is_busy, ever_active):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 5:
+                g._refresh()
+
+        g._mock_pm.update_state.side_effect = mock_update_state
+        g._refresh()
+        
+        # 验证因为有防重入标志，mock_update_state 里的递归调用在第一层就 return 了，
+        # 所以最终 update_state 自 side_effect 设置后只额外执行了一次
+        self.assertEqual(call_count, 1)
+
+    def test_idle_timeout_state_validation(self):
+        """测试在超时到达前已非空闲状态，不会触发下游重启。"""
+        g = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10)
+        
+        # 退出空闲状态
+        g._is_idle = False
+        
+        # 此时触发空闲超时
+        g._on_idle_timeout()
+        
+        # 应该直接返回，不触发重启
+        g._mock_downstream.restart.assert_not_called()
+
+    def test_ever_active_reset_on_restarts_and_crashes(self):
+        """测试在下游重启与崩溃时，_ever_active 会正确复位为 False（干净状态）。"""
+        # 情况 1：从空闲超时重启
+        g1 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10)
+        g1._on_idle_timeout()
+        self.assertFalse(g1._ever_active)
+        g1._mock_downstream.restart.assert_called_once()
+
+        # 情况 2：从 pause 带有重启参数且已空闲的立即重启
+        g2 = _make_gateway(paused=False, ever_active=True)
+        g2._is_idle = True
+        g2.pause(restart_after_idle=True)
+        self.assertFalse(g2._ever_active)
+        g2._mock_downstream.restart.assert_called_once()
+
+        # 情况 3：崩溃重启
+        g3 = _make_gateway(paused=False, ever_active=True)
+        g3._mock_event_bus.publish(DownstreamCrashedEvent())
+        self.assertFalse(g3._ever_active)
+
+    def test_crashed_executing_prevents_attempt_count_reset(self):
+        """测试执行中崩溃导致的 executing=False 不会重置 attempt_count。"""
+        # 必须传入 pending_count=1，否则 _refresh 时会因为队列无任务而清零 attempt_count
+        g = _make_gateway(paused=False, downstream_executing=True, attempt_count=0, pending_count=1)
+        
+        # 1. 模拟崩溃：requeue 成功，增加 attempt_count
+        g._mock_writer.requeue_running_if_exists.return_value = True
+        g._mock_event_bus.publish(DownstreamCrashedEvent())
+        self.assertEqual(g._attempt_count, 1)
+        self.assertTrue(g._crashed_executing)
+        
+        # 2. 模拟重启逻辑发布 executing = False
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        
+        # 验证此时 attempt_count 依然保留为 1，崩溃标志被清空
+        self.assertEqual(g._attempt_count, 1)
+        self.assertFalse(g._crashed_executing)
+
 
 if __name__ == "__main__":
     unittest.main()

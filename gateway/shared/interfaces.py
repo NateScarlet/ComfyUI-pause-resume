@@ -143,11 +143,6 @@ class DownstreamClient(ABC):
         pass
 
     @abstractmethod
-    def on_sleep_prevention_changed(self, preventing: bool) -> None:
-        """通知下游客户端阻止系统休眠的状态发生变化（以便管理超时重启等运行时状态）。"""
-        pass
-
-    @abstractmethod
     async def send_prompt(self, prompt_id: str, body: Dict[str, Any]) -> None:
         """向下游发送任务数据。如果发送失败，可能抛出 DownstreamError。"""
         pass

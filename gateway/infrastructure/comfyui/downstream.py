@@ -66,10 +66,6 @@ class ComfyUIDownstreamClient(DownstreamClient):
         if self.loop is not None and self.loop.is_running():
             self.loop.create_task(self.restart_downstream())
 
-    def on_sleep_prevention_changed(self, preventing: bool) -> None:
-        """阻止系统休眠的状态发生变化时的事件回调。本客户端暂无须响应该状态。"""
-        pass
-
     async def send_prompt(self, prompt_id: str, body: Dict[str, Any]) -> None:
         """向下游发送任务数据（接口实现）。如果发送失败，抛出 DownstreamError。"""
         url = f"http://127.0.0.1:{self._downstream_port}/prompt"
