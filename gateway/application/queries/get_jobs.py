@@ -1,10 +1,8 @@
 import json
 import logging
-import aiohttp
 from typing import List, Dict, Any, Optional, Set, cast
-from gateway.shared.interfaces import TaskQueueReader
+from gateway.shared.interfaces import TaskQueueReader, DownstreamClient
 from gateway.shared.models import Task
-from gateway.application.services.downstream import DownstreamAppService
 
 logger = logging.getLogger(__name__)
 
@@ -13,31 +11,14 @@ class GetJobsQueryHandler:
     """整合网关队列与下游 ComfyUI 原生历史 Job 列表的 Query Handler。"""
 
     def __init__(
-        self, queue_reader: TaskQueueReader, downstream_service: DownstreamAppService
+        self, queue_reader: TaskQueueReader, downstream_client: DownstreamClient
     ):
         self._queue_reader = queue_reader
-        self._downstream_service = downstream_service
+        self._downstream_client = downstream_client
 
     async def handle(self, query_params: Dict[str, str]) -> Dict[str, Any]:
         """合并网关任务与下游 API 的历史任务，支持排序、过滤和分页展示。"""
-        downstream_port = self._downstream_service.downstream_port
-        downstream_jobs_url = f"http://127.0.0.1:{downstream_port}/api/jobs"
-
-        downstream_jobs: List[Dict[str, Any]] = []
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    downstream_jobs_url, params=query_params
-                ) as resp:
-                    if resp.status == 200:
-                        resp_json = await resp.json()
-                        if isinstance(resp_json, dict):
-                            resp_dict = cast(Dict[str, Any], resp_json)
-                            raw_jobs = resp_dict.get("jobs", [])
-                            if isinstance(raw_jobs, list):
-                                downstream_jobs = cast(List[Dict[str, Any]], raw_jobs)
-        except Exception as e:
-            logger.error(f"Error fetching jobs from downstream: {e}")
+        downstream_jobs = await self._downstream_client.get_jobs(query_params)
 
         def make_job_dict(task: Task, status_str: str) -> Dict[str, Any]:
             extra_data = cast(Dict[str, Any], json.loads(task.extra_data))
@@ -157,11 +138,8 @@ class GetJobsQueryHandler:
 class GetJobDetailQueryHandler:
     """获取具体 Job 详情信息的 Query Handler。"""
 
-    def __init__(
-        self, queue_reader: TaskQueueReader, downstream_service: DownstreamAppService
-    ):
+    def __init__(self, queue_reader: TaskQueueReader):
         self._queue_reader = queue_reader
-        self._downstream_service = downstream_service
 
     async def handle(self, job_id: str) -> Optional[Dict[str, Any]]:
         """从网关拦截的任务队列中查询具体任务详情。"""

@@ -1,17 +1,40 @@
-from typing import Optional
-from gateway.shared.interfaces import StateRepository
+from typing import Optional, Callable
+from gateway.shared.interfaces import (
+    StateRepository,
+    TaskQueueReader,
+    ProcessManager,
+    SystemPowerController,
+    Timer,
+    DownstreamClient,
+    TaskDispatcher,
+    EventBus,
+)
+from gateway.shared.events import (
+    StateChangedEvent,
+    StatusChangedEvent,
+    DownstreamExecutingChangedEvent,
+    DownstreamReadyChangedEvent,
+)
 
 
 class Gateway:
     """网关核心业务领域的聚合根，控制网关生命周期、状态调度与决策逻辑。
 
-    本类不依赖任何 I/O、HTTP 框架或操作系统底层 API，仅关注纯粹的业务状态转换。
-    持久化状态的读写通过注入的 StateRepository 抽象接口完成。
+    本类不依赖任何 I/O、HTTP 框架或操作系统底层 API，仅关注纯粹的业务状态转换与驱动。
+    所有依赖的抽象接口都在构造时注入，不为空，确保领域层无状态防守。
     """
 
     def __init__(
         self,
         state_repo: StateRepository,
+        queue_reader: TaskQueueReader,
+        process_manager: ProcessManager,
+        power_controller: SystemPowerController,
+        timer: Timer,
+        downstream: DownstreamClient,
+        dispatcher: TaskDispatcher,
+        event_bus: EventBus,
+        idle_restart_timeout: float = 0,
         restart_after_idle_on_pause: bool = False,
         downstream_executing: bool = False,
         downstream_ready: bool = False,
@@ -19,6 +42,12 @@ class Gateway:
         attempt_count: int = 0,
     ):
         self._state_repo = state_repo
+        self._queue_reader = queue_reader
+        self._process_manager = process_manager
+        self._power_controller = power_controller
+        self._timer = timer
+        self._idle_restart_timeout = idle_restart_timeout
+
         self.paused = state_repo.get_paused()
         self.restart_after_idle_on_pause = restart_after_idle_on_pause
         self.downstream_executing = downstream_executing
@@ -26,70 +55,151 @@ class Gateway:
         self.ever_active = ever_active
         self.attempt_count = attempt_count
 
-    def pause(self, restart_after_idle: bool, is_currently_idle: bool) -> Optional[str]:
-        """暂停队列。
+        self._is_idle = False
+        self._cancel_idle_timeout: Optional[Callable[[], None]] = None
 
-        如果传入了闲置后重启标志，且网关当前已经是空闲状态，则决策为立即重启下游。
-        """
+        self._downstream = downstream
+        self._dispatcher = dispatcher
+        self._event_bus = event_bus
+
+        # 领域聚合根在构造时，自己订阅感兴趣的事件，保持高内聚
+        self._event_bus.subscribe(
+            DownstreamExecutingChangedEvent,
+            lambda ev: self.set_downstream_executing(ev.executing),
+        )
+        self._event_bus.subscribe(
+            DownstreamReadyChangedEvent,
+            lambda ev: self.set_downstream_ready(ev.ready),
+        )
+
+    def sync_infrastructure(self) -> None:
+        """根据网关当前的业务决策，同步阻止系统休眠、空闲重启超时与外挂脚本状态。"""
+        has_pending = self._queue_reader.get_pending_count(limit=1) > 0
+        scripts_running = self._process_manager.is_running()
+
+        should_prevent = self.determine_sleep_prevention(has_pending, scripts_running)
+        is_busy = self.determine_busy_state(has_pending)
+
+        # 更新空闲/繁忙外挂脚本运行状态
+        self._process_manager.update_state(is_busy, self.ever_active)
+
+        if should_prevent:
+            self._power_controller.prevent_sleep()
+        else:
+            self._power_controller.allow_sleep()
+
+        self._downstream.on_sleep_prevention_changed(should_prevent)
+
+        # 检测并触发进入或退出空闲状态
+        is_idle = not should_prevent
+        if is_idle and not self._is_idle:
+            self._is_idle = True
+            self._on_idle_entered()
+        elif not is_idle and self._is_idle:
+            self._is_idle = False
+            self._on_idle_exited()
+
+    def _on_idle_entered(self) -> None:
+        """进入业务空闲状态时的决策逻辑。"""
+        if self.restart_after_idle_on_pause:
+            self.restart_after_idle_on_pause = False
+            self._downstream.restart()
+            self._event_bus.publish(StateChangedEvent(paused=self.paused))
+            return
+
+        if self.ever_active and self._idle_restart_timeout > 0:
+            self._cancel_idle_timeout = self._timer.start_timeout(
+                self._idle_restart_timeout, self._on_idle_timeout
+            )
+
+    def _on_idle_exited(self) -> None:
+        """退出业务空闲状态时的决策逻辑（取消超时定时器）。"""
+        if self._cancel_idle_timeout:
+            self._cancel_idle_timeout()
+            self._cancel_idle_timeout = None
+
+    def _on_idle_timeout(self) -> None:
+        """空闲超时到达时的自动重启决策。"""
+        self._cancel_idle_timeout = None
+        self._downstream.restart()
+
+    def pause(self, restart_after_idle: bool) -> None:
+        """暂停队列。"""
         self.paused = True
         self.restart_after_idle_on_pause = restart_after_idle
         self._state_repo.set_paused(True)
 
-        if restart_after_idle and is_currently_idle:
-            self.restart_after_idle_on_pause = False
-            return "RESTART_IMMEDIATELY"
-        return None
+        self._event_bus.publish(StateChangedEvent(paused=True))
+        self.sync_infrastructure()
 
-    def resume(self) -> bool:
-        """恢复队列，决策是否应当尝试向下一代发任务。"""
+        # 如果在此之前系统已经处于空闲状态（且请求立即重启），由于 sync_infrastructure
+        # 不会重复触发 _on_idle_entered，因此我们需要在这里直接触发重启
+        if restart_after_idle and self._is_idle and self.restart_after_idle_on_pause:
+            self.restart_after_idle_on_pause = False
+            self._downstream.restart()
+
+    def resume(self) -> None:
+        """恢复队列，并自动触发副作用。"""
         self.paused = False
         self.restart_after_idle_on_pause = False
         self._state_repo.set_paused(False)
-        return True
 
-    def set_downstream_executing(self, executing: bool) -> Optional[str]:
-        """设置下游的执行状态，并决策触发的业务动作。
+        self._event_bus.publish(StateChangedEvent(paused=False))
+        self.sync_infrastructure()
+        self._dispatcher.try_dispatch()
 
-        如果下游执行完任务变为空闲，则重置尝试次数，并决策清除运行队列且触发派发。
-        """
+    def set_downstream_executing(self, executing: bool) -> None:
+        """设置下游的执行状态，并决策触发相应的业务动作。"""
         if self.downstream_executing == executing:
-            return None
+            return
 
         self.downstream_executing = executing
         if executing:
             self.ever_active = True
-            return "ENTER_BUSY"
+            self.sync_infrastructure()
         else:
             self.attempt_count = 0
-            return "CLEAR_RUNNING_AND_DISPATCH"
+            self.sync_infrastructure()
+            self._event_bus.publish(StatusChangedEvent())
+            self._dispatcher.try_dispatch()
 
-    def set_downstream_ready(self, ready: bool) -> bool:
-        """设置下游就绪状态，返回是否应该尝试派发任务。"""
+    def set_downstream_ready(self, ready: bool) -> None:
+        """设置下游就绪状态，并在合适时触发派发。"""
         self.downstream_ready = ready
-        return ready and not self.paused
+        if ready and not self.paused:
+            self._dispatcher.try_dispatch()
 
     def on_dispatch_success(self) -> None:
         """当派发任务成功时的业务反馈。"""
-        pass
+        self._event_bus.publish(StatusChangedEvent())
 
     def on_dispatch_failed(self, is_permanent: bool) -> bool:
-        """当派发任务失败时的处理决策。
-
-        对于永久性不可恢复的错误（如 400 状态码），直接丢弃（返回 False 告知不重入队列）。
-        对于临时性错误，累加尝试计数，并返回 True 告知需要重入队列。
-        """
+        """当派发任务失败时的处理决策。"""
+        self._event_bus.publish(StatusChangedEvent())
         if is_permanent:
             return False
 
         self.attempt_count += 1
         return True
 
-    def calculate_dispatch_skip(self, pending_count: int) -> Optional[int]:
-        """核心派发调度决策。
+    def increment_attempt_count(self) -> None:
+        """物理崩溃时增加重试计数。"""
+        self.attempt_count += 1
 
-        根据当前网关暂停状态、下游执行状态和就绪状态，计算是否可派发。
-        若可派发，计算得出待弹出任务的 skip 偏移量（用于实现循环/重试机制）。
-        """
+    def on_task_added(self) -> None:
+        """当新任务入队时的业务逻辑与副作用驱动。"""
+        self.sync_infrastructure()
+        self._event_bus.publish(StatusChangedEvent())
+        self._dispatcher.try_dispatch()
+
+    def on_queue_modified(self) -> None:
+        """当队列内容被修改时的业务逻辑与副作用驱动。"""
+        self.sync_infrastructure()
+        self._event_bus.publish(StatusChangedEvent())
+        self._dispatcher.try_dispatch()
+
+    def calculate_dispatch_skip(self, pending_count: int) -> Optional[int]:
+        """核心派发调度决策。"""
         if self.paused or self.downstream_executing or not self.downstream_ready:
             return None
 
@@ -100,10 +210,7 @@ class Gateway:
         return self.attempt_count % pending_count
 
     def determine_busy_state(self, has_pending: bool) -> bool:
-        """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。
-
-        若已被暂停，即使队列里有待处理任务且下游未执行，也不视为繁忙，以便允许系统休眠省电。
-        """
+        """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
         return self.downstream_executing or (not self.paused and has_pending)
 
     def determine_sleep_prevention(

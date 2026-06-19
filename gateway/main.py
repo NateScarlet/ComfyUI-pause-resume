@@ -12,11 +12,16 @@ from .config import GatewayConfig
 from .infrastructure.sqlite.state import SQLiteStateRepository
 from .infrastructure.queue_factory import init_queue
 from .infrastructure.system.program import ExternalProgramManager
+from .infrastructure.system.power import PowerManagement
+from .infrastructure.system.timer import AsyncioTimer
 from .domain.gateway import Gateway
-from .application.services.downstream import DownstreamAppService
+from .infrastructure.comfyui.downstream import ComfyUIDownstreamClient
+from .infrastructure.in_memory.event_bus import InMemoryEventBus
+from .infrastructure.comfyui.dispatcher import ComfyUITaskDispatcher
 from .application.facade import AppFacade
 from .presentation.handlers import GatewayHandlers
 from .presentation.routes import setup_routes
+from .shared.events import DownstreamCrashedEvent, StatusChangedEvent
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
@@ -68,33 +73,69 @@ async def main() -> None:
     state_repo = SQLiteStateRepository(os.path.join(config.data_dir, "state.db"))
     queue_reader, queue_writer, close_queue = init_queue(config)
 
-    # 4. 实例化外部程序管理器
+    # 4. 实例化系统休眠管理器和定时器
+    power_manager = PowerManagement()
+    timer = AsyncioTimer()
+
+    # 5. 实例化外部程序管理器
     process_manager = ExternalProgramManager(config.idle_program, config.busy_program)
 
-    # 5. 实例化领域模型聚合根 (Gateway)，从持久化仓储恢复暂停状态
-    gateway = Gateway(state_repo=state_repo)
-
-    # 6. 实例化应用服务 (DownstreamAppService) 并依赖注入
-    downstream_service = DownstreamAppService(
-        gateway=gateway,
+    # 6. 实例化事件总线和下游客户端
+    event_bus = InMemoryEventBus()
+    downstream_service = ComfyUIDownstreamClient(
         config=config,
-        queue_reader=queue_reader,
-        queue_writer=queue_writer,
+        event_bus=event_bus,
         process_manager=process_manager,
     )
 
-    # 7. 根据初始状态，同步阻止系统休眠和外挂脚本行为
-    downstream_service.sync_state_to_infrastructure()
+    # 7. 实例化应用层任务分派器
+    dispatcher = ComfyUITaskDispatcher(
+        config=config,
+        queue_reader=queue_reader,
+        queue_writer=queue_writer,
+        downstream=downstream_service,
+        event_bus=event_bus,
+    )
 
-    # 8. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
+    # 8. 实例化领域模型聚合根 (Gateway)，直接注入所有依赖
+    gateway = Gateway(
+        state_repo=state_repo,
+        queue_reader=queue_reader,
+        process_manager=process_manager,
+        power_controller=power_manager,
+        timer=timer,
+        downstream=downstream_service,
+        dispatcher=dispatcher,
+        event_bus=event_bus,
+        idle_restart_timeout=config.idle_restart_timeout,
+    )
+
+    # 9. 任务分发器完成 Gateway 注入以消解循环引用
+    dispatcher.set_gateway(gateway)
+
+    # 10. 绑定崩溃处理和状态更新
+    # 启动时重入之前崩溃可能残留的正在运行任务
+    queue_writer.requeue_running()
+
+    def handle_crashed(ev: DownstreamCrashedEvent) -> None:
+        if queue_writer.requeue_running_if_exists():
+            gateway.increment_attempt_count()
+        event_bus.publish(StatusChangedEvent())
+
+    event_bus.subscribe(DownstreamCrashedEvent, handle_crashed)
+
+    # 11. 根据初始状态，同步阻止系统休眠和外挂脚本行为
+    gateway.sync_infrastructure()
+
+    # 12. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
     app_facade = AppFacade.create(
         gateway=gateway,
         queue_reader=queue_reader,
         queue_writer=queue_writer,
-        downstream_service=downstream_service,
+        downstream_client=downstream_service,
     )
 
-    # 9. 绑定异步事件循环与信号量
+    # 13. 绑定异步事件循环与信号量
     loop = asyncio.get_running_loop()
     downstream_service.loop = loop
     exit_event = asyncio.Event()
@@ -110,7 +151,7 @@ async def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 10. 后台拉起下游服务
+    # 14. 后台拉起下游服务
     async def bootstrap_downstream() -> None:
         if downstream_service.exiting:
             return
@@ -119,12 +160,13 @@ async def main() -> None:
 
     asyncio.create_task(bootstrap_downstream())
 
-    # 11. 构建表示层 (GatewayHandlers) 并注册 Web 路由
+    # 15. 构建表示层 (GatewayHandlers) 并注册 Web 路由
     app = web.Application(client_max_size=1024**3)
     handlers = GatewayHandlers(
         app=app_facade,
         downstream_service=downstream_service,
         queue_reader=queue_reader,
+        event_bus=event_bus,
     )
     setup_routes(app, handlers)
 
@@ -135,9 +177,9 @@ async def main() -> None:
 
     logger.info(f"🌐 Proxy server running on {config.proxy_host}:{config.proxy_port}")
 
-    # 12. 后台启动监控与首次分发
+    # 16. 后台启动监控与首次分发
     asyncio.create_task(downstream_service.monitor_downstream())
-    downstream_service.try_dispatch()
+    dispatcher.try_dispatch()
 
     # 13. 等待信号并优雅清理
     try:
@@ -150,6 +192,10 @@ async def main() -> None:
         await downstream_service.shutdown()
 
         # 构建方释放自己创建的基础设施资源
+        try:
+            power_manager.allow_sleep()
+        except Exception:
+            pass
         try:
             close_queue()
         except Exception:

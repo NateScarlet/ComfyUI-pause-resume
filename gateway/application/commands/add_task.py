@@ -4,17 +4,15 @@ import json
 from typing import Optional, Dict, Any
 from gateway.shared.models import Task, RawJSON
 from gateway.shared.interfaces import TaskQueueWriter
-from gateway.application.services.downstream import DownstreamAppService
+from gateway.domain.gateway import Gateway
 
 
 class AddTaskCommandHandler:
     """处理添加任务写指令的 Handler。"""
 
-    def __init__(
-        self, queue_writer: TaskQueueWriter, downstream_service: DownstreamAppService
-    ):
+    def __init__(self, queue_writer: TaskQueueWriter, gateway: Gateway):
         self._queue_writer = queue_writer
-        self._downstream_service = downstream_service
+        self._gateway = gateway
 
     def handle(
         self,
@@ -48,9 +46,7 @@ class AddTaskCommandHandler:
         )
         self._queue_writer.add_task(task)
 
-        # 触发基础设施状态同步、WebSocket 广播和尝试分发
-        self._downstream_service.sync_state_to_infrastructure()
-        self._downstream_service.notify_status_changed()
-        self._downstream_service.try_dispatch()
+        # 触发领域聚合根的入队响应逻辑
+        self._gateway.on_task_added()
 
         return {"prompt_id": prompt_id, "number": task_number}

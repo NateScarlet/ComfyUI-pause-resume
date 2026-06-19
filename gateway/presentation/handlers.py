@@ -9,8 +9,12 @@ from aiohttp import web
 from typing import List, Set, Union, cast, Dict, Any
 
 from gateway.shared.utils import raw_json_dumps
-from gateway.shared.interfaces import TaskQueueReader
-from gateway.application.services.downstream import DownstreamAppService
+from gateway.shared.interfaces import (
+    TaskQueueReader,
+    DownstreamClient,
+    EventBus,
+)
+from gateway.shared.events import StatusChangedEvent, StateChangedEvent
 from gateway.application.facade import AppFacade
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -26,20 +30,26 @@ class GatewayHandlers:
     def __init__(
         self,
         app: AppFacade,
-        downstream_service: DownstreamAppService,
+        downstream_service: DownstreamClient,
         queue_reader: TaskQueueReader,
+        event_bus: EventBus,
     ):
         self._app = app
         self._downstream_service = downstream_service
         self._queue_reader = queue_reader
+        self._event_bus = event_bus
 
         # 维护活跃的连接句柄
         self.sse_clients: Set[asyncio.Queue[str]] = set()
         self.ws_clients: Set[web.WebSocketResponse] = set()
 
-        # 注册应用层通知的回调
-        self._downstream_service.register_ws_callback(self._on_ws_broadcast_triggered)
-        self._downstream_service.register_sse_callback(self._on_sse_broadcast_triggered)
+        # 通过订阅 EventBus 事件来处理 WS 和 SSE 广播
+        self._unsub_status = self._event_bus.subscribe(
+            StatusChangedEvent, lambda ev: self._on_ws_broadcast_triggered()
+        )
+        self._unsub_state = self._event_bus.subscribe(
+            StateChangedEvent, lambda ev: self._on_sse_broadcast_triggered(ev.paused)
+        )
 
         # WS 广播防抖控制变量
         self._broadcast_ws_scheduled: bool = False
@@ -47,9 +57,12 @@ class GatewayHandlers:
 
     def _on_ws_broadcast_triggered(self) -> None:
         """应用层通知：触发防抖的 WS 队列剩余数量状态广播。"""
-        loop = self._downstream_service.loop
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(self._schedule_broadcast_ws_status)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(self._schedule_broadcast_ws_status)
+        except RuntimeError:
+            pass
 
     def _schedule_broadcast_ws_status(self) -> None:
         """在事件循环中调度防抖广播逻辑。"""
@@ -81,8 +94,10 @@ class GatewayHandlers:
                 except Exception:
                     pass
 
-        if self._downstream_service.loop is not None:
-            self._downstream_service.loop.create_task(do_broadcast())
+        try:
+            asyncio.create_task(do_broadcast())
+        except RuntimeError:
+            pass
 
     def _on_sse_broadcast_triggered(self, paused: bool) -> None:
         """应用层通知：广播暂停状态给 SSE 客户端。"""
@@ -166,7 +181,7 @@ class GatewayHandlers:
         ):
             return web.Response(status=404, text="Not Found")
 
-        if not self._downstream_service.gateway.downstream_ready:
+        if not self._downstream_service.downstream_ready:
             method = request.method
             accept = request.headers.get("Accept", "")
             if method == "GET" and (
@@ -427,7 +442,12 @@ class GatewayHandlers:
             return web.Response(status=502, text=f"Bad Gateway: {e}")
 
     def shutdown(self) -> None:
-        """关闭所有 SSE 和 WS 连接。"""
+        """关闭所有订阅及 SSE 和 WS 连接。"""
+        if hasattr(self, "_unsub_status"):
+            self._unsub_status()
+        if hasattr(self, "_unsub_state"):
+            self._unsub_state()
+
         for q in list(self.sse_clients):
             try:
                 q.put_nowait("shutdown")
@@ -448,5 +468,8 @@ class GatewayHandlers:
                     return_exceptions=True,
                 )
 
-        if self.ws_clients and self._downstream_service.loop is not None:
-            self._downstream_service.loop.create_task(close_all_ws())
+        if self.ws_clients:
+            try:
+                asyncio.create_task(close_all_ws())
+            except RuntimeError:
+                pass

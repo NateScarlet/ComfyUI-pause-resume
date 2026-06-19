@@ -1,6 +1,24 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
 from .models import Task
+
+T = TypeVar("T")
+
+
+class EventBus(ABC):
+    """网关内部的事件发布与订阅总线接口。"""
+
+    @abstractmethod
+    def subscribe(
+        self, event_class: Type[T], callback: Callable[[T], Any]
+    ) -> Callable[[], None]:
+        """订阅指定类型的事件类，返回一个无参取消订阅的闭包函数。"""
+        pass
+
+    @abstractmethod
+    def publish(self, event: object) -> None:
+        """发布指定事件的实例，触发所有订阅了该事件类类型的回调。"""
+        pass
 
 
 class TaskQueueReader(ABC):
@@ -101,4 +119,101 @@ class ProcessManager(ABC):
     @abstractmethod
     def is_running(self) -> bool:
         """检测当前是否有正在运行的受控外部辅助进程。"""
+        pass
+
+
+class DownstreamClient(ABC):
+    """代表下游 ComfyUI 服务生命周期的抽象控制客户端。"""
+
+    @property
+    @abstractmethod
+    def downstream_ready(self) -> bool:
+        """下游服务是否已就绪。"""
+        pass
+
+    @property
+    @abstractmethod
+    def downstream_port(self) -> int:
+        """下游服务监听的物理端口。"""
+        pass
+
+    @abstractmethod
+    def restart(self) -> None:
+        """重启下游服务。"""
+        pass
+
+    @abstractmethod
+    def on_sleep_prevention_changed(self, preventing: bool) -> None:
+        """通知下游客户端阻止系统休眠的状态发生变化（以便管理超时重启等运行时状态）。"""
+        pass
+
+    @abstractmethod
+    async def send_prompt(self, prompt_id: str, body: Dict[str, Any]) -> None:
+        """向下游发送任务数据。如果发送失败，可能抛出 DownstreamError。"""
+        pass
+
+    @abstractmethod
+    async def get_jobs(self, query_params: Dict[str, str]) -> List[Dict[str, Any]]:
+        """从下游 ComfyUI 原生 API 获取历史作业列表。"""
+        pass
+
+
+class StateBroadcaster(ABC):
+    """负责向客户端广播网关状态变更事件的抽象接口。"""
+
+    @abstractmethod
+    def register_ws_callback(self, callback: Callable[[], None]) -> None:
+        """注册前端 WebSocket 状态广播回调。"""
+        pass
+
+    @abstractmethod
+    def register_sse_callback(self, callback: Callable[[bool], None]) -> None:
+        """注册 SSE 状态广播回调。"""
+        pass
+
+    @abstractmethod
+    def notify_state_changed(self, paused: bool) -> None:
+        """广播暂停/恢复状态变更事件。"""
+        pass
+
+    @abstractmethod
+    def notify_status_changed(self) -> None:
+        """广播队列任务数量等状态变更事件。"""
+        pass
+
+
+class TaskDispatcher(ABC):
+    """负责向下一代发任务的抽象调度器接口。"""
+
+    @abstractmethod
+    def try_dispatch(self) -> None:
+        """尝试向下一代发任务。"""
+        pass
+
+
+class SystemPowerController(ABC):
+    """负责控制系统电源状态（例如休眠阻止）的抽象接口。"""
+
+    @abstractmethod
+    def prevent_sleep(self) -> None:
+        """阻止系统进入休眠状态。"""
+        pass
+
+    @abstractmethod
+    def allow_sleep(self) -> None:
+        """恢复系统默认的休眠行为。"""
+        pass
+
+
+class Timer(ABC):
+    """用于处理定时延时触发动作的抽象定时器接口。"""
+
+    @abstractmethod
+    def start_timeout(
+        self, seconds: float, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """在指定秒数后异步执行回调。
+
+        返回一个无参取消函数（Callable[[], None]），调用该函数可取消此特定定时任务。
+        """
         pass
