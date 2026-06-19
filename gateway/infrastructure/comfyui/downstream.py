@@ -81,7 +81,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                         raise DownstreamError(resp.status, txt)
         except DownstreamError:
             raise
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             raise DownstreamError(500, f"Network error: {str(e)}")
 
     async def get_jobs(self, query_params: Dict[str, str]) -> List[Dict[str, Any]]:
@@ -99,7 +99,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                             raw_jobs = resp_dict.get("jobs", [])
                             if isinstance(raw_jobs, list):
                                 return cast(List[Dict[str, Any]], raw_jobs)
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"Error fetching jobs from downstream: {e}")
         return []
 
@@ -184,7 +184,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                                 DownstreamReadyChangedEvent(ready=True)
                             )
                             return
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     pass
                 await asyncio.sleep(1)
         logger.error("❌ Downstream wait timeout")
@@ -205,7 +205,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                         if self._process.poll() is not None:
                             break
                         await asyncio.sleep(0.1)
-                except Exception:
+                except (ProcessLookupError, OSError):
                     pass
                 self._process = None
             self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
@@ -239,5 +239,5 @@ class ComfyUIDownstreamClient(DownstreamClient):
             try:
                 logger.info("Cleaning up downstream process...")
                 self._process.kill()
-            except Exception:
+            except (ProcessLookupError, OSError):
                 pass

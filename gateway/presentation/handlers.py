@@ -16,6 +16,7 @@ from gateway.shared.interfaces import (
 )
 from gateway.shared.models import TaskStatus
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
+from gateway.shared.exceptions import GatewayError
 from gateway.application.facade import AppFacade
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -86,7 +87,7 @@ class GatewayHandlers:
                 try:
                     if not ws.closed:
                         await ws.send_str(msg_str)
-                except Exception:
+                except (ConnectionResetError, aiohttp.WebSocketError):
                     pass
 
         try:
@@ -100,7 +101,7 @@ class GatewayHandlers:
         for q in list(self.sse_clients):
             try:
                 q.put_nowait(data)
-            except Exception:
+            except asyncio.QueueFull:
                 pass
 
     async def handle_pause(self, request: web.Request) -> web.Response:
@@ -109,7 +110,7 @@ class GatewayHandlers:
         if request.body_exists:
             try:
                 body = await request.json()
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 return web.Response(status=400, text="Bad Request: Invalid JSON body")
             if not isinstance(body, dict):
                 return web.Response(
@@ -250,7 +251,7 @@ class GatewayHandlers:
                         "node_errors": {},
                     }
                 )
-            except Exception as e:
+            except (GatewayError, ValueError, TypeError) as e:
                 logger.error(f"Error processing {path}: {e}")
                 traceback.print_exc()
                 return web.Response(status=400, text=str(e))
@@ -287,7 +288,7 @@ class GatewayHandlers:
         if method == "POST" and path in ("/queue", "/api/queue"):
             try:
                 raw_body = await request.json()
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 return web.Response(status=400, text="Bad Request: Invalid JSON body")
             body_json: Dict[str, Any] = {}
             if isinstance(raw_body, dict):
@@ -370,7 +371,7 @@ class GatewayHandlers:
                                                                 data_str = json.dumps(
                                                                     data_dict
                                                                 )
-                                        except Exception:
+                                        except (json.JSONDecodeError, TypeError):
                                             pass
                                     await ws_to.send_str(data_str)
                                 elif msg.type == aiohttp.WSMsgType.BINARY:
@@ -389,7 +390,11 @@ class GatewayHandlers:
                 except ConnectionResetError:
                     # 客户端正常关闭页面时，传输层已关闭，写入失败属于正常行为
                     pass
-                except Exception as e:
+                except (
+                    aiohttp.ClientError,
+                    ConnectionResetError,
+                    asyncio.TimeoutError,
+                ) as e:
                     logger.error(f"WebSocket Error: {e}")
                 finally:
                     self.ws_clients.discard(ws_server)
@@ -427,7 +432,7 @@ class GatewayHandlers:
                             headers=resp_headers,
                             content_type=resp.content_type,
                         )
-                except Exception as e:
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     return web.Response(status=502, text=f"Bad Gateway: {e}")
 
         # 8. 默认普通代理
@@ -449,7 +454,7 @@ class GatewayHandlers:
                         await proxy_resp.write(chunk)
                     await proxy_resp.write_eof()
                     return proxy_resp
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             return web.Response(status=502, text=f"Bad Gateway: {e}")
 
     def shutdown(self) -> None:
@@ -462,14 +467,14 @@ class GatewayHandlers:
         for q in list(self.sse_clients):
             try:
                 q.put_nowait("shutdown")
-            except Exception:
+            except asyncio.QueueFull:
                 pass
 
         async def close_ws(ws: web.WebSocketResponse) -> None:
             try:
                 if not ws.closed:
                     await ws.close(code=1001, message=b"Server shutting down")
-            except Exception:
+            except (ConnectionResetError, RuntimeError):
                 pass
 
         async def close_all_ws() -> None:

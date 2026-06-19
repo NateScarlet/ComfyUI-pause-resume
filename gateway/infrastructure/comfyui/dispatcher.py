@@ -110,13 +110,13 @@ class ComfyUITaskDispatcher(TaskDispatcher):
                         self._save_failed_workflow(
                             task, de.message, body, extra_data, de.status_code
                         )
-                    except Exception as save_err:
+                    except (OSError, TypeError) as save_err:
                         logger.error(
                             f"Failed to save failed workflow details: {save_err}"
                         )
                 else:
                     self._queue_writer.requeue_running()
-            except Exception as e:
+            except (json.JSONDecodeError, OSError) as e:
                 logger.error(f"Error sending workflow: {e}")
                 self._event_bus.publish(
                     DispatchFailedEvent(task_id=task.prompt_id, is_permanent=False)
@@ -176,7 +176,7 @@ class ComfyUITaskDispatcher(TaskDispatcher):
             if extra_data.get("client_id"):
                 body["client_id"] = extra_data["client_id"]
             self._save_failed_workflow(task, error_msg, body, extra_data, 500)
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, TypeError) as e:
             logger.error(f"Failed to handle failed task: {e}")
 
     def shutdown(self) -> None:

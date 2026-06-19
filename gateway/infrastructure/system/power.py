@@ -20,7 +20,7 @@ class PowerManagement(SystemPowerController):
                 self._ES_CONTINUOUS | self._ES_SYSTEM_REQUIRED
             )
             self._prevented = True
-        except Exception:
+        except (AttributeError, OSError):
             pass
 
     def allow_sleep(self) -> None:
@@ -30,5 +30,5 @@ class PowerManagement(SystemPowerController):
         try:
             ctypes.windll.kernel32.SetThreadExecutionState(self._ES_CONTINUOUS)
             self._prevented = False
-        except Exception:
+        except (AttributeError, OSError):
             pass

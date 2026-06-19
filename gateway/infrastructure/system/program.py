@@ -65,7 +65,7 @@ class ExternalProgramManager(ProcessManager):
             if is_win and args[0].lower().endswith((".bat", ".cmd")):
                 args = ["cmd", "/c"] + args
             return subprocess.Popen(args, startupinfo=startupinfo)
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Failed to start program '{cmd_str}': {e}")
             return None
 
@@ -74,7 +74,7 @@ class ExternalProgramManager(ProcessManager):
         if self._busy_process:
             try:
                 self._busy_process.kill()
-            except Exception:
+            except (ProcessLookupError, OSError):
                 pass
             self._busy_process = None
 
@@ -96,7 +96,7 @@ class ExternalProgramManager(ProcessManager):
         if self._idle_process:
             try:
                 self._idle_process.kill()
-            except Exception:
+            except (ProcessLookupError, OSError):
                 pass
             self._idle_process = None
 
@@ -128,12 +128,12 @@ class ExternalProgramManager(ProcessManager):
         if self._idle_process:
             try:
                 self._idle_process.kill()
-            except Exception:
+            except (ProcessLookupError, OSError):
                 pass
             self._idle_process = None
         if self._busy_process:
             try:
                 self._busy_process.kill()
-            except Exception:
+            except (ProcessLookupError, OSError):
                 pass
             self._busy_process = None

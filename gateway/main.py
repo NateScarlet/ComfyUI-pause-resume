@@ -50,7 +50,7 @@ class DebugAccessLogger(AccessLogger):
                     dct[k2] = value
                     extra[k1] = dct
             self.logger.debug(self._log_format % tuple(values), extra=extra)
-        except Exception:
+        except (AttributeError, TypeError, ValueError, KeyError):
             self.logger.exception("Error in logging")
 
 
@@ -186,22 +186,22 @@ async def main() -> None:
         # 构建方释放自己创建的基础设施资源
         try:
             power_manager.allow_sleep()
-        except Exception:
+        except OSError:
             pass
         try:
             close_queue()
-        except Exception:
+        except OSError:
             pass
         try:
             state_repo.close()
-        except Exception:
+        except OSError:
             pass
         try:
             process_manager.cleanup()
-        except Exception:
+        except OSError:
             pass
 
         try:
             await runner.cleanup()
-        except Exception as e:
+        except (OSError, asyncio.TimeoutError) as e:
             logger.error(f"Error during runner cleanup: {e}")

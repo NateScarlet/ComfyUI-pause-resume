@@ -2,6 +2,7 @@ import asyncio
 import threading
 import logging
 from typing import Dict, List, Callable, Any, Type, TypeVar
+from gateway.shared.exceptions import GatewayError
 from gateway.shared.interfaces import EventBus
 
 T = TypeVar("T")
@@ -68,7 +69,13 @@ class InMemoryEventBus(EventBus):
             for callback in callbacks:
                 try:
                     callback(event)
-                except Exception as e:
+                except (
+                    GatewayError,
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    KeyError,
+                ) as e:
                     logger.error(f"Error in event callback: {e}", exc_info=True)
             logger.debug("EventBus.run_callbacks: %s DONE", event_class.__name__)
 

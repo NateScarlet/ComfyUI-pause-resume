@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import logging
 from typing import Tuple, Any, Callable
@@ -50,7 +51,7 @@ def init_queue(
             logger.info(
                 f"✅ Migration successful! Legacy queue file renamed to {bak_path}"
             )
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.error(f"❌ Migration failed: {e}")
 
     return queue_instance, queue_instance, queue_instance.close
