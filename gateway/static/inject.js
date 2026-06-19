@@ -4,7 +4,7 @@ const EXT_NAMESPACE = "io.github.natescarlet.pause-resume";
 
 // ─── 统一 API 调用层，避免重复 fetch 逻辑 ───────────────
 const api = {
-  _baseUrl: `/${EXT_NAMESPACE}`,
+  baseUrl: `/${EXT_NAMESPACE}`,
 
   /** 通用 POST 请求，自动处理 JSON 序列化 */
   async _post(endpoint, body) {
@@ -13,7 +13,7 @@ const api = {
       opts.headers = { "Content-Type": "application/json" };
       opts.body = JSON.stringify(body);
     }
-    const resp = await fetch(`${this._baseUrl}/${endpoint}`, opts);
+    const resp = await fetch(`${this.baseUrl}/${endpoint}`, opts);
     return resp.json();
   },
 
@@ -50,7 +50,7 @@ app.registerExtension({
     },
   ],
   async setup() {
-    let proxyPaused = false;
+    let paused = false;
     let btnPause = null;
 
     function setButtonState(btn) {
@@ -59,18 +59,16 @@ app.registerExtension({
       if (isNewUI) {
         btn.className =
           "relative inline-flex items-center justify-center gap-1.5 cursor-pointer touch-manipulation whitespace-nowrap appearance-none border-none font-medium font-inter transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 h-8 rounded-lg p-2 text-xs px-3 " +
-          (proxyPaused
+          (paused
             ? "bg-destructive-background text-base-foreground hover:bg-destructive-background-hover"
             : "bg-secondary-background text-secondary-foreground hover:bg-secondary-background-hover");
       } else {
         btn.className = "";
         btn.style.backgroundColor = "var(--bg-color)";
         btn.style.color = "var(--fg-color)";
-        btn.style.border = proxyPaused
-          ? "1px solid #e74c3c"
-          : "1px solid #2ecc71";
+        btn.style.border = paused ? "1px solid #e74c3c" : "1px solid #2ecc71";
       }
-      btn.innerText = proxyPaused ? "▶️ Resume" : "⏸️ Pause";
+      btn.innerText = paused ? "▶️ Resume" : "⏸️ Pause";
     }
 
     function createPauseButton() {
@@ -79,12 +77,12 @@ app.registerExtension({
       btn.onclick = async (e) => {
         const ctrlPressed = e.ctrlKey || e.metaKey;
         let data;
-        if (proxyPaused) {
+        if (paused) {
           data = await api.resume();
         } else {
           data = await api.pause(ctrlPressed);
         }
-        proxyPaused = data.paused;
+        paused = data.paused;
         setButtonState(btn);
       };
 
@@ -113,11 +111,11 @@ app.registerExtension({
       }
     }
 
-    const eventSource = new EventSource(`${api._baseUrl}/sse`);
+    const eventSource = new EventSource(`${api.baseUrl}/sse`);
     eventSource.onmessage = (event) => {
       try {
         let data = JSON.parse(event.data);
-        proxyPaused = data.paused;
+        paused = data.paused;
         if (btnPause) {
           setButtonState(btnPause);
         }
