@@ -124,10 +124,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             )
             tasks: List[Task] = []
             for row in cursor.fetchall():
-                try:
-                    tasks.append(self._row_to_task(row))
-                except Exception as e:
-                    logger.error(f"Failed to decode task from DB: {e}")
+                tasks.append(self._row_to_task(row))
             return tasks
 
     def get_running(self) -> List[Task]:
@@ -139,10 +136,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             )
             tasks: List[Task] = []
             for row in cursor.fetchall():
-                try:
-                    tasks.append(self._row_to_task(row))
-                except Exception as e:
-                    logger.error(f"Failed to decode running task from DB: {e}")
+                tasks.append(self._row_to_task(row))
             return tasks
 
     def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
@@ -156,11 +150,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             running: List[Task] = []
             pending: List[Task] = []
             for row in cursor.fetchall():
-                try:
-                    task = self._row_to_task(row)
-                except Exception as e:
-                    logger.error(f"Failed to decode task from DB: {e}")
-                    continue
+                task = self._row_to_task(row)
                 if row[6] == "running":
                     running.append(task)
                 else:
@@ -267,11 +257,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                     "UPDATE tasks_v2 SET status = 'running' WHERE id = ?", (target_id,)
                 )
                 self._conn.commit()
-
-                try:
-                    return self._row_to_task(row)
-                except Exception as e:
-                    logger.error(f"Failed to decode popped task: {e}")
+                return self._row_to_task(row)
             return None
 
     def requeue_running(self) -> None:

@@ -73,13 +73,10 @@ class GatewayHandlers:
         async def do_broadcast() -> None:
             await asyncio.sleep(self._broadcast_ws_debounce_sec)
             self._broadcast_ws_scheduled = False
-            try:
-                remaining = (
-                    self._queue_reader.get_pending_count()
-                    + self._queue_reader.get_running_count()
-                )
-            except Exception:
-                remaining = 0
+            remaining = (
+                self._queue_reader.get_pending_count()
+                + self._queue_reader.get_running_count()
+            )
 
             msg = {
                 "type": "status",

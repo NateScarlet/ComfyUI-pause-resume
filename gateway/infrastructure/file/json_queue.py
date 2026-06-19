@@ -1,14 +1,11 @@
 import os
 import json
 import threading
-import logging
 from typing import List, Optional, Tuple, Set, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
 from gateway.shared.models import Task, RawJSON
 from gateway.shared.utils import RawJSONEncoder
-
-logger = logging.getLogger(__name__)
 
 
 class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
@@ -40,46 +37,40 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
     def _load(self) -> None:
         """从磁盘中加载并反序列化 JSON 队列。"""
         if os.path.exists(self._queue_file):
-            try:
-                with open(self._queue_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                raw_pending: list[list[Any]] = data.get("queue_pending", [])
-                raw_running: list[list[Any]] = data.get("queue_running", [])
+            with open(self._queue_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_pending: list[list[Any]] = data.get("queue_pending", [])
+            raw_running: list[list[Any]] = data.get("queue_running", [])
 
-                seen_ids: Set[str] = set()
-                tasks: List[Task] = []
-                for q in raw_running + raw_pending:
-                    task = self._parse_task_from_list(q)
-                    if task is None:
-                        continue
-                    if task.prompt_id not in seen_ids:
-                        seen_ids.add(task.prompt_id)
-                        tasks.append(task)
+            seen_ids: Set[str] = set()
+            tasks: List[Task] = []
+            for q in raw_running + raw_pending:
+                task = self._parse_task_from_list(q)
+                if task is None:
+                    continue
+                if task.prompt_id not in seen_ids:
+                    seen_ids.add(task.prompt_id)
+                    tasks.append(task)
 
-                tasks.sort(key=lambda t: t.number)
-                self._pending_queue = tasks
-                self._queue_running = []
+            tasks.sort(key=lambda t: t.number)
+            self._pending_queue = tasks
+            self._queue_running = []
 
-                if tasks:
-                    self._next_task_number = (
-                        max(int(abs(float(t.number))) for t in tasks) + 1
-                    )
-            except Exception as e:
-                logger.error(f"Failed to load queue.json: {e}")
+            if tasks:
+                self._next_task_number = (
+                    max(int(abs(float(t.number))) for t in tasks) + 1
+                )
 
     def _save(self) -> None:
         """以原子覆盖的形式将当前的内存队列状态写入 JSON 文件中。"""
-        try:
-            data = {
-                "queue_running": [t.to_list() for t in self._queue_running],
-                "queue_pending": [t.to_list() for t in self._pending_queue],
-            }
-            temp_file = self._queue_file + ".tmp"
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, cls=RawJSONEncoder)
-            os.replace(temp_file, self._queue_file)
-        except Exception as e:
-            logger.error(f"Failed to save queue: {e}")
+        data = {
+            "queue_running": [t.to_list() for t in self._queue_running],
+            "queue_pending": [t.to_list() for t in self._pending_queue],
+        }
+        temp_file = self._queue_file + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, cls=RawJSONEncoder)
+        os.replace(temp_file, self._queue_file)
 
     def get_pending(self) -> List[Task]:
         """获取所有待处理任务列表。"""

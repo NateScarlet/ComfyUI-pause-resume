@@ -77,18 +77,12 @@ class GatewayConfig:
                 if i + 1 < len(extra_args_list) and not extra_args_list[
                     i + 1
                 ].startswith("-"):
-                    try:
-                        self.proxy_port = int(extra_args_list[i + 1])
-                    except ValueError:
-                        pass
+                    self.proxy_port = int(extra_args_list[i + 1])
                     i += 2
                 else:
                     i += 1
             elif arg.startswith("--port="):
-                try:
-                    self.proxy_port = int(arg.split("=", 1)[1])
-                except ValueError:
-                    pass
+                self.proxy_port = int(arg.split("=", 1)[1])
                 i += 1
             else:
                 self.downstream_args.append(arg)
