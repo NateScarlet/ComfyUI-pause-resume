@@ -1,5 +1,13 @@
 from dataclasses import dataclass
+from enum import Enum
 from typing import Sequence, List, Any
+
+
+class TaskStatus(str, Enum):
+    """任务在队列中的状态。"""
+
+    PENDING = "pending"
+    RUNNING = "running"
 
 
 class RawJSON(str):

@@ -4,7 +4,7 @@ import threading
 from typing import List, Optional, Tuple, Set, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON
+from gateway.shared.models import Task, RawJSON, TaskStatus
 from gateway.shared.utils import RawJSONEncoder
 
 
@@ -72,33 +72,30 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
             json.dump(data, f, ensure_ascii=False, cls=RawJSONEncoder)
         os.replace(temp_file, self._queue_file)
 
-    def get_pending(self) -> List[Task]:
-        """获取所有待处理任务列表。"""
+    def get_tasks(
+        self, status: Optional[TaskStatus] = None
+    ) -> List[Tuple[TaskStatus, Task]]:
+        """获取指定状态的任务列表，每项附带状态标记；status=None 时返回全部任务。"""
         with self._lock:
-            return list(self._pending_queue)
+            result: List[Tuple[TaskStatus, Task]] = []
+            if status is None or status == TaskStatus.RUNNING:
+                result.extend((TaskStatus.RUNNING, t) for t in self._queue_running)
+            if status is None or status == TaskStatus.PENDING:
+                result.extend((TaskStatus.PENDING, t) for t in self._pending_queue)
+            return result
 
-    def get_running(self) -> List[Task]:
-        """获取所有正在运行任务列表。"""
+    def get_task_count(
+        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+    ) -> int:
+        """获取指定状态的任务数量；status=None 时返回全部任务数量。"""
         with self._lock:
-            return list(self._queue_running)
+            if status is None:
+                cnt = len(self._pending_queue) + len(self._queue_running)
+            elif status == TaskStatus.PENDING:
+                cnt = len(self._pending_queue)
+            else:
+                cnt = len(self._queue_running)
 
-    def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
-        """原子地同时获取 (running, pending) 任务列表快照。"""
-        with self._lock:
-            return list(self._queue_running), list(self._pending_queue)
-
-    def get_pending_count(self, limit: Optional[int] = None) -> int:
-        """获取待处理任务数量，支持通过 limit 限制扫描深度以提升性能。"""
-        with self._lock:
-            cnt = len(self._pending_queue)
-            if limit is not None:
-                return min(cnt, limit)
-            return cnt
-
-    def get_running_count(self, limit: Optional[int] = None) -> int:
-        """获取正在运行任务数量，支持通过 limit 限制扫描深度以提升性能。"""
-        with self._lock:
-            cnt = len(self._queue_running)
             if limit is not None:
                 return min(cnt, limit)
             return cnt

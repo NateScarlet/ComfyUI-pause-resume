@@ -11,7 +11,7 @@ from gateway.shared.interfaces import (
     TaskDispatcher,
     EventBus,
 )
-from gateway.shared.models import Task
+from gateway.shared.models import Task, TaskStatus
 from gateway.shared.events import (
     StateChangedEvent,
     StatusChangedEvent,
@@ -140,13 +140,11 @@ class Gateway:
         try:
             for _ in range(10):
 
-                pending_count = self._queue_reader.get_pending_count(limit=1)
-                has_pending = pending_count > 0
-                running_count = self._queue_reader.get_running_count(limit=1)
-                has_running = running_count > 0
+                total_count = self._queue_reader.get_task_count(limit=1)
+                has_tasks = total_count > 0
 
-                # 如果既没有排队任务也没有运行中任务，重置所有计数
-                if not has_pending and not has_running:
+                # 如果没有任何任务，重置所有计数
+                if not has_tasks:
                     self._crash_count = 0
                     self._dispatch_skip_offset = 0
                     self._last_failed_task_id = None
@@ -155,15 +153,14 @@ class Gateway:
                         self._cancel_dispatch_retry = None
                 elif self._last_failed_task_id is not None:
                     # 检查先前失败的任务是否已经不在队列中（例如被用户手动删除）
-                    pending_tasks: List[Task] = self._queue_reader.get_pending()
-                    running_tasks: List[Task] = self._queue_reader.get_running()
-                    active_ids = {t.prompt_id for t in pending_tasks + running_tasks}
+                    all_tasks = [t for _, t in self._queue_reader.get_tasks()]
+                    active_ids = {t.prompt_id for t in all_tasks}
                     if self._last_failed_task_id not in active_ids:
                         self._crash_count = 0
                         self._dispatch_skip_offset = 0
                         self._last_failed_task_id = None
 
-                is_busy = self._is_busy(has_pending)
+                is_busy = self._is_busy(has_tasks)
 
                 # 更新空闲/繁忙外挂脚本运行状态
                 self._process_manager.update_state(is_busy, self._ever_active)
@@ -171,9 +168,7 @@ class Gateway:
                 # 必须在 update_state 触发运行状态变更之后，重新获取外挂脚本最新的实际运行状态，以保证后续判断基于最新数据
                 scripts_running = self._process_manager.is_running()
 
-                should_prevent = self._should_prevent_sleep(
-                    has_pending, scripts_running
-                )
+                should_prevent = self._should_prevent_sleep(has_tasks, scripts_running)
 
                 if should_prevent:
                     self._power_controller.prevent_sleep()
@@ -321,7 +316,7 @@ class Gateway:
                 "DownstreamExecutingChanged: executing=False done, dispatch_skip=%s "
                 "(pending=%s crashed=%s paused=%s ready=%s)",
                 skip,
-                self._queue_reader.get_pending_count(),
+                self._queue_reader.get_task_count(TaskStatus.PENDING),
                 self._crashed_executing,
                 self._paused,
                 self._downstream_ready,
@@ -347,7 +342,9 @@ class Gateway:
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
-        running_tasks: List[Task] = self._queue_reader.get_running()
+        running_tasks: List[Task] = [
+            t for _, t in self._queue_reader.get_tasks(TaskStatus.RUNNING)
+        ]
         self._ever_active = False
 
         if running_tasks:
@@ -419,19 +416,19 @@ class Gateway:
         if self._paused or self._downstream_executing or not self._downstream_ready:
             return None
 
-        pending_count = self._queue_reader.get_pending_count()
+        pending_count = self._queue_reader.get_task_count(TaskStatus.PENDING)
         if pending_count <= 0:
             return None
 
         return self._dispatch_skip_offset % pending_count
 
-    def _is_busy(self, has_pending: bool) -> bool:
+    def _is_busy(self, has_tasks: bool) -> bool:
         """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
-        return self._downstream_executing or (not self._paused and has_pending)
+        return self._downstream_executing or (not self._paused and has_tasks)
 
-    def _should_prevent_sleep(self, has_pending: bool, scripts_running: bool) -> bool:
+    def _should_prevent_sleep(self, has_tasks: bool, scripts_running: bool) -> bool:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
-        is_busy = self._is_busy(has_pending)
+        is_busy = self._is_busy(has_tasks)
         return is_busy or scripts_running
 
     def dispose(self) -> None:

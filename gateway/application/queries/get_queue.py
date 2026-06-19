@@ -1,5 +1,6 @@
-from typing import Dict, Any
+from typing import List, Tuple
 from gateway.shared.interfaces import TaskQueueReader
+from gateway.shared.models import Task, TaskStatus
 
 
 class GetQueueQueryHandler:
@@ -8,9 +9,6 @@ class GetQueueQueryHandler:
     def __init__(self, queue_reader: TaskQueueReader):
         self._queue_reader = queue_reader
 
-    def handle(self) -> Dict[str, Any]:
-        """返回网关当前的待处理任务与运行中任务（已格式化为 /queue 兼容的数据包）。"""
-        return {
-            "queue_running": [t.to_list() for t in self._queue_reader.get_running()],
-            "queue_pending": [t.to_list() for t in self._queue_reader.get_pending()],
-        }
+    def handle(self) -> List[Tuple[TaskStatus, Task]]:
+        """返回原始任务列表，格式转换由表示层负责。"""
+        return self._queue_reader.get_tasks()

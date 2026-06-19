@@ -14,6 +14,7 @@ from gateway.shared.interfaces import (
     DownstreamClient,
     EventBus,
 )
+from gateway.shared.models import TaskStatus
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
 from gateway.application.facade import AppFacade
 
@@ -73,10 +74,7 @@ class GatewayHandlers:
         async def do_broadcast() -> None:
             await asyncio.sleep(self._broadcast_ws_debounce_sec)
             self._broadcast_ws_scheduled = False
-            remaining = (
-                self._queue_reader.get_pending_count()
-                + self._queue_reader.get_running_count()
-            )
+            remaining = self._queue_reader.get_task_count()
 
             msg = {
                 "type": "status",
@@ -253,7 +251,15 @@ class GatewayHandlers:
 
         # 2. 拦截队列状态查询：GET /queue
         if method == "GET" and path in ("/queue", "/api/queue"):
-            res_data = self._app.get_queue.handle()
+            tasks = self._app.get_queue.handle()
+            res_data = {
+                "queue_running": [
+                    t.to_list() for status, t in tasks if status == TaskStatus.RUNNING
+                ],
+                "queue_pending": [
+                    t.to_list() for status, t in tasks if status == TaskStatus.PENDING
+                ],
+            }
             return web.json_response(res_data, dumps=raw_json_dumps)
 
         # 3. 拦截合并 jobs 查询：GET /api/jobs
@@ -321,8 +327,7 @@ class GatewayHandlers:
                                                 )
                                                 if data_dict.get("type") == "status":
                                                     remaining = (
-                                                        self._queue_reader.get_pending_count()
-                                                        + self._queue_reader.get_running_count()
+                                                        self._queue_reader.get_task_count()
                                                     )
                                                     data_payload = data_dict.get("data")
                                                     if isinstance(data_payload, dict):

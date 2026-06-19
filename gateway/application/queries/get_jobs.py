@@ -2,7 +2,7 @@ import json
 import logging
 from typing import List, Dict, Any, Optional, Set, cast
 from gateway.shared.interfaces import TaskQueueReader, DownstreamClient
-from gateway.shared.models import Task
+from gateway.shared.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,9 @@ class GetJobsQueryHandler:
                 "workflow_id": workflow_id,
             }
 
-        running_tasks, pending_tasks = self._queue_reader.get_queue_snapshot()
+        all_tasks = self._queue_reader.get_tasks()
+        running_tasks = [t for s, t in all_tasks if s == TaskStatus.RUNNING]
+        pending_tasks = [t for s, t in all_tasks if s == TaskStatus.PENDING]
 
         gateway_running_jobs = [make_job_dict(t, "in_progress") for t in running_tasks]
         gateway_pending_jobs = [make_job_dict(t, "pending") for t in pending_tasks]
@@ -143,7 +145,9 @@ class GetJobDetailQueryHandler:
 
     async def handle(self, job_id: str) -> Optional[Dict[str, Any]]:
         """从网关拦截的任务队列中查询具体任务详情。"""
-        running_tasks, pending_tasks = self._queue_reader.get_queue_snapshot()
+        all_tasks = self._queue_reader.get_tasks()
+        running_tasks = [t for s, t in all_tasks if s == TaskStatus.RUNNING]
+        pending_tasks = [t for s, t in all_tasks if s == TaskStatus.PENDING]
 
         target_task: Optional[Task] = None
         status_str = None

@@ -6,7 +6,7 @@ import json
 from typing import List, Optional, Tuple, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON
+from gateway.shared.models import Task, RawJSON, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -115,87 +115,57 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             create_time=row[5],
         )
 
-    def get_pending(self) -> List[Task]:
-        """获取所有待处理任务（按 number 升序排序）。"""
+    def get_tasks(
+        self, status: Optional[TaskStatus] = None
+    ) -> List[Tuple[TaskStatus, Task]]:
+        """获取指定状态的任务列表，每项附带状态标记；status=None 时返回全部任务。"""
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC"
-            )
-            tasks: List[Task] = []
-            for row in cursor.fetchall():
-                tasks.append(self._row_to_task(row))
-            return tasks
+            if status is None:
+                where_clause = ""
+            elif status == TaskStatus.PENDING:
+                where_clause = "WHERE status = 'pending'"
+            else:
+                where_clause = "WHERE status = 'running'"
 
-    def get_running(self) -> List[Task]:
-        """获取所有正在运行任务。"""
-        with self._lock:
-            cursor = self._conn.cursor()
-            cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'running'"
-            )
-            tasks: List[Task] = []
-            for row in cursor.fetchall():
-                tasks.append(self._row_to_task(row))
-            return tasks
-
-    def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
-        """原子地同时获取 (running, pending) 任务列表快照。"""
-        with self._lock:
-            cursor = self._conn.cursor()
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
-                "FROM tasks_v2 WHERE status IN ('running', 'pending') ORDER BY number ASC"
+                f"FROM tasks_v2 {where_clause} ORDER BY number ASC"
             )
-            running: List[Task] = []
-            pending: List[Task] = []
+            result: List[Tuple[TaskStatus, Task]] = []
             for row in cursor.fetchall():
                 task = self._row_to_task(row)
-                if row[6] == "running":
-                    running.append(task)
-                else:
-                    pending.append(task)
-            return running, pending
+                task_status = TaskStatus(row[6])
+                result.append((task_status, task))
+            return result
 
-    def get_pending_count(self, limit: Optional[int] = None) -> int:
-        """获取待处理任务数量，支持 limit 以优化扫描性能。"""
+    def get_task_count(
+        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+    ) -> int:
+        """获取指定状态的任务数量；status=None 时返回全部任务数量。"""
         t_start = time.perf_counter()
         with self._lock:
             cursor = self._conn.cursor()
+            if status is None:
+                where_clause = ""
+            elif status == TaskStatus.PENDING:
+                where_clause = "WHERE status = 'pending'"
+            else:
+                where_clause = "WHERE status = 'running'"
+
             if limit is not None:
                 cursor.execute(
-                    "SELECT 1 FROM tasks_v2 WHERE status = 'pending' LIMIT ?", (limit,)
+                    f"SELECT 1 FROM tasks_v2 {where_clause} LIMIT ?", (limit,)
                 )
                 result = len(cursor.fetchall())
             else:
-                cursor.execute("SELECT COUNT(*) FROM tasks_v2 WHERE status = 'pending'")
+                cursor.execute(f"SELECT COUNT(*) FROM tasks_v2 {where_clause}")
                 row = cursor.fetchone()
                 result = row[0] if row else 0
         t_total = (time.perf_counter() - t_start) * 1000
         if t_total > 10:
             logger.debug(
-                f"SQLite get_pending_count(limit={limit}) = {result} took {t_total:.1f}ms"
-            )
-        return result
-
-    def get_running_count(self, limit: Optional[int] = None) -> int:
-        """获取正在运行任务数量，支持 limit 以优化扫描性能。"""
-        t_start = time.perf_counter()
-        with self._lock:
-            cursor = self._conn.cursor()
-            if limit is not None:
-                cursor.execute(
-                    "SELECT 1 FROM tasks_v2 WHERE status = 'running' LIMIT ?", (limit,)
-                )
-                result = len(cursor.fetchall())
-            else:
-                cursor.execute("SELECT COUNT(*) FROM tasks_v2 WHERE status = 'running'")
-                row = cursor.fetchone()
-                result = row[0] if row else 0
-        t_total = (time.perf_counter() - t_start) * 1000
-        if t_total > 10:
-            logger.debug(
-                f"SQLite get_running_count(limit={limit}) = {result} took {t_total:.1f}ms"
+                f"SQLite get_task_count(status={status}, limit={limit}) = {result} took {t_total:.1f}ms"
             )
         return result
 

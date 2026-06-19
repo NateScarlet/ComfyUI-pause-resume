@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
-from gateway.shared.models import Task
+from gateway.shared.models import Task, TaskStatus
 from gateway.shared.interfaces import (
     StateRepository,
     TaskQueueReader,
@@ -70,10 +70,29 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     repo.get_paused.return_value = paused
 
     reader = MagicMock(spec=TaskQueueReader)
-    reader.get_pending_count.return_value = pending_count
-    reader.get_pending.return_value = pending_tasks
-    reader.get_running.return_value = running_tasks
-    reader.get_running_count.return_value = len(running_tasks)
+
+    def _default_get_tasks(status=None):
+        result = []
+        if status is None or status == TaskStatus.RUNNING:
+            result.extend((TaskStatus.RUNNING, t) for t in running_tasks)
+        if status is None or status == TaskStatus.PENDING:
+            result.extend((TaskStatus.PENDING, t) for t in pending_tasks)
+        return result
+
+    reader.get_tasks.side_effect = _default_get_tasks
+
+    def _default_get_task_count(status=None, limit=None):
+        if status is None:
+            cnt = pending_count + len(running_tasks)
+        elif status == TaskStatus.PENDING:
+            cnt = pending_count
+        else:
+            cnt = len(running_tasks)
+        if limit is not None:
+            return min(cnt, limit)
+        return cnt
+
+    reader.get_task_count.side_effect = _default_get_task_count
 
     writer = MagicMock(spec=TaskQueueWriter)
     writer.requeue_running_if_exists.return_value = False
@@ -221,7 +240,7 @@ class TestDomainGateway(unittest.TestCase):
 
         # 模拟物理重入列成功
         g._mock_writer.requeue_running_if_exists.return_value = True
-        g._mock_reader.get_pending_count.return_value = 1
+        g._mock_reader.get_task_count.side_effect = lambda status=None, limit=None: 1
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
         self.assertEqual(g._crash_count, 1)
@@ -268,7 +287,7 @@ class TestDomainGateway(unittest.TestCase):
         g2 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer2)
 
         # 离开空闲 (如因为有排队任务)
-        g2._mock_reader.get_pending_count.return_value = 1
+        g2._mock_reader.get_task_count.side_effect = lambda status=None, limit=None: 1
         g2._mock_event_bus.publish(QueueModifiedEvent())
 
         self.assertFalse(g2._is_idle)
@@ -301,31 +320,31 @@ class TestDomainGateway(unittest.TestCase):
         """测试繁忙和空闲业务状态计算。"""
         # 1. 暂停状态下，即使有任务也不视为繁忙
         g = _make_gateway(paused=True)
-        self.assertFalse(g._is_busy(has_pending=True))
+        self.assertFalse(g._is_busy(has_tasks=True))
 
         # 2. 下游正在执行：视为繁忙
         g = _make_gateway(paused=False, downstream_executing=True)
-        self.assertTrue(g._is_busy(has_pending=False))
+        self.assertTrue(g._is_busy(has_tasks=False))
 
         # 3. 未暂停且有排队任务：视为繁忙
         g = _make_gateway(paused=False, downstream_executing=False)
-        self.assertTrue(g._is_busy(has_pending=True))
+        self.assertTrue(g._is_busy(has_tasks=True))
 
         # 4. 未暂停且无任务：闲置
-        self.assertFalse(g._is_busy(has_pending=False))
+        self.assertFalse(g._is_busy(has_tasks=False))
 
     def test_determine_sleep_prevention(self):
         """测试是否阻止系统休眠决策。"""
         g = _make_gateway(paused=False)
 
         # 繁忙 且 无脚本在跑 -> 阻止休眠
-        self.assertTrue(g._should_prevent_sleep(has_pending=True, scripts_running=False))
+        self.assertTrue(g._should_prevent_sleep(has_tasks=True, scripts_running=False))
 
         # 空闲 但 有脚本在跑 -> 阻止休眠
-        self.assertTrue(g._should_prevent_sleep(has_pending=False, scripts_running=True))
+        self.assertTrue(g._should_prevent_sleep(has_tasks=False, scripts_running=True))
 
         # 空闲 且 无脚本在跑 -> 允许休眠
-        self.assertFalse(g._should_prevent_sleep(has_pending=False, scripts_running=False))
+        self.assertFalse(g._should_prevent_sleep(has_tasks=False, scripts_running=False))
 
     def test_script_state_changed_decision(self):
         """测试外挂辅助程序状态发生变化时的刷新决策。"""
@@ -344,8 +363,8 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=False)
         g._mock_writer.requeue_running_if_exists.return_value = True
 
-        # 初始化时调用过一次 _refresh
-        initial_count_pending = g._mock_reader.get_pending_count.call_count
+        # 初始化时调用过一次 _refresh（每次 _refresh 调用 get_task_count 一次）
+        initial_count_pending = g._mock_reader.get_task_count.call_count
         initial_count_running = g._mock_pm.is_running.call_count
         self.assertEqual(initial_count_pending, 1)
         self.assertEqual(initial_count_running, 1)
@@ -354,7 +373,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
         # 崩溃后 _refresh 被触发，各计数应该加 1
-        self.assertEqual(g._mock_reader.get_pending_count.call_count, 2)
+        self.assertEqual(g._mock_reader.get_task_count.call_count, 2)
         self.assertEqual(g._mock_pm.is_running.call_count, 2)
 
     def test_refresh_reentrancy_prevention(self):
@@ -480,9 +499,8 @@ class TestDomainGateway(unittest.TestCase):
         self.assertEqual(g._last_failed_task_id, "task_999")
         
         # 2. 从 pending 和 running 中将该任务彻底移除（模拟手动删除），触发队列刷新
-        g._mock_reader.get_pending.return_value = []
-        g._mock_reader.get_running.return_value = []
-        g._mock_reader.get_pending_count.return_value = 0
+        g._mock_reader.get_tasks.side_effect = lambda status=None: []
+        g._mock_reader.get_task_count.side_effect = lambda status=None, limit=None: 0
         g._mock_event_bus.publish(QueueModifiedEvent())
         
         # 确认崩溃计数、派发偏移与失败 ID 被清零

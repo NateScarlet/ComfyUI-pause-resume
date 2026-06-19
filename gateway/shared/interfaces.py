@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
-from .models import Task
+from .models import Task, TaskStatus
 
 T = TypeVar("T")
 
@@ -25,28 +25,17 @@ class TaskQueueReader(ABC):
     """网关任务队列的只读查询接口，隔离了写操作，符合读写分离与最小接口原则。"""
 
     @abstractmethod
-    def get_pending(self) -> List[Task]:
-        """获取当前队列中所有等待处理的任务列表。"""
+    def get_tasks(
+        self, status: Optional[TaskStatus] = None
+    ) -> List[Tuple[TaskStatus, Task]]:
+        """获取指定状态的任务列表，每项附带状态标记；status=None 时返回全部任务。"""
         pass
 
     @abstractmethod
-    def get_running(self) -> List[Task]:
-        """获取当前正在下游执行的任务列表。"""
-        pass
-
-    @abstractmethod
-    def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
-        """原子地同时获取 (running, pending) 任务列表快照，保证两者来自同一时刻的一致性视图。"""
-        pass
-
-    @abstractmethod
-    def get_pending_count(self, limit: Optional[int] = None) -> int:
-        """获取等待处理的任务数量，支持指定 limit 以防止在大队列下全扫描。"""
-        pass
-
-    @abstractmethod
-    def get_running_count(self, limit: Optional[int] = None) -> int:
-        """获取正在执行的任务数量。"""
+    def get_task_count(
+        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+    ) -> int:
+        """获取指定状态的任务数量；status=None 时返回全部任务数量。支持 limit 防止全扫描。"""
         pass
 
 

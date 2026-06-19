@@ -11,17 +11,6 @@ from .file.json_queue import JSONFileQueue
 logger = logging.getLogger(__name__)
 
 
-def transfer_tasks(source: Any, dest: Any) -> None:
-    """将源队列中的所有任务转移到目标队列中。"""
-    pending = source.get_pending()
-    running = source.get_running()
-
-    for task in running:
-        dest.add_task(task)
-    for task in pending:
-        dest.add_task(task)
-
-
 def init_queue(
     config: GatewayConfig,
 ) -> Tuple[TaskQueueReader, TaskQueueWriter, Callable[[], None]]:
@@ -51,7 +40,8 @@ def init_queue(
         logger.info(f"📦 Found legacy queue file {old_json_path}. Migrating...")
         try:
             legacy_queue = JSONFileQueue(old_json_path)
-            transfer_tasks(legacy_queue, queue_instance)
+            for _, task in legacy_queue.get_tasks():
+                queue_instance.add_task(task)
             legacy_queue.close()
 
             suffix = "".join(random.choices("0123456789abcdef", k=8))
