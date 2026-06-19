@@ -241,7 +241,7 @@ class Gateway:
 
         self._event_bus.publish(StateChangedEvent(paused=False))
         self._refresh()
-        self._dispatcher.try_dispatch()
+        self._dispatcher.dispatch()
 
     def _handle_downstream_executing_changed(
         self, ev: DownstreamExecutingChangedEvent
@@ -266,7 +266,7 @@ class Gateway:
                 self._queue_writer.clear_running()
             self._refresh()
             self._event_bus.publish(StatusChangedEvent())
-            self._dispatcher.try_dispatch()
+            self._dispatcher.dispatch()
 
     def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
         """设置下游就绪状态，并在合适时触发派发。"""
@@ -275,7 +275,7 @@ class Gateway:
         self._event_bus.publish(StatusChangedEvent())
         if ev.ready:
             if not self._paused:
-                self._dispatcher.try_dispatch()
+                self._dispatcher.dispatch()
         else:
             # 当下游变为不可用时，取消处于等待中的延迟重试
             if self._cancel_dispatch_retry:
@@ -321,7 +321,7 @@ class Gateway:
         """当队列内容被修改（新任务入队、清空或删除）时的业务逻辑与副作用驱动。"""
         self._refresh()
         self._event_bus.publish(StatusChangedEvent())
-        self._dispatcher.try_dispatch()
+        self._dispatcher.dispatch()
 
     def _handle_dispatch_success(self, ev: DispatchSuccessEvent) -> None:
         """当派发任务成功时的业务反馈。"""
@@ -343,7 +343,7 @@ class Gateway:
             if self._cancel_dispatch_retry:
                 self._cancel_dispatch_retry()
             self._cancel_dispatch_retry = self._timer.start_timeout(
-                5.0, self._dispatcher.try_dispatch
+                5.0, self._dispatcher.dispatch
             )
 
     def get_dispatch_skip(self) -> Optional[int]:

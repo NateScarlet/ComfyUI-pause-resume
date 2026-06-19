@@ -172,7 +172,7 @@ async def main() -> None:
 
     # 16. 后台启动监控与首次分发
     asyncio.create_task(downstream_service.monitor_downstream())
-    dispatcher.try_dispatch()
+    dispatcher.dispatch()
 
     # 13. 等待信号并优雅清理
     try:

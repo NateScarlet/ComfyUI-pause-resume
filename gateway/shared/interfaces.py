@@ -157,7 +157,7 @@ class TaskDispatcher(ABC):
     """负责向下一代发任务的抽象调度器接口。"""
 
     @abstractmethod
-    def try_dispatch(self) -> None:
+    def dispatch(self) -> None:
         """尝试向下一代发任务。"""
         pass
 

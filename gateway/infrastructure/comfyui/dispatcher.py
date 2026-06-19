@@ -50,7 +50,7 @@ class ComfyUITaskDispatcher(TaskDispatcher):
         assert self._gateway is not None, "Gateway must be set before use"
         return self._gateway
 
-    def try_dispatch(self) -> None:
+    def dispatch(self) -> None:
         """线程安全地触发一次任务派发尝试。"""
         try:
             loop = asyncio.get_event_loop()

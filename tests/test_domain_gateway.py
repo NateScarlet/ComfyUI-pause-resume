@@ -158,7 +158,7 @@ class TestDomainGateway(unittest.TestCase):
         g.resume()
         self.assertFalse(g.paused)
         self.assertFalse(g._restart_after_idle_on_pause)
-        g._mock_dispatcher.try_dispatch.assert_called_once()
+        g._mock_dispatcher.dispatch.assert_called_once()
 
     def test_resume_persists_state(self):
         """测试恢复操作会自动持久化状态。"""
@@ -182,19 +182,19 @@ class TestDomainGateway(unittest.TestCase):
         self.assertFalse(g2._downstream_executing)
         self.assertEqual(g2._attempt_count, 0)
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g2._mock_event_bus.published))
-        g2._mock_dispatcher.try_dispatch.assert_called_once()
+        g2._mock_dispatcher.dispatch.assert_called_once()
 
     def test_set_downstream_ready_decision(self):
         """测试下游就绪变化的派发决策。"""
         g = _make_gateway(paused=False)
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
         self.assertTrue(g._downstream_ready)
-        g._mock_dispatcher.try_dispatch.assert_called_once()
+        g._mock_dispatcher.dispatch.assert_called_once()
 
         g = _make_gateway(paused=True)
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
         self.assertTrue(g._downstream_ready)
-        g._mock_dispatcher.try_dispatch.assert_not_called()
+        g._mock_dispatcher.dispatch.assert_not_called()
 
     def test_dispatch_failed_decision(self):
         """测试任务派发失败的重试决策。"""
@@ -431,7 +431,7 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=False, pending_count=2)
         g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
         self.assertEqual(g._attempt_count, 1)
-        g._mock_timer.start_timeout.assert_called_once_with(5.0, g._dispatcher.try_dispatch)
+        g._mock_timer.start_timeout.assert_called_once_with(5.0, g._dispatcher.dispatch)
         
         # 2. 触发派发成功，确认定时器被取消
         g._mock_timer_cancel.assert_not_called()
