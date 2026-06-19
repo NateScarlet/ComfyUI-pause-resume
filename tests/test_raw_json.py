@@ -5,7 +5,8 @@ import io
 import unittest
 from typing import Any
 
-from gateway.models import RawJSON, raw_json_dumps, RawJSONEncoder
+from gateway.shared.models import RawJSON
+from gateway.shared.utils import raw_json_dumps, RawJSONEncoder
 
 
 class TestRawJSON(unittest.TestCase):

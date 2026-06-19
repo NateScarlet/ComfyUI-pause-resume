@@ -2,5 +2,11 @@
 - **python:** 所有非故意公开让外部访问的类成员，都应该用下划线前缀命名
 - 
 - **directory_structure:** 网关核心代码已拆分至 `gateway/` 包目录下，数据默认存储于 `gateway_data/` 目录下（可通过 `COMFYUI_GATEWAY_DATA_DIR` 环境变量进行自定义设置）。禁止向仓库根目录随意添加新的网关业务 python 文件。此外，保存提交失败任务信息的 `failed_workflows` 目录也必须保存在由 `COMFYUI_GATEWAY_DATA_DIR` 定义的网关数据存储目录下（即 `os.path.join(self.config.data_dir, "failed_workflows")`），禁止直接放置在项目根目录下。
+- 
+- **clean_architecture_ddd:** 所有网关业务状态机的流转、休眠决策和任务派发计算逻辑，必须定义在领域层（`gateway/domain/`）的聚合根（如 `Gateway`）中。应用层（`gateway/application/`）作为轻量级编排层，仅负责胶水装配和执行副作用，禁止编写具体的业务状态转移判定（防止贫血模型）。
+- **clean_architecture_ddd:** 领域层与应用层不得直接依赖任何具体技术细节（如 `aiohttp`, `sqlite3`）。所有底层技术实现均需在 `gateway/infrastructure/` 下开发，并通过依赖注入注入到应用层所声明的抽象接口（在 `gateway/shared/interfaces.py` 中定义）上。
+- **cqrs_isp:** 物理队列读写划分为 `TaskQueueReader` 与 `TaskQueueWriter`。对于所有的查询（Queries），只允许注入 `TaskQueueReader`，禁止获取写入接口，遵循最小接口原则与读写分离契约。
+- **shared_layer:** 纯数据模型（如 `Task`, `RawJSON`）、系统自定义异常和核心抽象接口必须存放在允许所有层导入的 `gateway/shared/` 包中。该包不得依赖项目中的其他任何包，以完全避免循环导入并降低类型转换开销。
+- **facade_injection:** 表示层的 `GatewayHandlers` 只允许注入聚合后的 `AppFacade` 门面及 `DownstreamAppService` 服务。禁止在控制器中单独注入多个散装的 Command/Query Handler，控制器调用均需经过 `self._app.xxx.handle()` 执行，以保证开闭原则。
 
 

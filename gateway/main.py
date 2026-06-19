@@ -9,9 +9,14 @@ from aiohttp.web_log import AccessLogger
 from typing import Any
 
 from .config import GatewayConfig
-from .models import init_queue, GatewayStateManager
-from .gateway import Gateway
-from .server import GatewayHandlers, setup_routes
+from .infrastructure.sqlite.state import SQLiteStateRepository
+from .infrastructure.queue_factory import init_queue
+from .infrastructure.system.program import ExternalProgramManager
+from .domain.gateway import Gateway
+from .application.services.downstream import DownstreamAppService
+from .application.facade import AppFacade
+from .presentation.handlers import GatewayHandlers
+from .presentation.routes import setup_routes
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
@@ -58,43 +63,72 @@ async def main() -> None:
         )
         sys.exit(1)
 
-    # 3. 创建网关状态管理器与任务队列
+    # 3. 实例化技术持久化和工厂队列（读写接口分离）
     os.makedirs(config.data_dir, exist_ok=True)
-    state_db_path = os.path.join(config.data_dir, "state.db")
-    state_manager = GatewayStateManager(state_db_path)
-    queue = init_queue(config)
+    state_repo = SQLiteStateRepository(os.path.join(config.data_dir, "state.db"))
+    queue_reader, queue_writer = init_queue(config)
 
-    # 4. 创建 Gateway 实例 (构造函数依赖注入)
-    gateway = Gateway(config, state_manager, queue)
+    # 4. 实例化外部程序管理器
+    process_manager = ExternalProgramManager(config.idle_program, config.busy_program)
 
-    # 5. 绑定事件循环及退出信号处理器
+    # 5. 实例化领域模型聚合根 (Gateway)
+    initial_paused = state_repo.get_paused()
+    gateway = Gateway(paused=initial_paused)
+
+    # 6. 实例化应用服务 (DownstreamAppService) 并依赖注入
+    downstream_service = DownstreamAppService(
+        gateway=gateway,
+        config=config,
+        queue_reader=queue_reader,
+        queue_writer=queue_writer,
+        state_repo=state_repo,
+        process_manager=process_manager,
+    )
+
+    # 7. 根据初始状态，同步阻止系统休眠和外挂脚本行为
+    downstream_service.sync_state_to_infrastructure()
+
+    # 8. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
+    app_facade = AppFacade.create(
+        gateway=gateway,
+        queue_reader=queue_reader,
+        queue_writer=queue_writer,
+        state_repo=state_repo,
+        downstream_service=downstream_service,
+    )
+
+    # 9. 绑定异步事件循环与信号量
     loop = asyncio.get_running_loop()
-    gateway.loop = loop
+    downstream_service.loop = loop
     exit_event = asyncio.Event()
 
     def signal_handler(signum: Any, frame: Any) -> None:
-        if signum == signal.SIGINT and gateway.exiting:
+        if signum == signal.SIGINT and downstream_service.exiting:
             logger.info("⚡ Forced exit requested by user. Exiting immediately...")
             sys.exit(1)
         logger.info("👋 Received termination signal, exiting...")
-        gateway.exiting = True
+        downstream_service.exiting = True
         loop.call_soon_threadsafe(exit_event.set)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 6. 后台拉起下游服务
+    # 10. 后台拉起下游服务
     async def bootstrap_downstream() -> None:
-        if gateway.exiting:
+        if downstream_service.exiting:
             return
-        gateway.start_downstream()
-        await gateway.wait_downstream_ready()
+        downstream_service.start_downstream()
+        await downstream_service.wait_downstream_ready()
 
     asyncio.create_task(bootstrap_downstream())
 
-    # 7. 构建 Aiohttp 服务器及处理器依赖项并注册路由
-    app = web.Application(client_max_size=1024**3)  # 最大 1GB 上传包大小限制
-    handlers = GatewayHandlers(gateway)
+    # 11. 构建表示层 (GatewayHandlers) 并注册 Web 路由
+    app = web.Application(client_max_size=1024**3)
+    handlers = GatewayHandlers(
+        app=app_facade,
+        downstream_service=downstream_service,
+        queue_reader=queue_reader,
+    )
     setup_routes(app, handlers)
 
     runner = web.AppRunner(app, access_log_class=DebugAccessLogger)
@@ -104,14 +138,20 @@ async def main() -> None:
 
     logger.info(f"🌐 Proxy server running on {config.proxy_host}:{config.proxy_port}")
 
-    # 8. 启动队列分发与监控后台进程
-    asyncio.create_task(gateway.monitor_downstream())
+    # 12. 后台启动监控与首次分发
+    asyncio.create_task(downstream_service.monitor_downstream())
+    downstream_service.try_dispatch()
 
-    # 9. 挂起并等待退出信号触发优雅退出机制
+    # 13. 等待信号并优雅清理
     try:
         await exit_event.wait()
     except asyncio.CancelledError:
         pass
     finally:
         logger.info("🛑 Gateway shutting down...")
-        await gateway.shutdown(runner)
+        handlers.shutdown()
+        await downstream_service.shutdown()
+        try:
+            await runner.cleanup()
+        except Exception as e:
+            logger.error(f"Error during runner cleanup: {e}")
