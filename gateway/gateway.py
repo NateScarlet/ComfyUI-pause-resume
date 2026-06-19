@@ -258,7 +258,13 @@ class Gateway:
         sys.exit(1)
 
     async def restart_downstream(self) -> None:
-        """异步重启下游服务进程，并安全释放相关资源"""
+        """异步重启下游服务进程，并安全释放相关资源
+
+        内部自带 _is_restarting 守卫，调用者无需自行检查。
+        多次并发调用会被自动合并为一次重启。
+        """
+        if self._is_restarting:
+            return
         self._is_restarting = True
         self.downstream_ready = False
         try:
