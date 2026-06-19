@@ -76,11 +76,14 @@ async def main() -> None:
     power_manager = PowerManagement()
     timer = AsyncioTimer()
 
-    # 5. 实例化外部程序管理器
-    process_manager = ExternalProgramManager(config.idle_program, config.busy_program)
-
-    # 6. 实例化事件总线和下游客户端
+    # 6. 实例化事件总线
     event_bus = InMemoryEventBus()
+
+    # 5. 实例化外部程序管理器
+    process_manager = ExternalProgramManager(
+        config.idle_program, config.busy_program, event_bus
+    )
+
     downstream_service = ComfyUIDownstreamClient(
         config=config,
         event_bus=event_bus,

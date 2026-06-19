@@ -55,3 +55,10 @@ class DispatchFailedEvent:
     """任务派发至下游 ComfyUI 失败的事件。"""
 
     is_permanent: bool
+
+
+@dataclass(frozen=True)
+class ScriptStateChangedEvent:
+    """外挂脚本运行状态（启动/停止/退出）发生变更的事件。"""
+
+    pass

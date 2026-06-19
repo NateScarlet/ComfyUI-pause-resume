@@ -2,8 +2,10 @@ import sys
 import shlex
 import subprocess
 import logging
+import threading
 from typing import Optional, Any
-from gateway.shared.interfaces import ProcessManager
+from gateway.shared.interfaces import ProcessManager, EventBus
+from gateway.shared.events import ScriptStateChangedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -11,9 +13,15 @@ logger = logging.getLogger(__name__)
 class ExternalProgramManager(ProcessManager):
     """管理在空闲和繁忙状态下需要运行的外部程序（例如监控、挖矿程序等）。"""
 
-    def __init__(self, idle_path: str, busy_path: str):
+    def __init__(
+        self,
+        idle_path: str,
+        busy_path: str,
+        event_bus: Optional[EventBus] = None,
+    ):
         self._idle_path = idle_path
         self._busy_path = busy_path
+        self._event_bus = event_bus
         self._idle_process: Optional[subprocess.Popen[Any]] = None
         self._busy_process: Optional[subprocess.Popen[Any]] = None
         self._last_state: tuple[bool, bool] | None = None
@@ -74,7 +82,14 @@ class ExternalProgramManager(ProcessManager):
             not self._idle_process or self._idle_process.poll() is not None
         ):
             logger.info(f"🌙 Starting idle program: {self._idle_path}")
-            self._idle_process = self._run_program(self._idle_path)
+            proc = self._run_program(self._idle_path)
+            self._idle_process = proc
+            if proc:
+                threading.Thread(
+                    target=self._monitor_process,
+                    args=(proc, "idle"),
+                    daemon=True,
+                ).start()
 
     def _start_busy(self) -> None:
         """启动繁忙时运行的外部程序，并杀掉空闲时的外部程序。"""
@@ -89,7 +104,24 @@ class ExternalProgramManager(ProcessManager):
             not self._busy_process or self._busy_process.poll() is not None
         ):
             logger.info(f"🔥 Starting busy program: {self._busy_path}")
-            self._busy_process = self._run_program(self._busy_path)
+            proc = self._run_program(self._busy_path)
+            self._busy_process = proc
+            if proc:
+                threading.Thread(
+                    target=self._monitor_process,
+                    args=(proc, "busy"),
+                    daemon=True,
+                ).start()
+
+    def _monitor_process(self, proc: subprocess.Popen[Any], name: str) -> None:
+        """在后台守护线程中等待受控进程退出，若是当前正在运作的进程，则触发事件。"""
+        proc.wait()
+        if self._event_bus:
+            if proc is self._idle_process or proc is self._busy_process:
+                logger.info(
+                    f"External program {name} terminated with exit code {proc.poll()}"
+                )
+                self._event_bus.publish(ScriptStateChangedEvent())
 
     def cleanup(self) -> None:
         """终止所有由该管理器启动的外部进程（空闲或繁忙程序）。"""

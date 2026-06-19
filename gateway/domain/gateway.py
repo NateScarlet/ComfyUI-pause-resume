@@ -19,6 +19,7 @@ from gateway.shared.events import (
     QueueModifiedEvent,
     DispatchSuccessEvent,
     DispatchFailedEvent,
+    ScriptStateChangedEvent,
 )
 
 
@@ -93,6 +94,10 @@ class Gateway:
         self._event_bus.subscribe(
             DispatchFailedEvent,
             self._handle_dispatch_failed,
+        )
+        self._event_bus.subscribe(
+            ScriptStateChangedEvent,
+            self._handle_script_state_changed,
         )
 
         # 初始同步阻止系统休眠和外挂脚本状态
@@ -209,9 +214,15 @@ class Gateway:
             self._dispatcher.try_dispatch()
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
-        """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列。"""
+        """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
         if self._queue_writer.requeue_running_if_exists():
             self._attempt_count += 1
+        self._event_bus.publish(StatusChangedEvent())
+        self._refresh()
+
+    def _handle_script_state_changed(self, ev: ScriptStateChangedEvent) -> None:
+        """当外挂辅助程序状态发生变化时，决策并重新刷新阻止休眠与空闲超时等状态。"""
+        self._refresh()
         self._event_bus.publish(StatusChangedEvent())
 
     def _handle_queue_modified(self, ev: QueueModifiedEvent) -> None:

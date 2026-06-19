@@ -21,6 +21,7 @@ from gateway.shared.events import (
     QueueModifiedEvent,
     DispatchSuccessEvent,
     DispatchFailedEvent,
+    ScriptStateChangedEvent,
 )
 
 
@@ -198,6 +199,7 @@ class TestDomainGateway(unittest.TestCase):
 
         # 模拟物理重入列成功
         g._mock_writer.requeue_running_if_exists.return_value = True
+        g._mock_reader.get_pending_count.return_value = 1
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
         self.assertEqual(g._attempt_count, 1)
@@ -303,6 +305,36 @@ class TestDomainGateway(unittest.TestCase):
 
         # 空闲 且 无脚本在跑 -> 允许休眠
         self.assertFalse(g._should_prevent_sleep(has_pending=False, scripts_running=False))
+
+    def test_script_state_changed_decision(self):
+        """测试外挂辅助程序状态发生变化时的刷新决策。"""
+        g = _make_gateway(paused=False)
+        g._mock_pm.is_running.return_value = True
+
+        g._mock_event_bus.published.clear()
+        g._mock_event_bus.publish(ScriptStateChangedEvent())
+
+        # 应该是阻止休眠状态被调用
+        g._mock_power.prevent_sleep.assert_called()
+        self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
+
+    def test_downstream_crashed_triggers_refresh(self):
+        """测试下游物理崩溃时，不仅重入列还会触发 _refresh。"""
+        g = _make_gateway(paused=False)
+        g._mock_writer.requeue_running_if_exists.return_value = True
+
+        # 初始化时调用过一次 _refresh
+        initial_count_pending = g._mock_reader.get_pending_count.call_count
+        initial_count_running = g._mock_pm.is_running.call_count
+        self.assertEqual(initial_count_pending, 1)
+        self.assertEqual(initial_count_running, 1)
+
+        # 触发崩溃事件
+        g._mock_event_bus.publish(DownstreamCrashedEvent())
+
+        # 崩溃后 _refresh 被触发，各计数应该加 1
+        self.assertEqual(g._mock_reader.get_pending_count.call_count, 2)
+        self.assertEqual(g._mock_pm.is_running.call_count, 2)
 
 
 if __name__ == "__main__":
