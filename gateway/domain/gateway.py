@@ -77,8 +77,8 @@ class Gateway:
         has_pending = self._queue_reader.get_pending_count(limit=1) > 0
         scripts_running = self._process_manager.is_running()
 
-        should_prevent = self.determine_sleep_prevention(has_pending, scripts_running)
-        is_busy = self.determine_busy_state(has_pending)
+        should_prevent = self.should_prevent_sleep(has_pending, scripts_running)
+        is_busy = self.is_busy(has_pending)
 
         # 更新空闲/繁忙外挂脚本运行状态
         self._process_manager.update_state(is_busy, self.ever_active)
@@ -198,7 +198,7 @@ class Gateway:
         self._event_bus.publish(StatusChangedEvent())
         self._dispatcher.try_dispatch()
 
-    def calculate_dispatch_skip(self, pending_count: int) -> Optional[int]:
+    def get_dispatch_skip(self, pending_count: int) -> Optional[int]:
         """核心派发调度决策。"""
         if self.paused or self.downstream_executing or not self.downstream_ready:
             return None
@@ -209,13 +209,13 @@ class Gateway:
 
         return self.attempt_count % pending_count
 
-    def determine_busy_state(self, has_pending: bool) -> bool:
+    def is_busy(self, has_pending: bool) -> bool:
         """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
         return self.downstream_executing or (not self.paused and has_pending)
 
-    def determine_sleep_prevention(
+    def should_prevent_sleep(
         self, has_pending: bool, scripts_running: bool
     ) -> bool:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
-        is_busy = self.determine_busy_state(has_pending)
+        is_busy = self.is_busy(has_pending)
         return is_busy or scripts_running

@@ -228,55 +228,55 @@ class TestDomainGateway(unittest.TestCase):
         """测试计算派发 skip 偏移量。"""
         # 情况 1：网关暂停，不能分发
         g = _make_gateway(paused=True, downstream_ready=True)
-        self.assertIsNone(g.calculate_dispatch_skip(pending_count=10))
+        self.assertIsNone(g.get_dispatch_skip(pending_count=10))
 
         # 情况 2：下游繁忙，不能分发
         g = _make_gateway(paused=False, downstream_executing=True, downstream_ready=True)
-        self.assertIsNone(g.calculate_dispatch_skip(pending_count=10))
+        self.assertIsNone(g.get_dispatch_skip(pending_count=10))
 
         # 情况 3：下游未就绪，不能分发
         g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=False)
-        self.assertIsNone(g.calculate_dispatch_skip(pending_count=10))
+        self.assertIsNone(g.get_dispatch_skip(pending_count=10))
 
         # 情况 4：队列为空，不能分发并重置尝试计数
         g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=3)
-        self.assertIsNone(g.calculate_dispatch_skip(pending_count=0))
+        self.assertIsNone(g.get_dispatch_skip(pending_count=0))
         self.assertEqual(g.attempt_count, 0)
 
         # 情况 5：正常派发
         g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=5)
-        skip = g.calculate_dispatch_skip(pending_count=3)
+        skip = g.get_dispatch_skip(pending_count=3)
         self.assertEqual(skip, 2)  # 5 % 3 = 2
 
     def test_determine_busy_state(self):
         """测试繁忙和空闲业务状态计算。"""
         # 1. 暂停状态下，即使有任务也不视为繁忙
         g = _make_gateway(paused=True)
-        self.assertFalse(g.determine_busy_state(has_pending=True))
+        self.assertFalse(g.is_busy(has_pending=True))
 
         # 2. 下游正在执行：视为繁忙
         g = _make_gateway(paused=False, downstream_executing=True)
-        self.assertTrue(g.determine_busy_state(has_pending=False))
+        self.assertTrue(g.is_busy(has_pending=False))
 
         # 3. 未暂停且有排队任务：视为繁忙
         g = _make_gateway(paused=False, downstream_executing=False)
-        self.assertTrue(g.determine_busy_state(has_pending=True))
+        self.assertTrue(g.is_busy(has_pending=True))
 
         # 4. 未暂停且无任务：闲置
-        self.assertFalse(g.determine_busy_state(has_pending=False))
+        self.assertFalse(g.is_busy(has_pending=False))
 
     def test_determine_sleep_prevention(self):
         """测试是否阻止系统休眠决策。"""
         g = _make_gateway(paused=False)
 
         # 繁忙 且 无脚本在跑 -> 阻止休眠
-        self.assertTrue(g.determine_sleep_prevention(has_pending=True, scripts_running=False))
+        self.assertTrue(g.should_prevent_sleep(has_pending=True, scripts_running=False))
 
         # 空闲 但 有脚本在跑 -> 阻止休眠
-        self.assertTrue(g.determine_sleep_prevention(has_pending=False, scripts_running=True))
+        self.assertTrue(g.should_prevent_sleep(has_pending=False, scripts_running=True))
 
         # 空闲 且 无脚本在跑 -> 允许休眠
-        self.assertFalse(g.determine_sleep_prevention(has_pending=False, scripts_running=False))
+        self.assertFalse(g.should_prevent_sleep(has_pending=False, scripts_running=False))
 
 
 if __name__ == "__main__":
