@@ -2,6 +2,7 @@ from typing import Optional, Callable
 from gateway.shared.interfaces import (
     StateRepository,
     TaskQueueReader,
+    TaskQueueWriter,
     ProcessManager,
     SystemPowerController,
     Timer,
@@ -14,6 +15,10 @@ from gateway.shared.events import (
     StatusChangedEvent,
     DownstreamExecutingChangedEvent,
     DownstreamReadyChangedEvent,
+    DownstreamCrashedEvent,
+    QueueModifiedEvent,
+    DispatchSuccessEvent,
+    DispatchFailedEvent,
 )
 
 
@@ -28,6 +33,7 @@ class Gateway:
         self,
         state_repo: StateRepository,
         queue_reader: TaskQueueReader,
+        queue_writer: TaskQueueWriter,
         process_manager: ProcessManager,
         power_controller: SystemPowerController,
         timer: Timer,
@@ -43,17 +49,18 @@ class Gateway:
     ):
         self._state_repo = state_repo
         self._queue_reader = queue_reader
+        self._queue_writer = queue_writer
         self._process_manager = process_manager
         self._power_controller = power_controller
         self._timer = timer
         self._idle_restart_timeout = idle_restart_timeout
 
-        self.paused = state_repo.get_paused()
-        self.restart_after_idle_on_pause = restart_after_idle_on_pause
-        self.downstream_executing = downstream_executing
-        self.downstream_ready = downstream_ready
-        self.ever_active = ever_active
-        self.attempt_count = attempt_count
+        self._paused = state_repo.get_paused()
+        self._restart_after_idle_on_pause = restart_after_idle_on_pause
+        self._downstream_executing = downstream_executing
+        self._downstream_ready = downstream_ready
+        self._ever_active = ever_active
+        self._attempt_count = attempt_count
 
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
@@ -62,26 +69,55 @@ class Gateway:
         self._dispatcher = dispatcher
         self._event_bus = event_bus
 
-        # 领域聚合根在构造时，自己订阅感兴趣的事件，保持高内聚
+        # 领域聚合根在构造时，自己订阅感兴趣的物理与业务事件，保持高内聚
         self._event_bus.subscribe(
             DownstreamExecutingChangedEvent,
-            lambda ev: self.set_downstream_executing(ev.executing),
+            self._handle_downstream_executing_changed,
         )
         self._event_bus.subscribe(
             DownstreamReadyChangedEvent,
-            lambda ev: self.set_downstream_ready(ev.ready),
+            self._handle_downstream_ready_changed,
+        )
+        self._event_bus.subscribe(
+            DownstreamCrashedEvent,
+            self._handle_downstream_crashed,
+        )
+        self._event_bus.subscribe(
+            QueueModifiedEvent,
+            self._handle_queue_modified,
+        )
+        self._event_bus.subscribe(
+            DispatchSuccessEvent,
+            self._handle_dispatch_success,
+        )
+        self._event_bus.subscribe(
+            DispatchFailedEvent,
+            self._handle_dispatch_failed,
         )
 
-    def refresh(self) -> None:
+        # 初始同步阻止系统休眠和外挂脚本状态
+        self._refresh()
+
+    @property
+    def paused(self) -> bool:
+        """向外部提供网关当前是否暂停的只读状态。"""
+        return self._paused
+
+    def _refresh(self) -> None:
         """根据网关当前的业务决策，刷新阻止系统休眠、空闲重启超时与外挂脚本状态。"""
-        has_pending = self._queue_reader.get_pending_count(limit=1) > 0
+        pending_count = self._queue_reader.get_pending_count(limit=1)
+        has_pending = pending_count > 0
         scripts_running = self._process_manager.is_running()
 
-        should_prevent = self.should_prevent_sleep(has_pending, scripts_running)
-        is_busy = self.is_busy(has_pending)
+        # 如果没有排队任务，重置尝试计数
+        if not has_pending:
+            self._attempt_count = 0
+
+        should_prevent = self._should_prevent_sleep(has_pending, scripts_running)
+        is_busy = self._is_busy(has_pending)
 
         # 更新空闲/繁忙外挂脚本运行状态
-        self._process_manager.update_state(is_busy, self.ever_active)
+        self._process_manager.update_state(is_busy, self._ever_active)
 
         if should_prevent:
             self._power_controller.prevent_sleep()
@@ -101,13 +137,13 @@ class Gateway:
 
     def _on_idle_entered(self) -> None:
         """进入业务空闲状态时的决策逻辑。"""
-        if self.restart_after_idle_on_pause:
-            self.restart_after_idle_on_pause = False
+        if self._restart_after_idle_on_pause:
+            self._restart_after_idle_on_pause = False
             self._downstream.restart()
-            self._event_bus.publish(StateChangedEvent(paused=self.paused))
+            self._event_bus.publish(StateChangedEvent(paused=self._paused))
             return
 
-        if self.ever_active and self._idle_restart_timeout > 0:
+        if self._ever_active and self._idle_restart_timeout > 0:
             self._cancel_idle_timeout = self._timer.start_timeout(
                 self._idle_restart_timeout, self._on_idle_timeout
             )
@@ -125,97 +161,90 @@ class Gateway:
 
     def pause(self, restart_after_idle: bool) -> None:
         """暂停队列。"""
-        self.paused = True
-        self.restart_after_idle_on_pause = restart_after_idle
+        self._paused = True
+        self._restart_after_idle_on_pause = restart_after_idle
         self._state_repo.set_paused(True)
 
         self._event_bus.publish(StateChangedEvent(paused=True))
-        self.refresh()
+        self._refresh()
 
         # 如果在此之前系统已经处于空闲状态（且请求立即重启），由于 sync_infrastructure
         # 不会重复触发 _on_idle_entered，因此我们需要在这里直接触发重启
-        if restart_after_idle and self._is_idle and self.restart_after_idle_on_pause:
-            self.restart_after_idle_on_pause = False
+        if restart_after_idle and self._is_idle and self._restart_after_idle_on_pause:
+            self._restart_after_idle_on_pause = False
             self._downstream.restart()
 
     def resume(self) -> None:
         """恢复队列，并自动触发副作用。"""
-        self.paused = False
-        self.restart_after_idle_on_pause = False
+        self._paused = False
+        self._restart_after_idle_on_pause = False
         self._state_repo.set_paused(False)
 
         self._event_bus.publish(StateChangedEvent(paused=False))
-        self.refresh()
+        self._refresh()
         self._dispatcher.try_dispatch()
 
-    def set_downstream_executing(self, executing: bool) -> None:
+    def _handle_downstream_executing_changed(
+        self, ev: DownstreamExecutingChangedEvent
+    ) -> None:
         """设置下游的执行状态，并决策触发相应的业务动作。"""
-        if self.downstream_executing == executing:
+        executing = ev.executing
+        if self._downstream_executing == executing:
             return
 
-        self.downstream_executing = executing
+        self._downstream_executing = executing
         if executing:
-            self.ever_active = True
-            self.refresh()
+            self._ever_active = True
+            self._refresh()
         else:
-            self.attempt_count = 0
-            self.refresh()
+            self._attempt_count = 0
+            self._refresh()
             self._event_bus.publish(StatusChangedEvent())
             self._dispatcher.try_dispatch()
 
-    def set_downstream_ready(self, ready: bool) -> None:
+    def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
         """设置下游就绪状态，并在合适时触发派发。"""
-        self.downstream_ready = ready
-        if ready and not self.paused:
+        self._downstream_ready = ev.ready
+        if ev.ready and not self._paused:
             self._dispatcher.try_dispatch()
 
-    def on_dispatch_success(self) -> None:
+    def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
+        """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列。"""
+        if self._queue_writer.requeue_running_if_exists():
+            self._attempt_count += 1
+        self._event_bus.publish(StatusChangedEvent())
+
+    def _handle_queue_modified(self, ev: QueueModifiedEvent) -> None:
+        """当队列内容被修改（新任务入队、清空或删除）时的业务逻辑与副作用驱动。"""
+        self._refresh()
+        self._event_bus.publish(StatusChangedEvent())
+        self._dispatcher.try_dispatch()
+
+    def _handle_dispatch_success(self, ev: DispatchSuccessEvent) -> None:
         """当派发任务成功时的业务反馈。"""
         self._event_bus.publish(StatusChangedEvent())
 
-    def on_dispatch_failed(self, is_permanent: bool) -> bool:
+    def _handle_dispatch_failed(self, ev: DispatchFailedEvent) -> None:
         """当派发任务失败时的处理决策。"""
         self._event_bus.publish(StatusChangedEvent())
-        if is_permanent:
-            return False
-
-        self.attempt_count += 1
-        return True
-
-    def increment_attempt_count(self) -> None:
-        """物理崩溃时增加重试计数。"""
-        self.attempt_count += 1
-
-    def on_task_added(self) -> None:
-        """当新任务入队时的业务逻辑与副作用驱动。"""
-        self.refresh()
-        self._event_bus.publish(StatusChangedEvent())
-        self._dispatcher.try_dispatch()
-
-    def on_queue_modified(self) -> None:
-        """当队列内容被修改时的业务逻辑与副作用驱动。"""
-        self.refresh()
-        self._event_bus.publish(StatusChangedEvent())
-        self._dispatcher.try_dispatch()
+        if not ev.is_permanent:
+            self._attempt_count += 1
 
     def get_dispatch_skip(self, pending_count: int) -> Optional[int]:
-        """核心派发调度决策。"""
-        if self.paused or self.downstream_executing or not self.downstream_ready:
+        """核心派发调度决策（无副作用纯查询）。"""
+        if self._paused or self._downstream_executing or not self._downstream_ready:
             return None
 
         if pending_count <= 0:
-            self.attempt_count = 0
             return None
 
-        return self.attempt_count % pending_count
+        return self._attempt_count % pending_count
 
-    def is_busy(self, has_pending: bool) -> bool:
+    def _is_busy(self, has_pending: bool) -> bool:
         """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
-        return self.downstream_executing or (not self.paused and has_pending)
+        return self._downstream_executing or (not self._paused and has_pending)
 
-    def should_prevent_sleep(
-        self, has_pending: bool, scripts_running: bool
-    ) -> bool:
+    def _should_prevent_sleep(self, has_pending: bool, scripts_running: bool) -> bool:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
-        is_busy = self.is_busy(has_pending)
+        is_busy = self._is_busy(has_pending)
         return is_busy or scripts_running

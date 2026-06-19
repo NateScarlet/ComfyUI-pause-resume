@@ -3,16 +3,16 @@ import time
 import json
 from typing import Optional, Dict, Any
 from gateway.shared.models import Task, RawJSON
-from gateway.shared.interfaces import TaskQueueWriter
-from gateway.domain.gateway import Gateway
+from gateway.shared.interfaces import TaskQueueWriter, EventBus
+from gateway.shared.events import QueueModifiedEvent
 
 
 class AddTaskCommandHandler:
     """处理添加任务写指令的 Handler。"""
 
-    def __init__(self, queue_writer: TaskQueueWriter, gateway: Gateway):
+    def __init__(self, queue_writer: TaskQueueWriter, event_bus: EventBus):
         self._queue_writer = queue_writer
-        self._gateway = gateway
+        self._event_bus = event_bus
 
     def handle(
         self,
@@ -46,7 +46,7 @@ class AddTaskCommandHandler:
         )
         self._queue_writer.add_task(task)
 
-        # 触发领域聚合根的入队响应逻辑
-        self._gateway.on_task_added()
+        # 发布事件，由网关自行订阅处理
+        self._event_bus.publish(QueueModifiedEvent())
 
         return {"prompt_id": prompt_id, "number": task_number}

@@ -21,7 +21,6 @@ from .infrastructure.comfyui.dispatcher import ComfyUITaskDispatcher
 from .application.facade import AppFacade
 from .presentation.handlers import GatewayHandlers
 from .presentation.routes import setup_routes
-from .shared.events import DownstreamCrashedEvent, StatusChangedEvent
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
@@ -97,10 +96,14 @@ async def main() -> None:
         event_bus=event_bus,
     )
 
-    # 8. 实例化领域模型聚合根 (Gateway)，直接注入所有依赖
+    # 8. 启动时重入之前崩溃可能残留的正在运行任务（必须在实例化 Gateway 前完成）
+    queue_writer.requeue_running()
+
+    # 9. 实例化领域模型聚合根 (Gateway)，直接注入所有依赖
     gateway = Gateway(
         state_repo=state_repo,
         queue_reader=queue_reader,
+        queue_writer=queue_writer,
         process_manager=process_manager,
         power_controller=power_manager,
         timer=timer,
@@ -110,29 +113,16 @@ async def main() -> None:
         idle_restart_timeout=config.idle_restart_timeout,
     )
 
-    # 9. 任务分发器完成 Gateway 注入以消解循环引用
+    # 10. 任务分发器完成 Gateway 注入以消解循环引用
     dispatcher.set_gateway(gateway)
 
-    # 10. 绑定崩溃处理和状态更新
-    # 启动时重入之前崩溃可能残留的正在运行任务
-    queue_writer.requeue_running()
-
-    def handle_crashed(ev: DownstreamCrashedEvent) -> None:
-        if queue_writer.requeue_running_if_exists():
-            gateway.increment_attempt_count()
-        event_bus.publish(StatusChangedEvent())
-
-    event_bus.subscribe(DownstreamCrashedEvent, handle_crashed)
-
-    # 11. 根据初始状态，同步阻止系统休眠和外挂脚本行为
-    gateway.refresh()
-
-    # 12. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
+    # 11. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
     app_facade = AppFacade.create(
         gateway=gateway,
         queue_reader=queue_reader,
         queue_writer=queue_writer,
         downstream_client=downstream_service,
+        event_bus=event_bus,
     )
 
     # 13. 绑定异步事件循环与信号量

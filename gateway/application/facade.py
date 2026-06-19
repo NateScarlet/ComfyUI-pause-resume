@@ -1,5 +1,10 @@
 from gateway.domain.gateway import Gateway
-from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter, DownstreamClient
+from gateway.shared.interfaces import (
+    TaskQueueReader,
+    TaskQueueWriter,
+    DownstreamClient,
+    EventBus,
+)
 from .commands.add_task import AddTaskCommandHandler
 from .commands.pause_resume import PauseQueueCommandHandler, ResumeQueueCommandHandler
 from .commands.modify_queue import ModifyQueueCommandHandler
@@ -41,13 +46,14 @@ class AppFacade:
         queue_reader: TaskQueueReader,
         queue_writer: TaskQueueWriter,
         downstream_client: DownstreamClient,
+        event_bus: EventBus,
     ) -> "AppFacade":
         """快速实例化门面，在内部组装所有的命令与查询处理器，极大减轻启动根的代码量。"""
         return cls(
-            add_task=AddTaskCommandHandler(queue_writer, gateway),
+            add_task=AddTaskCommandHandler(queue_writer, event_bus),
             pause_queue=PauseQueueCommandHandler(gateway),
             resume_queue=ResumeQueueCommandHandler(gateway),
-            modify_queue=ModifyQueueCommandHandler(queue_writer, gateway),
+            modify_queue=ModifyQueueCommandHandler(queue_writer, event_bus),
             get_queue=GetQueueQueryHandler(queue_reader),
             get_jobs=GetJobsQueryHandler(queue_reader, downstream_client),
             get_job_detail=GetJobDetailQueryHandler(queue_reader),

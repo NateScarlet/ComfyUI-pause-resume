@@ -1,14 +1,14 @@
 from typing import Optional, List
-from gateway.shared.interfaces import TaskQueueWriter
-from gateway.domain.gateway import Gateway
+from gateway.shared.interfaces import TaskQueueWriter, EventBus
+from gateway.shared.events import QueueModifiedEvent
 
 
 class ModifyQueueCommandHandler:
     """清空队列或删除特定待处理任务的 Command Handler。"""
 
-    def __init__(self, queue_writer: TaskQueueWriter, gateway: Gateway):
+    def __init__(self, queue_writer: TaskQueueWriter, event_bus: EventBus):
         self._queue_writer = queue_writer
-        self._gateway = gateway
+        self._event_bus = event_bus
 
     def handle(
         self, clear: bool = False, delete_ids: Optional[List[str]] = None
@@ -19,4 +19,5 @@ class ModifyQueueCommandHandler:
         if delete_ids:
             self._queue_writer.delete_pending(delete_ids)
 
-        self._gateway.on_queue_modified()
+        # 发布事件，由网关自行订阅处理
+        self._event_bus.publish(QueueModifiedEvent())

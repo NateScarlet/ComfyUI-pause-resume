@@ -16,6 +16,7 @@ from gateway.shared.interfaces import (
 )
 from gateway.shared.exceptions import DownstreamError
 from gateway.domain.gateway import Gateway
+from gateway.shared.events import DispatchSuccessEvent, DispatchFailedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +90,15 @@ class ComfyUITaskDispatcher(TaskDispatcher):
             try:
                 await self._downstream.send_prompt(task.prompt_id, body)
                 logger.info(f"📤 Sent workflow {task.prompt_id} to downstream")
-                self.gateway.on_dispatch_success()
+                self._event_bus.publish(DispatchSuccessEvent())
             except DownstreamError as de:
                 logger.error(
                     f"Failed to send workflow {task.prompt_id}: {de.status_code} - {de.message}"
                 )
                 is_permanent = 400 <= de.status_code <= 500
-                should_requeue = self.gateway.on_dispatch_failed(is_permanent)
+                self._event_bus.publish(DispatchFailedEvent(is_permanent=is_permanent))
 
-                if not should_requeue:
+                if is_permanent:
                     self._queue_writer.clear_running()
                     try:
                         self._save_failed_workflow(
@@ -111,9 +112,8 @@ class ComfyUITaskDispatcher(TaskDispatcher):
                     self._queue_writer.requeue_running()
             except Exception as e:
                 logger.error(f"Error sending workflow: {e}")
-                should_requeue = self.gateway.on_dispatch_failed(is_permanent=False)
-                if should_requeue:
-                    self._queue_writer.requeue_running()
+                self._event_bus.publish(DispatchFailedEvent(is_permanent=False))
+                self._queue_writer.requeue_running()
         finally:
             self._dispatching = False
 
