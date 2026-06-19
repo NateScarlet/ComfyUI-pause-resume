@@ -82,9 +82,8 @@ class Gateway:
                 PowerManagement.prevent_sleep()
                 self._preventing_sleep = True
         else:
-            if self._ever_active and self.config.idle_restart_timeout > 0:
-                if self._idle_start_time is None:
-                    self._idle_start_time = time.time()
+            if self._idle_start_time is None:
+                self._idle_start_time = time.time()
 
             if self._preventing_sleep:
                 logger.info("💤 Allowing system sleep")
