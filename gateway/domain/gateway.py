@@ -83,7 +83,6 @@ class Gateway:
         self._refreshing = False
         self._refresh_needed = False
         self._crashed_executing = False
-        self._refresh_loop_count = 0
 
         self._downstream = downstream
         self._dispatcher = dispatcher
@@ -138,13 +137,8 @@ class Gateway:
             return
         self._refreshing = True
         self._refresh_needed = False
-        self._refresh_loop_count = 0
         try:
-            while True:
-                self._refresh_loop_count += 1
-                if self._refresh_loop_count > 10:
-                    # 防止异常情况下的无限重入循环
-                    break
+            for _ in range(10):
 
                 pending_count = self._queue_reader.get_pending_count(limit=1)
                 has_pending = pending_count > 0
