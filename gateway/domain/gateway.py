@@ -304,10 +304,11 @@ class Gateway:
             if self._crashed_executing:
                 self._crashed_executing = False
                 # 如果崩溃 requeue 的任务已经重新执行并完成（_ever_active 为 True），
-                # 说明任务成功完成，应重置崩溃计数
+                # 说明任务成功完成，应重置崩溃计数并清理运行队列
                 if self._ever_active:
                     self._crash_count = 0
                     self._last_failed_task_id = None
+                    self._queue_writer.clear_running()
             else:
                 self._crash_count = 0
                 self._last_failed_task_id = None
@@ -354,9 +355,8 @@ class Gateway:
             ):
                 self._crash_count = 0
             self._last_failed_task_id = task.prompt_id
-            pending_count = self._queue_reader.get_pending_count()
-            # 崩溃跳过逻辑降级策略：若是单任务队列，崩溃超过阈值直接标记为永久失败
-            if pending_count == 0 and self._crash_count >= 2:
+            # 崩溃超过阈值直接标记为永久失败，避免阻塞整个队列
+            if self._crash_count >= 2:
                 self._queue_writer.clear_running()
                 self._crash_count = 0
                 self._last_failed_task_id = None
@@ -400,14 +400,7 @@ class Gateway:
         self._event_bus.publish(StatusChangedEvent())
         if not ev.is_permanent:
             self._dispatch_skip_offset += 1
-            running_tasks: List[Task] = self._queue_reader.get_running()
-            if running_tasks:
-                self._last_failed_task_id = running_tasks[0].prompt_id
-            else:
-                # 如果 running 中无任务，尝试从 pending 中获取失败任务 ID
-                pending_tasks: List[Task] = self._queue_reader.get_pending()
-                if pending_tasks:
-                    self._last_failed_task_id = pending_tasks[0].prompt_id
+            self._last_failed_task_id = ev.task_id
 
             # 启动延迟重试驱动，避免瞬时网络异常引起高频无效空转
             if self._cancel_dispatch_retry:

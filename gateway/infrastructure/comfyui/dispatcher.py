@@ -98,7 +98,11 @@ class ComfyUITaskDispatcher(TaskDispatcher):
                     f"Failed to send workflow {task.prompt_id}: {de.status_code} - {de.message}"
                 )
                 is_permanent = 400 <= de.status_code <= 500
-                self._event_bus.publish(DispatchFailedEvent(is_permanent=is_permanent))
+                self._event_bus.publish(
+                    DispatchFailedEvent(
+                        task_id=task.prompt_id, is_permanent=is_permanent
+                    )
+                )
 
                 if is_permanent:
                     self._queue_writer.clear_running()
@@ -114,7 +118,9 @@ class ComfyUITaskDispatcher(TaskDispatcher):
                     self._queue_writer.requeue_running()
             except Exception as e:
                 logger.error(f"Error sending workflow: {e}")
-                self._event_bus.publish(DispatchFailedEvent(is_permanent=False))
+                self._event_bus.publish(
+                    DispatchFailedEvent(task_id=task.prompt_id, is_permanent=False)
+                )
                 self._queue_writer.requeue_running()
         finally:
             self._dispatching = False

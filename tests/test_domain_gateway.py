@@ -202,13 +202,13 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=False, pending_count=1)
 
         # 永久不可恢复错误：不重试
-        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=True))
+        g._mock_event_bus.publish(DispatchFailedEvent(task_id="task_test", is_permanent=True))
         self.assertEqual(g._dispatch_skip_offset, 0)
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
 
         # 临时错误：触发重试，累加偏移
         g._mock_event_bus.published.clear()
-        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g._mock_event_bus.publish(DispatchFailedEvent(task_id="task_test", is_permanent=False))
         self.assertEqual(g._dispatch_skip_offset, 1)
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
 
@@ -430,7 +430,7 @@ class TestDomainGateway(unittest.TestCase):
         """测试临时派发失败会触发定时器延迟重试，且派发成功时可以取消该定时器。"""
         # 场景 A：派发失败后，在重试触发前收到成功事件，应取消定时器
         g = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
-        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g._mock_event_bus.publish(DispatchFailedEvent(task_id="task_test", is_permanent=False))
         self.assertEqual(g._dispatch_skip_offset, 1)
         g._mock_timer.start_timeout.assert_called_once_with(5.0, g._retry_dispatch)
 
@@ -440,7 +440,7 @@ class TestDomainGateway(unittest.TestCase):
 
         # 场景 B：重试回调触发时，应清除取消函数并以最新 skip 触发派发
         g2 = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
-        g2._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g2._mock_event_bus.publish(DispatchFailedEvent(task_id="task_test", is_permanent=False))
         g2._mock_dispatcher.dispatch.assert_not_called()
         g2._retry_dispatch()
         g2._mock_dispatcher.dispatch.assert_called_once_with(1)
@@ -471,7 +471,7 @@ class TestDomainGateway(unittest.TestCase):
         t = MagicMock(spec=Task)
         t.prompt_id = "task_999"
         g = _make_gateway(paused=False, pending_tasks=[t], running_tasks=[t])
-        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g._mock_event_bus.publish(DispatchFailedEvent(task_id="task_999", is_permanent=False))
         self.assertEqual(g._dispatch_skip_offset, 1)
         self.assertEqual(g._last_failed_task_id, "task_999")
         
@@ -489,7 +489,7 @@ class TestDomainGateway(unittest.TestCase):
     def test_downstream_ready_changed_cancels_retry(self):
         """测试当下游变为未就绪（offline）时，自动取消正在挂起的延迟派发重试。"""
         g = _make_gateway(paused=False, pending_count=1)
-        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g._mock_event_bus.publish(DispatchFailedEvent(task_id="task_test", is_permanent=False))
         g._mock_timer.start_timeout.assert_called_once()
         
         # 下游变为未就绪

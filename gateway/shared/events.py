@@ -54,6 +54,7 @@ class DispatchSuccessEvent:
 class DispatchFailedEvent:
     """任务派发至下游 ComfyUI 失败的事件。"""
 
+    task_id: str
     is_permanent: bool
 
 
