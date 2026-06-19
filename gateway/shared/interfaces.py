@@ -153,30 +153,6 @@ class DownstreamClient(ABC):
         pass
 
 
-class StateBroadcaster(ABC):
-    """负责向客户端广播网关状态变更事件的抽象接口。"""
-
-    @abstractmethod
-    def register_ws_callback(self, callback: Callable[[], None]) -> None:
-        """注册前端 WebSocket 状态广播回调。"""
-        pass
-
-    @abstractmethod
-    def register_sse_callback(self, callback: Callable[[bool], None]) -> None:
-        """注册 SSE 状态广播回调。"""
-        pass
-
-    @abstractmethod
-    def notify_state_changed(self, paused: bool) -> None:
-        """广播暂停/恢复状态变更事件。"""
-        pass
-
-    @abstractmethod
-    def notify_status_changed(self) -> None:
-        """广播队列任务数量等状态变更事件。"""
-        pass
-
-
 class TaskDispatcher(ABC):
     """负责向下一代发任务的抽象调度器接口。"""
 
