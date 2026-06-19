@@ -497,6 +497,72 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=False))
         g._mock_timer_cancel.assert_called_once()
 
+    def test_full_normal_dispatch_cycle(self):
+        """测试完整的正常派发周期：got prompt → Prompt executed → 自动派发下一个任务。"""
+        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2)
+
+        # 第 1 步：下游开始执行（got prompt）
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+        self.assertTrue(g._downstream_executing)
+        self.assertTrue(g._ever_active)
+
+        # 第 2 步：下游执行完毕（Prompt executed in）
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        self.assertFalse(g._downstream_executing)
+
+        # 验证：执行完毕后应该自动触发派发下一个任务
+        g._mock_dispatcher.dispatch.assert_called()
+        g._mock_writer.clear_running.assert_called_once()
+
+        # 验证 get_dispatch_skip 返回了合法的 skip 值
+        skip = g.get_dispatch_skip()
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip, 0)
+
+    def test_executing_false_guards_against_duplicate_events(self):
+        """测试 _downstream_executing 已是 False 时再收到 executing=False 不会重复处理。"""
+        # 但也不应该跳过关键逻辑——如果下游从未收到过 executing=True，
+        # 则 _downstream_executing 初始就是 False，此时收到 executing=False
+        # 会因为 guard 而直接返回，导致 clear_running 和 dispatch 都不执行。
+        # 这个测试确认 guard 的行为。
+        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2,
+                          downstream_executing=False)
+
+        # 在 _downstream_executing 已是 False 时发布 executing=False
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        # guard 生效：因为 _downstream_executing == executing，直接返回
+        # dispatch 不应被调用
+        g._mock_dispatcher.dispatch.assert_not_called()
+        g._mock_writer.clear_running.assert_not_called()
+
+    def test_multiple_tasks_auto_dispatch_chain(self):
+        """测试多任务自动链式派发：一个任务完成后自动派发下一个，再下一个。"""
+        g = _make_gateway(paused=False, downstream_ready=True, pending_count=3)
+
+        # 预置 _downstream_executing = True 模拟下游正在执行第一个任务
+        g._downstream_executing = True
+        g._ever_active = True
+
+        # 第一次 "Prompt executed in" → 应该触发 dispatch
+        g._mock_dispatcher.dispatch.reset_mock()
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        self.assertFalse(g._downstream_executing)
+        g._mock_dispatcher.dispatch.assert_called_once()
+        g._mock_writer.clear_running.assert_called_once()
+
+        # 模拟 dispatch 成功后下游再次开始执行（got prompt）
+        g._mock_dispatcher.dispatch.reset_mock()
+        g._mock_writer.clear_running.reset_mock()
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+        self.assertTrue(g._downstream_executing)
+
+        # 第二次 "Prompt executed in" → 应该再次触发 dispatch
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        self.assertFalse(g._downstream_executing)
+        g._mock_dispatcher.dispatch.assert_called_once()
+        g._mock_writer.clear_running.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

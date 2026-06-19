@@ -24,7 +24,8 @@ from .presentation.routes import setup_routes
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
-    format="[GATEWAY] %(message)s",
+    format="[GATEWAY] %(asctime)s %(levelname)-5s %(message)s",
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,8 @@ async def main() -> None:
     timer = AsyncioTimer()
 
     # 6. 实例化事件总线
-    event_bus = InMemoryEventBus()
+    loop = asyncio.get_running_loop()
+    event_bus = InMemoryEventBus(loop)
 
     # 5. 实例化外部程序管理器
     process_manager = ExternalProgramManager(
@@ -97,6 +99,7 @@ async def main() -> None:
         queue_writer=queue_writer,
         downstream=downstream_service,
         event_bus=event_bus,
+        loop=loop,
     )
 
     # 8. 启动时重入之前崩溃可能残留的正在运行任务（必须在实例化 Gateway 前完成）
@@ -126,7 +129,6 @@ async def main() -> None:
     )
 
     # 13. 绑定异步事件循环与信号量
-    loop = asyncio.get_running_loop()
     downstream_service.loop = loop
     exit_event = asyncio.Event()
 

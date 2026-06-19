@@ -30,40 +30,55 @@ class ComfyUITaskDispatcher(TaskDispatcher):
         queue_writer: TaskQueueWriter,
         downstream: DownstreamClient,
         event_bus: EventBus,
+        loop: asyncio.AbstractEventLoop,
     ) -> None:
         self._config = config
         self._queue_reader = queue_reader
         self._queue_writer = queue_writer
         self._downstream = downstream
         self._event_bus = event_bus
+        self._loop = loop
         self._dispatching: bool = False
         self._exiting: bool = False
 
     def dispatch(self, skip: Optional[int]) -> None:
         """线程安全地触发一次任务派发尝试。"""
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            return
-
-        if loop.is_running():
-            loop.call_soon_threadsafe(self._schedule_dispatch, skip)
+        logger.debug("dispatch called: skip=%s", skip)
+        self._loop.call_soon_threadsafe(self._schedule_dispatch, skip)
 
     def _schedule_dispatch(self, skip: Optional[int]) -> None:
+        logger.debug("_schedule_dispatch: creating task, skip=%s", skip)
         asyncio.create_task(self._try_send_task(skip))
 
     async def _try_send_task(self, skip: Optional[int]) -> None:
         """执行派发任务的具体副作用。"""
+        logger.debug(
+            "_try_send_task: entered, skip=%s dispatching=%s exiting=%s",
+            skip,
+            self._dispatching,
+            self._exiting,
+        )
         if self._dispatching or self._exiting:
+            logger.debug(
+                "_try_send_task: skipped (dispatching=%s exiting=%s)",
+                self._dispatching,
+                self._exiting,
+            )
             return
         self._dispatching = True
         try:
             if skip is None:
+                logger.debug("_try_send_task: skip is None, nothing to dispatch")
                 return
 
             task = self._queue_writer.pop_task(skip)
             if task is None:
+                logger.warning("_try_send_task: pop_task(skip=%s) returned None", skip)
                 return
+
+            logger.info(
+                "_try_send_task: dispatching task %s (skip=%s)", task.prompt_id, skip
+            )
 
             extra_data = json.loads(task.extra_data)
             body: Dict[str, Any] = {

@@ -148,10 +148,12 @@ class ComfyUIDownstreamClient(DownstreamClient):
 
                 # 仅仅发布物理状态日志对应的强类型事件到 EventBus
                 if "got prompt" in line:
+                    logger.debug("Detected 'got prompt' in downstream log")
                     self.event_bus.publish(
                         DownstreamExecutingChangedEvent(executing=True)
                     )
                 elif "Prompt executed in" in line:
+                    logger.debug("Detected 'Prompt executed in' in downstream log")
                     self.event_bus.publish(
                         DownstreamExecutingChangedEvent(executing=False)
                     )

@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Callable, List
 from gateway.shared.interfaces import (
     StateRepository,
@@ -22,6 +23,8 @@ from gateway.shared.events import (
     DispatchFailedEvent,
     ScriptStateChangedEvent,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Gateway:
@@ -292,8 +295,24 @@ class Gateway:
         """设置下游的执行状态，并决策触发相应的业务动作。"""
         executing = ev.executing
         if self._downstream_executing == executing:
+            logger.debug(
+                "DownstreamExecutingChanged ignored: already %s (crashed=%s paused=%s ready=%s)",
+                executing,
+                self._crashed_executing,
+                self._paused,
+                self._downstream_ready,
+            )
             return
 
+        logger.info(
+            "DownstreamExecutingChanged: %s → %s (crashed=%s paused=%s ready=%s ever_active=%s)",
+            self._downstream_executing,
+            executing,
+            self._crashed_executing,
+            self._paused,
+            self._downstream_ready,
+            self._ever_active,
+        )
         self._downstream_executing = executing
         if executing:
             # 只有在下游真正开始执行任务时，才将 _ever_active 设为 True
@@ -313,8 +332,18 @@ class Gateway:
                 self._last_failed_task_id = None
                 self._queue_writer.clear_running()
             self._refresh()
+            skip = self.get_dispatch_skip()
+            logger.info(
+                "DownstreamExecutingChanged: executing=False done, dispatch_skip=%s "
+                "(pending=%s crashed=%s paused=%s ready=%s)",
+                skip,
+                self._queue_reader.get_pending_count(),
+                self._crashed_executing,
+                self._paused,
+                self._downstream_ready,
+            )
             self._event_bus.publish(StatusChangedEvent())
-            self._dispatcher.dispatch(self.get_dispatch_skip())
+            self._dispatcher.dispatch(skip)
 
     def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
         """设置下游就绪状态，并在合适时触发派发。"""

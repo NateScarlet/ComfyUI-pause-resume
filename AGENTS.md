@@ -1,6 +1,7 @@
 - **python:** 编辑完代码后，运行 `.\scripts\check.ps1` 脚本进行类型检查、单元测试与代码格式化。
 - **python:** 所有非故意公开让外部访问的类成员，都应该用下划线前缀命名
-- 
+- **依赖注入:** 所有实现所需的依赖都应该显式注入而不是依赖自己尝试获取并尝试降级
+- **错误处理：**　逻辑不能正常进行应该明确报错，而不是静默忽略。
 - **directory_structure:** 网关核心代码已拆分至 `gateway/` 包目录下，数据默认存储于 `gateway_data/` 目录下（可通过 `COMFYUI_GATEWAY_DATA_DIR` 环境变量进行自定义设置）。禁止向仓库根目录随意添加新的网关业务 python 文件。此外，保存提交失败任务信息的 `failed_workflows` 目录也必须保存在由 `COMFYUI_GATEWAY_DATA_DIR` 定义的网关数据存储目录下（即 `os.path.join(self.config.data_dir, "failed_workflows")`），禁止直接放置在项目根目录下。
 - 
 - **clean_architecture_ddd:** 所有网关业务状态机的流转、休眠决策和任务派发计算逻辑，必须定义在领域层（`gateway/domain/`）的聚合根（如 `Gateway`）中。应用层（`gateway/application/`）作为轻量级编排层，仅负责胶水装配和执行副作用，禁止编写具体的业务状态转移判定（防止贫血模型）。

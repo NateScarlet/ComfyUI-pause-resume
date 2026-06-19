@@ -15,9 +15,10 @@ class InMemoryEventBus(EventBus):
     支持在任意后台线程中调用 publish，其回调执行会被安全地调度到 asyncio 事件循环的主线程中运行。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._subscribers: Dict[Type[Any], List[Callable[[Any], Any]]] = {}
         self._lock = threading.Lock()
+        self._loop = loop
 
     def subscribe(
         self, event_class: Type[T], callback: Callable[[T], Any]
@@ -50,19 +51,25 @@ class InMemoryEventBus(EventBus):
                 return
             callbacks = list(self._subscribers[event_class])
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = None
+        logger.debug(
+            "EventBus.publish: %s, %d callbacks, thread=%s",
+            event_class.__name__,
+            len(callbacks),
+            threading.current_thread().name,
+        )
 
         def run_callbacks() -> None:
+            logger.debug(
+                "EventBus.run_callbacks: %s, running %d callbacks, thread=%s",
+                event_class.__name__,
+                len(callbacks),
+                threading.current_thread().name,
+            )
             for callback in callbacks:
                 try:
                     callback(event)
                 except Exception as e:
-                    logger.error(f"Error in event callback: {e}")
+                    logger.error(f"Error in event callback: {e}", exc_info=True)
+            logger.debug("EventBus.run_callbacks: %s DONE", event_class.__name__)
 
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(run_callbacks)
-        else:
-            run_callbacks()
+        self._loop.call_soon_threadsafe(run_callbacks)
