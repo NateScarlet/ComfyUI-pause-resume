@@ -427,16 +427,22 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_dispatch_failed_retry_and_cancel(self):
         """测试临时派发失败会触发定时器延迟重试，且派发成功时可以取消该定时器。"""
-        # 1. 触发临时失败，确认定时器启动
-        g = _make_gateway(paused=False, pending_count=2)
+        # 场景 A：派发失败后，在重试触发前收到成功事件，应取消定时器
+        g = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
         g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
         self.assertEqual(g._attempt_count, 1)
-        g._mock_timer.start_timeout.assert_called_once_with(5.0, g._dispatcher.dispatch)
-        
-        # 2. 触发派发成功，确认定时器被取消
+        g._mock_timer.start_timeout.assert_called_once_with(5.0, g._retry_dispatch)
+
         g._mock_timer_cancel.assert_not_called()
         g._mock_event_bus.publish(DispatchSuccessEvent())
         g._mock_timer_cancel.assert_called_once()
+
+        # 场景 B：重试回调触发时，应清除取消函数并以最新 skip 触发派发
+        g2 = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
+        g2._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g2._mock_dispatcher.dispatch.assert_not_called()
+        g2._retry_dispatch()
+        g2._mock_dispatcher.dispatch.assert_called_once_with(1)
 
     def test_single_task_crash_loop_fallback(self):
         """测试单任务队列下，多次崩溃后触发降级策略，将坏任务标记为永久失败并移出队列。"""

@@ -116,9 +116,6 @@ async def main() -> None:
         idle_restart_timeout=config.idle_restart_timeout,
     )
 
-    # 10. 任务分发器完成 Gateway 注入以消解循环引用
-    dispatcher.set_gateway(gateway)
-
     # 11. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
     app_facade = AppFacade.create(
         gateway=gateway,
@@ -172,7 +169,7 @@ async def main() -> None:
 
     # 16. 后台启动监控与首次分发
     asyncio.create_task(downstream_service.monitor_downstream())
-    dispatcher.dispatch()
+    dispatcher.dispatch(gateway.get_dispatch_skip())
 
     # 13. 等待信号并优雅清理
     try:

@@ -15,7 +15,6 @@ from gateway.shared.interfaces import (
     EventBus,
 )
 from gateway.shared.exceptions import DownstreamError
-from gateway.domain.gateway import Gateway
 from gateway.shared.events import DispatchSuccessEvent, DispatchFailedEvent
 
 logger = logging.getLogger(__name__)
@@ -37,20 +36,10 @@ class ComfyUITaskDispatcher(TaskDispatcher):
         self._queue_writer = queue_writer
         self._downstream = downstream
         self._event_bus = event_bus
-        self._gateway: Optional[Gateway] = None
         self._dispatching: bool = False
         self._exiting: bool = False
 
-    def set_gateway(self, gateway: Gateway) -> None:
-        """延迟注入领域聚合根实例。"""
-        self._gateway = gateway
-
-    @property
-    def gateway(self) -> Gateway:
-        assert self._gateway is not None, "Gateway must be set before use"
-        return self._gateway
-
-    def dispatch(self) -> None:
+    def dispatch(self, skip: Optional[int]) -> None:
         """线程安全地触发一次任务派发尝试。"""
         try:
             loop = asyncio.get_event_loop()
@@ -58,18 +47,17 @@ class ComfyUITaskDispatcher(TaskDispatcher):
             return
 
         if loop.is_running():
-            loop.call_soon_threadsafe(self._schedule_dispatch)
+            loop.call_soon_threadsafe(self._schedule_dispatch, skip)
 
-    def _schedule_dispatch(self) -> None:
-        asyncio.create_task(self._try_send_task())
+    def _schedule_dispatch(self, skip: Optional[int]) -> None:
+        asyncio.create_task(self._try_send_task(skip))
 
-    async def _try_send_task(self) -> None:
+    async def _try_send_task(self, skip: Optional[int]) -> None:
         """执行派发任务的具体副作用。"""
         if self._dispatching or self._exiting:
             return
         self._dispatching = True
         try:
-            skip = self.gateway.get_dispatch_skip()
             if skip is None:
                 return
 
