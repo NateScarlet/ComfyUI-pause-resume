@@ -109,15 +109,21 @@ class GatewayHandlers:
         if request.body_exists:
             try:
                 body = await request.json()
-                if isinstance(body, dict):
-                    body_dict = cast(Dict[str, Any], body)
-                    val = body_dict.get("restart_after_idle")
-                    if isinstance(val, bool):
-                        restart_after_idle = val
-                    elif isinstance(val, str) and val.lower() in ("1", "true", "yes"):
-                        restart_after_idle = True
             except Exception:
-                pass
+                return web.Response(status=400, text="Bad Request: Invalid JSON body")
+            if not isinstance(body, dict):
+                return web.Response(
+                    status=400, text="Bad Request: Body must be a JSON object"
+                )
+            body_dict = cast(Dict[str, Any], body)
+            val = body_dict.get("restart_after_idle")
+            if val is not None:
+                if not isinstance(val, bool):
+                    return web.Response(
+                        status=400,
+                        text="Bad Request: 'restart_after_idle' must be a boolean",
+                    )
+                restart_after_idle = val
 
         self._app.pause_queue.handle(restart_after_idle=restart_after_idle)
         return web.json_response({"status": "ok", "paused": True})
@@ -279,13 +285,13 @@ class GatewayHandlers:
 
         # 5. 拦截清空/删除操作：POST /queue (带 clear 或 delete)
         if method == "POST" and path in ("/queue", "/api/queue"):
-            body_json: Dict[str, Any] = {}
             try:
                 raw_body = await request.json()
-                if isinstance(raw_body, dict):
-                    body_json = cast(Dict[str, Any], raw_body)
             except Exception:
-                pass
+                return web.Response(status=400, text="Bad Request: Invalid JSON body")
+            body_json: Dict[str, Any] = {}
+            if isinstance(raw_body, dict):
+                body_json = cast(Dict[str, Any], raw_body)
 
             clear = bool(body_json.get("clear"))
             raw_delete = body_json.get("delete")
