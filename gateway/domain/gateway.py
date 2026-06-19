@@ -372,10 +372,6 @@ class Gateway:
                 if self._queue_writer.requeue_running_if_exists():
                     self._crash_count += 1
                     self._crashed_executing = True
-        else:
-            if self._queue_writer.requeue_running_if_exists():
-                self._crash_count += 1
-                self._crashed_executing = True
 
         self._event_bus.publish(StatusChangedEvent())
         self._refresh()

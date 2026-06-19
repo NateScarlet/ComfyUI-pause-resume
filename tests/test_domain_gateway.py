@@ -215,7 +215,9 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_downstream_crashed_decision(self):
         """测试下游物理崩溃时的重入列与尝试计数逻辑。"""
-        g = _make_gateway(paused=False)
+        running_task = MagicMock(spec=Task)
+        running_task.prompt_id = "test_task"
+        g = _make_gateway(paused=False, running_tasks=[running_task])
 
         # 模拟物理重入列成功
         g._mock_writer.requeue_running_if_exists.return_value = True
@@ -226,13 +228,12 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_writer.requeue_running_if_exists.assert_called_once()
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
 
-        # 模拟没有正在运行的任务，重入列未发生
+        # 模拟没有正在运行的任务，重入列不应被调用
         g2 = _make_gateway(paused=False)
-        g2._mock_writer.requeue_running_if_exists.return_value = False
         g2._mock_event_bus.publish(DownstreamCrashedEvent())
 
         self.assertEqual(g2._crash_count, 0)
-        g2._mock_writer.requeue_running_if_exists.assert_called_once()
+        g2._mock_writer.requeue_running_if_exists.assert_not_called()
 
     def test_idle_timeout_restart_and_cancel(self):
         """测试超时重启与定时器取消流程。"""
@@ -411,8 +412,10 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_crashed_executing_prevents_attempt_count_reset(self):
         """测试崩溃后下游重启导致的 executing=False 不会重置崩溃计数（任务尚未重新执行）。"""
+        running_task = MagicMock(spec=Task)
+        running_task.prompt_id = "test_task"
         # 必须传入 pending_count=1，否则 _refresh 时会因为队列无任务而清零 crash_count
-        g = _make_gateway(paused=False, downstream_executing=True, crash_count=0, pending_count=1)
+        g = _make_gateway(paused=False, downstream_executing=True, crash_count=0, pending_count=1, running_tasks=[running_task])
         
         # 1. 模拟崩溃：requeue 成功，增加 crash_count
         g._mock_writer.requeue_running_if_exists.return_value = True
