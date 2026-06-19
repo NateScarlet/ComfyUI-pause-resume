@@ -128,7 +128,8 @@ class TestDomainGateway(unittest.TestCase):
         self.assertFalse(g.paused)
         self.assertFalse(g._downstream_executing)
         self.assertFalse(g._downstream_ready)
-        self.assertEqual(g._attempt_count, 0)
+        self.assertEqual(g._crash_count, 0)
+        self.assertEqual(g._dispatch_skip_offset, 0)
 
     def test_pause_decision(self):
         """测试暂停时的决策流。"""
@@ -177,10 +178,10 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_power.prevent_sleep.assert_called_once()
 
         # 下游执行完毕变为空闲，重置尝试计数并触发派发
-        g2 = _make_gateway(paused=False, downstream_executing=True, attempt_count=5, pending_count=1)
+        g2 = _make_gateway(paused=False, downstream_executing=True, crash_count=5, pending_count=1)
         g2._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertFalse(g2._downstream_executing)
-        self.assertEqual(g2._attempt_count, 0)
+        self.assertEqual(g2._crash_count, 0)
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g2._mock_event_bus.published))
         g2._mock_dispatcher.dispatch.assert_called_once()
 
@@ -202,13 +203,13 @@ class TestDomainGateway(unittest.TestCase):
 
         # 永久不可恢复错误：不重试
         g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=True))
-        self.assertEqual(g._attempt_count, 0)
+        self.assertEqual(g._dispatch_skip_offset, 0)
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
 
-        # 临时错误：触发重试，累加计数
+        # 临时错误：触发重试，累加偏移
         g._mock_event_bus.published.clear()
         g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
-        self.assertEqual(g._attempt_count, 1)
+        self.assertEqual(g._dispatch_skip_offset, 1)
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
 
     def test_downstream_crashed_decision(self):
@@ -220,7 +221,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_reader.get_pending_count.return_value = 1
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
-        self.assertEqual(g._attempt_count, 1)
+        self.assertEqual(g._crash_count, 1)
         g._mock_writer.requeue_running_if_exists.assert_called_once()
         self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
 
@@ -229,7 +230,7 @@ class TestDomainGateway(unittest.TestCase):
         g2._mock_writer.requeue_running_if_exists.return_value = False
         g2._mock_event_bus.publish(DownstreamCrashedEvent())
 
-        self.assertEqual(g2._attempt_count, 0)
+        self.assertEqual(g2._crash_count, 0)
         g2._mock_writer.requeue_running_if_exists.assert_called_once()
 
     def test_idle_timeout_restart_and_cancel(self):
@@ -286,11 +287,11 @@ class TestDomainGateway(unittest.TestCase):
         self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 4：队列为空，不能分发
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=3, pending_count=0)
+        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, dispatch_skip_offset=3, pending_count=0)
         self.assertIsNone(g.get_dispatch_skip())
 
-        # 情况 5：正常派发，指定 pending_count=3 避免构造时重置 attempt_count
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=5, pending_count=3)
+        # 情况 5：正常派发，指定 pending_count=3 避免构造时重置 dispatch_skip_offset
+        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, dispatch_skip_offset=5, pending_count=3)
         skip = g.get_dispatch_skip()
         self.assertEqual(skip, 2)  # 5 % 3 = 2
 
@@ -408,21 +409,21 @@ class TestDomainGateway(unittest.TestCase):
         self.assertFalse(g3._ever_active)
 
     def test_crashed_executing_prevents_attempt_count_reset(self):
-        """测试执行中崩溃导致的 executing=False 不会重置 attempt_count。"""
-        # 必须传入 pending_count=1，否则 _refresh 时会因为队列无任务而清零 attempt_count
-        g = _make_gateway(paused=False, downstream_executing=True, attempt_count=0, pending_count=1)
+        """测试崩溃后下游重启导致的 executing=False 不会重置崩溃计数（任务尚未重新执行）。"""
+        # 必须传入 pending_count=1，否则 _refresh 时会因为队列无任务而清零 crash_count
+        g = _make_gateway(paused=False, downstream_executing=True, crash_count=0, pending_count=1)
         
-        # 1. 模拟崩溃：requeue 成功，增加 attempt_count
+        # 1. 模拟崩溃：requeue 成功，增加 crash_count
         g._mock_writer.requeue_running_if_exists.return_value = True
         g._mock_event_bus.publish(DownstreamCrashedEvent())
-        self.assertEqual(g._attempt_count, 1)
+        self.assertEqual(g._crash_count, 1)
         self.assertTrue(g._crashed_executing)
         
-        # 2. 模拟重启逻辑发布 executing = False
+        # 2. 模拟下游重启后发布 executing = False（此时 _ever_active 为 False，任务尚未重新执行）
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         
-        # 验证此时 attempt_count 依然保留为 1，崩溃标志被清空
-        self.assertEqual(g._attempt_count, 1)
+        # 验证此时 crash_count 依然保留为 1（因为 _ever_active 为 False，说明任务未完成），崩溃标志被清空
+        self.assertEqual(g._crash_count, 1)
         self.assertFalse(g._crashed_executing)
 
     def test_dispatch_failed_retry_and_cancel(self):
@@ -430,7 +431,7 @@ class TestDomainGateway(unittest.TestCase):
         # 场景 A：派发失败后，在重试触发前收到成功事件，应取消定时器
         g = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
         g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
-        self.assertEqual(g._attempt_count, 1)
+        self.assertEqual(g._dispatch_skip_offset, 1)
         g._mock_timer.start_timeout.assert_called_once_with(5.0, g._retry_dispatch)
 
         g._mock_timer_cancel.assert_not_called()
@@ -451,27 +452,27 @@ class TestDomainGateway(unittest.TestCase):
         t.prompt_id = "bad_task_123"
         g = _make_gateway(paused=False, pending_count=0, running_tasks=[t])
         
-        # 在构造后，将已尝试次数设为 2（即第3次执行前崩溃）
-        g._attempt_count = 2
+        # 在构造后，将崩溃次数设为 2（即第3次执行前崩溃）
+        g._crash_count = 2
         
         # 触发物理崩溃事件
         g._mock_event_bus.publish(DownstreamCrashedEvent())
         
-        # 确认：运行中任务被清除，尝试计数被清零，且调用了 handle_failed_task 备份
+        # 确认：运行中任务被清除，崩溃计数被清零，且调用了 handle_failed_task 备份
         g._mock_writer.clear_running.assert_called_once()
-        self.assertEqual(g._attempt_count, 0)
+        self.assertEqual(g._crash_count, 0)
         g._mock_dispatcher.handle_failed_task.assert_called_once_with(t, "Downstream crashed 3 times during execution.")
         # 确认 crashed_executing 未被设为 True
         self.assertFalse(g._crashed_executing)
 
     def test_attempt_count_reset_when_last_failed_deleted(self):
-        """测试先前派发失败的坏任务被手动删除（不再处于队列中）后，尝试计数及失败 ID 自动复位。"""
+        """测试先前派发失败的坏任务被手动删除（不再处于队列中）后，崩溃计数、派发偏移及失败 ID 自动复位。"""
         # 1. 派发失败，记录坏任务 ID
         t = MagicMock(spec=Task)
         t.prompt_id = "task_999"
         g = _make_gateway(paused=False, pending_tasks=[t], running_tasks=[t])
         g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
-        self.assertEqual(g._attempt_count, 1)
+        self.assertEqual(g._dispatch_skip_offset, 1)
         self.assertEqual(g._last_failed_task_id, "task_999")
         
         # 2. 从 pending 和 running 中将该任务彻底移除（模拟手动删除），触发队列刷新
@@ -480,8 +481,9 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_reader.get_pending_count.return_value = 0
         g._mock_event_bus.publish(QueueModifiedEvent())
         
-        # 确认尝试计数与失败 ID 被清零
-        self.assertEqual(g._attempt_count, 0)
+        # 确认崩溃计数、派发偏移与失败 ID 被清零
+        self.assertEqual(g._crash_count, 0)
+        self.assertEqual(g._dispatch_skip_offset, 0)
         self.assertIsNone(g._last_failed_task_id)
 
     def test_downstream_ready_changed_cancels_retry(self):

@@ -47,7 +47,8 @@ class Gateway:
         downstream_executing: bool = False,
         downstream_ready: bool = False,
         ever_active: bool = False,
-        attempt_count: int = 0,
+        crash_count: int = 0,
+        dispatch_skip_offset: int = 0,
     ):
         self._state_repo = state_repo
         self._queue_reader = queue_reader
@@ -67,7 +68,10 @@ class Gateway:
         # 此时该标志必须被重置为 False，直到下游下一次真正开始执行任务时才置为 True。
         self._ever_active = ever_active
 
-        self._attempt_count = attempt_count
+        # 崩溃计数：当前任务连续崩溃的次数，仅用于崩溃跳过阈值判断
+        self._crash_count = crash_count
+        # 派发跳过偏移：派发失败后跳过已失败任务的偏移量，用于 get_dispatch_skip
+        self._dispatch_skip_offset = dispatch_skip_offset
 
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
@@ -76,39 +80,55 @@ class Gateway:
         self._refreshing = False
         self._refresh_needed = False
         self._crashed_executing = False
+        self._refresh_loop_count = 0
 
         self._downstream = downstream
         self._dispatcher = dispatcher
         self._event_bus = event_bus
 
         # 领域聚合根在构造时，自己订阅感兴趣的物理与业务事件，保持高内聚
-        self._event_bus.subscribe(
-            DownstreamExecutingChangedEvent,
-            self._handle_downstream_executing_changed,
+        self._unsubscribe_callbacks: List[Callable[[], None]] = []
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                DownstreamExecutingChangedEvent,
+                self._handle_downstream_executing_changed,
+            )
         )
-        self._event_bus.subscribe(
-            DownstreamReadyChangedEvent,
-            self._handle_downstream_ready_changed,
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                DownstreamReadyChangedEvent,
+                self._handle_downstream_ready_changed,
+            )
         )
-        self._event_bus.subscribe(
-            DownstreamCrashedEvent,
-            self._handle_downstream_crashed,
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                DownstreamCrashedEvent,
+                self._handle_downstream_crashed,
+            )
         )
-        self._event_bus.subscribe(
-            QueueModifiedEvent,
-            self._handle_queue_modified,
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                QueueModifiedEvent,
+                self._handle_queue_modified,
+            )
         )
-        self._event_bus.subscribe(
-            DispatchSuccessEvent,
-            self._handle_dispatch_success,
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                DispatchSuccessEvent,
+                self._handle_dispatch_success,
+            )
         )
-        self._event_bus.subscribe(
-            DispatchFailedEvent,
-            self._handle_dispatch_failed,
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                DispatchFailedEvent,
+                self._handle_dispatch_failed,
+            )
         )
-        self._event_bus.subscribe(
-            ScriptStateChangedEvent,
-            self._handle_script_state_changed,
+        self._unsubscribe_callbacks.append(
+            self._event_bus.subscribe(
+                ScriptStateChangedEvent,
+                self._handle_script_state_changed,
+            )
         )
 
         # 初始同步阻止系统休眠和外挂脚本状态
@@ -128,14 +148,21 @@ class Gateway:
             return
         self._refreshing = True
         self._refresh_needed = False
+        self._refresh_loop_count = 0
         try:
             while True:
+                self._refresh_loop_count += 1
+                if self._refresh_loop_count > 10:
+                    # 防止异常情况下的无限重入循环
+                    break
+
                 pending_count = self._queue_reader.get_pending_count(limit=1)
                 has_pending = pending_count > 0
 
-                # 如果没有排队任务，重置尝试计数
+                # 如果没有排队任务，重置所有计数
                 if not has_pending:
-                    self._attempt_count = 0
+                    self._crash_count = 0
+                    self._dispatch_skip_offset = 0
                     self._last_failed_task_id = None
                     if self._cancel_dispatch_retry:
                         self._cancel_dispatch_retry()
@@ -146,7 +173,8 @@ class Gateway:
                     running_tasks: List[Task] = self._queue_reader.get_running()
                     active_ids = {t.prompt_id for t in pending_tasks + running_tasks}
                     if self._last_failed_task_id not in active_ids:
-                        self._attempt_count = 0
+                        self._crash_count = 0
+                        self._dispatch_skip_offset = 0
                         self._last_failed_task_id = None
 
                 is_busy = self._is_busy(has_pending)
@@ -221,11 +249,16 @@ class Gateway:
         self._restart_after_idle_on_pause = restart_after_idle
         self._state_repo.set_paused(True)
 
+        # 暂停时取消未完成的派发重试，避免在暂停期间无意义调用 dispatch
+        if self._cancel_dispatch_retry:
+            self._cancel_dispatch_retry()
+            self._cancel_dispatch_retry = None
+
         self._event_bus.publish(StateChangedEvent(paused=True))
         self._refresh()
 
-        # 如果在此之前系统已经处于空闲状态（且请求立即重启），由于 sync_infrastructure
-        # 不会重复触发 _on_idle_entered，因此我们需要在这里直接触发重启
+        # 如果此时系统已处于空闲状态，_refresh 不会触发 _on_idle_entered 转换，
+        # 因此需要在此处直接处理空闲立即重启逻辑
         if restart_after_idle and self._is_idle and self._restart_after_idle_on_pause:
             self._restart_after_idle_on_pause = False
             # 重启下游代表重启到干净状态，重置 _ever_active
@@ -238,6 +271,16 @@ class Gateway:
         self._paused = False
         self._restart_after_idle_on_pause = False
         self._state_repo.set_paused(False)
+
+        # 恢复时取消空闲超时定时器，避免在恢复后仍然空闲时触发非预期的下游重启
+        if self._cancel_idle_timeout:
+            self._cancel_idle_timeout()
+            self._cancel_idle_timeout = None
+
+        # 恢复时取消未完成的派发重试，恢复后会通过 dispatch 重新触发
+        if self._cancel_dispatch_retry:
+            self._cancel_dispatch_retry()
+            self._cancel_dispatch_retry = None
 
         self._event_bus.publish(StateChangedEvent(paused=False))
         self._refresh()
@@ -260,8 +303,13 @@ class Gateway:
             # 如果是因为崩溃导致的执行结束，不能清零失败计数，否则无法完成崩溃跳过逻辑
             if self._crashed_executing:
                 self._crashed_executing = False
+                # 如果崩溃 requeue 的任务已经重新执行并完成（_ever_active 为 True），
+                # 说明任务成功完成，应重置崩溃计数
+                if self._ever_active:
+                    self._crash_count = 0
+                    self._last_failed_task_id = None
             else:
-                self._attempt_count = 0
+                self._crash_count = 0
                 self._last_failed_task_id = None
                 self._queue_writer.clear_running()
             self._refresh()
@@ -289,12 +337,18 @@ class Gateway:
 
         if running_tasks:
             task = running_tasks[0]
+            # 如果崩溃的任务与上次失败的任务不同，重置崩溃计数（按任务隔离）
+            if (
+                self._last_failed_task_id is not None
+                and self._last_failed_task_id != task.prompt_id
+            ):
+                self._crash_count = 0
             self._last_failed_task_id = task.prompt_id
             pending_count = self._queue_reader.get_pending_count()
             # 崩溃跳过逻辑降级策略：若是单任务队列，崩溃超过阈值直接标记为永久失败
-            if pending_count == 0 and self._attempt_count >= 2:
+            if pending_count == 0 and self._crash_count >= 2:
                 self._queue_writer.clear_running()
-                self._attempt_count = 0
+                self._crash_count = 0
                 self._last_failed_task_id = None
                 self._dispatcher.handle_failed_task(
                     task, "Downstream crashed 3 times during execution."
@@ -302,11 +356,11 @@ class Gateway:
                 self._crashed_executing = False
             else:
                 if self._queue_writer.requeue_running_if_exists():
-                    self._attempt_count += 1
+                    self._crash_count += 1
                     self._crashed_executing = True
         else:
             if self._queue_writer.requeue_running_if_exists():
-                self._attempt_count += 1
+                self._crash_count += 1
                 self._crashed_executing = True
 
         self._event_bus.publish(StatusChangedEvent())
@@ -325,6 +379,7 @@ class Gateway:
 
     def _handle_dispatch_success(self, ev: DispatchSuccessEvent) -> None:
         """当派发任务成功时的业务反馈。"""
+        self._dispatch_skip_offset = 0
         if self._cancel_dispatch_retry:
             self._cancel_dispatch_retry()
             self._cancel_dispatch_retry = None
@@ -334,10 +389,15 @@ class Gateway:
         """当派发任务失败时的处理决策。"""
         self._event_bus.publish(StatusChangedEvent())
         if not ev.is_permanent:
-            self._attempt_count += 1
+            self._dispatch_skip_offset += 1
             running_tasks: List[Task] = self._queue_reader.get_running()
             if running_tasks:
                 self._last_failed_task_id = running_tasks[0].prompt_id
+            else:
+                # 如果 running 中无任务，尝试从 pending 中获取失败任务 ID
+                pending_tasks: List[Task] = self._queue_reader.get_pending()
+                if pending_tasks:
+                    self._last_failed_task_id = pending_tasks[0].prompt_id
 
             # 启动延迟重试驱动，避免瞬时网络异常引起高频无效空转
             if self._cancel_dispatch_retry:
@@ -360,7 +420,7 @@ class Gateway:
         if pending_count <= 0:
             return None
 
-        return self._attempt_count % pending_count
+        return self._dispatch_skip_offset % pending_count
 
     def _is_busy(self, has_pending: bool) -> bool:
         """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
@@ -370,3 +430,15 @@ class Gateway:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
         is_busy = self._is_busy(has_pending)
         return is_busy or scripts_running
+
+    def dispose(self) -> None:
+        """取消所有事件订阅，释放聚合根持有的引用，防止内存泄漏。"""
+        for unsubscribe in self._unsubscribe_callbacks:
+            unsubscribe()
+        self._unsubscribe_callbacks.clear()
+        if self._cancel_idle_timeout:
+            self._cancel_idle_timeout()
+            self._cancel_idle_timeout = None
+        if self._cancel_dispatch_retry:
+            self._cancel_dispatch_retry()
+            self._cancel_dispatch_retry = None
