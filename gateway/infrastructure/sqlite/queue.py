@@ -3,7 +3,7 @@ import threading
 import logging
 import time
 import json
-from typing import List, Optional, Any
+from typing import List, Optional, Tuple, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
 from gateway.shared.models import Task, RawJSON
@@ -145,6 +145,28 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                     logger.error(f"Failed to decode running task from DB: {e}")
             return tasks
 
+    def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
+        """原子地同时获取 (running, pending) 任务列表快照。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
+                "FROM tasks_v2 WHERE status IN ('running', 'pending') ORDER BY number ASC"
+            )
+            running: List[Task] = []
+            pending: List[Task] = []
+            for row in cursor.fetchall():
+                try:
+                    task = self._row_to_task(row)
+                except Exception as e:
+                    logger.error(f"Failed to decode task from DB: {e}")
+                    continue
+                if row[6] == "running":
+                    running.append(task)
+                else:
+                    pending.append(task)
+            return running, pending
+
     def get_pending_count(self, limit: Optional[int] = None) -> int:
         """获取待处理任务数量，支持 limit 以优化扫描性能。"""
         t_start = time.perf_counter()
@@ -260,6 +282,17 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 "UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'"
             )
             self._conn.commit()
+
+    def requeue_running_if_exists(self) -> bool:
+        """原子地将正在运行的任务放回队列，返回是否确实存在任务并成功放回。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'"
+            )
+            changed = cursor.rowcount > 0
+            self._conn.commit()
+            return changed
 
     def clear_running(self) -> None:
         """清空所有正在运行的任务。"""

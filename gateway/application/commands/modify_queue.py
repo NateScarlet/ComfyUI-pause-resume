@@ -16,11 +16,10 @@ class ModifyQueueCommandHandler:
         self, clear: bool = False, delete_ids: Optional[List[str]] = None
     ) -> None:
         """从物理队列中清除或清空任务，并调度同步状态。"""
-        with self._downstream_service.queue_lock:
-            if clear:
-                self._queue_writer.clear_pending()
-            if delete_ids:
-                self._queue_writer.delete_pending(delete_ids)
+        if clear:
+            self._queue_writer.clear_pending()
+        if delete_ids:
+            self._queue_writer.delete_pending(delete_ids)
 
         self._downstream_service.sync_state_to_infrastructure()
         self._downstream_service.notify_status_changed()

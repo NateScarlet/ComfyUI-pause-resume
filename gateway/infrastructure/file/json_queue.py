@@ -2,7 +2,7 @@ import os
 import json
 import threading
 import logging
-from typing import List, Optional, Set, Any
+from typing import List, Optional, Tuple, Set, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
 from gateway.shared.models import Task, RawJSON
@@ -91,6 +91,11 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             return list(self._queue_running)
 
+    def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
+        """原子地同时获取 (running, pending) 任务列表快照。"""
+        with self._lock:
+            return list(self._queue_running), list(self._pending_queue)
+
     def get_pending_count(self, limit: Optional[int] = None) -> int:
         """获取待处理任务数量，支持通过 limit 限制扫描深度以提升性能。"""
         with self._lock:
@@ -140,6 +145,18 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
                 self._queue_running.clear()
                 self._pending_queue.sort(key=lambda t: t.number)
                 self._save()
+
+    def requeue_running_if_exists(self) -> bool:
+        """原子地将正在运行的任务放回队列，返回是否确实存在任务并成功放回。"""
+        with self._lock:
+            if not self._queue_running:
+                return False
+            task = self._queue_running[0]
+            self._pending_queue.append(task)
+            self._queue_running.clear()
+            self._pending_queue.sort(key=lambda t: t.number)
+            self._save()
+            return True
 
     def clear_running(self) -> None:
         """物理清除所有正在运行状态的任务。"""

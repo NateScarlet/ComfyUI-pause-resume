@@ -30,24 +30,23 @@ class AddTaskCommandHandler:
         if prompt_id is None:
             prompt_id = str(uuid.uuid4())
 
-        with self._downstream_service.queue_lock:
-            if number is not None:
-                task_number = number
-            else:
-                task_number = float(self._queue_writer.new_task_number())
-                if front:
-                    task_number = -task_number
+        if number is not None:
+            task_number = number
+        else:
+            task_number = float(self._queue_writer.new_task_number())
+            if front:
+                task_number = -task_number
 
-            create_time = int(time.time() * 1000)
-            task = Task(
-                number=task_number,
-                prompt_id=prompt_id,
-                prompt=RawJSON(json.dumps(prompt, ensure_ascii=False)),
-                extra_data=RawJSON(json.dumps(extra_data, ensure_ascii=False)),
-                outputs_to_execute=[],
-                create_time=create_time,
-            )
-            self._queue_writer.add_task(task)
+        create_time = int(time.time() * 1000)
+        task = Task(
+            number=task_number,
+            prompt_id=prompt_id,
+            prompt=RawJSON(json.dumps(prompt, ensure_ascii=False)),
+            extra_data=RawJSON(json.dumps(extra_data, ensure_ascii=False)),
+            outputs_to_execute=[],
+            create_time=create_time,
+        )
+        self._queue_writer.add_task(task)
 
         # 触发基础设施状态同步、WebSocket 广播和尝试分发
         self._downstream_service.sync_state_to_infrastructure()

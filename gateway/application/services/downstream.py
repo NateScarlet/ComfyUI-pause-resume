@@ -59,8 +59,6 @@ class DownstreamAppService:
         self._idle_timeout_task: Optional[asyncio.Task[None]] = None
         self._dispatching: bool = False
 
-        self.queue_lock = threading.Lock()
-
         # 外部订阅状态变更事件的回调（用于解耦表示层的 SSE 和 WS 广播）
         self._ws_broadcast_callbacks: List[Callable[[], None]] = []
         self._sse_broadcast_callbacks: List[Callable[[bool], None]] = []
@@ -187,8 +185,7 @@ class DownstreamAppService:
             if skip is None:
                 return
 
-            with self.queue_lock:
-                task = self.queue_writer.pop_task(skip)
+            task = self.queue_writer.pop_task(skip)
 
             if task is None:
                 return
@@ -227,8 +224,7 @@ class DownstreamAppService:
                             )
 
                             if not should_requeue:
-                                with self.queue_lock:
-                                    self.queue_writer.clear_running()
+                                self.queue_writer.clear_running()
                                 try:
                                     self._save_failed_workflow(
                                         task, txt, body, extra_data, resp.status
@@ -238,15 +234,13 @@ class DownstreamAppService:
                                         f"Failed to save failed workflow details: {save_err}"
                                     )
                             else:
-                                with self.queue_lock:
-                                    self.queue_writer.requeue_running()
+                                self.queue_writer.requeue_running()
                             self.notify_status_changed()
             except Exception as e:
                 logger.error(f"Error sending workflow: {e}")
                 should_requeue = self.gateway.on_dispatch_failed(is_permanent=False)
                 if should_requeue:
-                    with self.queue_lock:
-                        self.queue_writer.requeue_running()
+                    self.queue_writer.requeue_running()
                 self.notify_status_changed()
         finally:
             self._dispatching = False
@@ -408,10 +402,8 @@ class DownstreamAppService:
                     f"❌ Downstream process exited unexpectedly with code {exit_code}. "
                     f"Restarting in {self.config.restart_delay_sec} seconds..."
                 )
-                with self.queue_lock:
-                    if self.queue_reader.get_running_count(limit=1) > 0:
-                        self.queue_writer.requeue_running()
-                        self.gateway.attempt_count += 1
+                if self.queue_writer.requeue_running_if_exists():
+                    self.gateway.attempt_count += 1
                 self.notify_status_changed()
                 await asyncio.sleep(self.config.restart_delay_sec)
                 await self.restart_downstream()

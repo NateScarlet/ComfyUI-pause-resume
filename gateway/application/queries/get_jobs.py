@@ -53,9 +53,7 @@ class GetJobsQueryHandler:
                 "workflow_id": workflow_id,
             }
 
-        with self._downstream_service.queue_lock:
-            running_tasks = self._queue_reader.get_running()
-            pending_tasks = self._queue_reader.get_pending()
+        running_tasks, pending_tasks = self._queue_reader.get_queue_snapshot()
 
         gateway_running_jobs = [make_job_dict(t, "in_progress") for t in running_tasks]
         gateway_pending_jobs = [make_job_dict(t, "pending") for t in pending_tasks]
@@ -167,9 +165,7 @@ class GetJobDetailQueryHandler:
 
     async def handle(self, job_id: str) -> Optional[Dict[str, Any]]:
         """从网关拦截的任务队列中查询具体任务详情。"""
-        with self._downstream_service.queue_lock:
-            running_tasks = self._queue_reader.get_running()
-            pending_tasks = self._queue_reader.get_pending()
+        running_tasks, pending_tasks = self._queue_reader.get_queue_snapshot()
 
         target_task: Optional[Task] = None
         status_str = None

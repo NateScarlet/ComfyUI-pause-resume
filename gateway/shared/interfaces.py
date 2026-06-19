@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from .models import Task
 
 
@@ -14,6 +14,11 @@ class TaskQueueReader(ABC):
     @abstractmethod
     def get_running(self) -> List[Task]:
         """获取当前正在下游执行的任务列表。"""
+        pass
+
+    @abstractmethod
+    def get_queue_snapshot(self) -> Tuple[List[Task], List[Task]]:
+        """原子地同时获取 (running, pending) 任务列表快照，保证两者来自同一时刻的一致性视图。"""
         pass
 
     @abstractmethod
@@ -48,6 +53,11 @@ class TaskQueueWriter(ABC):
     @abstractmethod
     def requeue_running(self) -> None:
         """将当前正在运行的任务退回到待处理队列（恢复其原序号位置），并清空运行状态。"""
+        pass
+
+    @abstractmethod
+    def requeue_running_if_exists(self) -> bool:
+        """原子地将正在运行的任务放回队列。返回是否确实存在正在运行的任务并成功放回。"""
         pass
 
     @abstractmethod
