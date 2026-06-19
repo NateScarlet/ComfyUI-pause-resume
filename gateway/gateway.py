@@ -40,6 +40,7 @@ class Gateway:
         self._preventing_sleep: bool = False
         self._idle_start_time: Optional[float] = None
         self._ever_active: bool = False
+        self._restart_after_idle_on_pause: bool = False
 
         # 实例化外部空闲与繁忙程序管理器
         self._program_manager = ExternalProgramManager(
@@ -95,6 +96,46 @@ class Gateway:
         data = json.dumps({"paused": self.paused})
         for q in list(self.sse_clients):
             q.put_nowait(data)
+
+    # ─── 业务方法：供 server 层调用 ────────────────────────────────
+
+    def is_idle(self) -> bool:
+        """系统是否处于闲置状态（无任务执行、无待处理、允许休眠）"""
+        return not self._preventing_sleep and self._idle_start_time is not None
+
+    def pause(self, restart_after_idle: bool = False) -> None:
+        """暂停队列，可选是否在闲置后立即重启下游 ComfyUI
+
+        若已暂停且闲置时再次以 restart_after_idle=True 调用，
+        则立即触发重启，不等待新的闲置状态。
+        """
+        if restart_after_idle and self.paused and self.is_idle():
+            logger.info(
+                "🔄 Pause-and-restart: already paused and idle, restarting now..."
+            )
+            self._restart_after_idle_on_pause = False
+            asyncio.create_task(self.restart_downstream())
+            self.broadcast_state()
+            return
+
+        self.paused = True
+        self.state_manager.set_paused(True)
+        self._restart_after_idle_on_pause = restart_after_idle
+        if restart_after_idle:
+            logger.info("⏸️ Queue Paused (will restart downstream when idle)")
+        else:
+            logger.info("⏸️ Queue Paused")
+        self.update_sleep_and_programs()
+        self.broadcast_state()
+
+    def resume(self) -> None:
+        """恢复队列"""
+        self.paused = False
+        self.state_manager.set_paused(False)
+        self._restart_after_idle_on_pause = False
+        logger.info("▶️ Queue Resumed")
+        self.update_sleep_and_programs()
+        self.broadcast_state()
 
     def broadcast_ws_status(self) -> None:
         """
@@ -269,6 +310,21 @@ class Gateway:
                     self.broadcast_ws_status()
                     await asyncio.sleep(self.config.restart_delay_sec)
                     await self.restart_downstream()
+                    continue
+
+                # 暂停后等待闲置立即重启：当系统进入闲置状态时立即触发重启
+                if (
+                    self._restart_after_idle_on_pause
+                    and not self._preventing_sleep
+                    and self._idle_start_time is not None
+                ):
+                    logger.info(
+                        "🔄 Pause-and-restart: system idle, "
+                        "restarting downstream immediately..."
+                    )
+                    self._restart_after_idle_on_pause = False
+                    await self.restart_downstream()
+                    self._idle_start_time = None
                     continue
 
                 # 检查队列空闲强制重启以释放显存/内存资源

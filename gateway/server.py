@@ -21,21 +21,31 @@ class GatewayHandlers:
         self.gateway = gateway
 
     async def handle_pause(self, request: web.Request) -> web.Response:
-        """暂停队列接口 POST /io.github.natescarlet.pause-resume/pause"""
-        self.gateway.paused = True
-        self.gateway.state_manager.set_paused(True)
-        logger.info("⏸️ Queue Paused")
-        self.gateway.update_sleep_and_programs()
-        self.gateway.broadcast_state()
+        """暂停队列接口 POST /io.github.natescarlet.pause-resume/pause
+
+        JSON body 可选参数: {"restart_after_idle": true}
+        为 true 时暂停后等系统闲置便立即重启下游 ComfyUI。
+        """
+        restart_after_idle = False
+        if request.body_exists:
+            try:
+                body: Any = await request.json()
+                if isinstance(body, dict):
+                    body_dict: Dict[str, Any] = cast(Dict[str, Any], body)
+                    val: Any = body_dict.get("restart_after_idle")
+                    if isinstance(val, bool):
+                        restart_after_idle = val
+                    elif isinstance(val, str) and val.lower() in ("1", "true", "yes"):
+                        restart_after_idle = True
+            except Exception:
+                pass
+
+        self.gateway.pause(restart_after_idle=restart_after_idle)
         return web.json_response({"status": "ok", "paused": True})
 
     async def handle_resume(self, request: web.Request) -> web.Response:
         """恢复队列接口 POST /io.github.natescarlet.pause-resume/resume"""
-        self.gateway.paused = False
-        self.gateway.state_manager.set_paused(False)
-        logger.info("▶️ Queue Resumed")
-        self.gateway.update_sleep_and_programs()
-        self.gateway.broadcast_state()
+        self.gateway.resume()
         return web.json_response({"status": "ok", "paused": False})
 
     async def handle_state(self, request: web.Request) -> web.Response:
@@ -587,12 +597,42 @@ class GatewayHandlers:
                         <script type="module">
                         import { app } from "/scripts/app.js";
 
+                        const EXT_NAMESPACE = "io.github.natescarlet.pause-resume";
+
                         app.registerExtension({
-                            name: "io.github.natescarlet.pause-resume",
+                            name: EXT_NAMESPACE,
+                            // ─── 注册命令，供 ComfyUI 快捷键系统使用 ───────────────
+                            commands: [
+                                {
+                                    id: `${EXT_NAMESPACE}.pause`,
+                                    label: "Pause Queue",
+                                    function: async () => {
+                                        await fetch(`/io.github.natescarlet.pause-resume/pause`, { method: "POST" });
+                                    },
+                                },
+                                {
+                                    id: `${EXT_NAMESPACE}.resume`,
+                                    label: "Resume Queue",
+                                    function: async () => {
+                                        await fetch(`/io.github.natescarlet.pause-resume/resume`, { method: "POST" });
+                                    },
+                                },
+                                {
+                                    id: `${EXT_NAMESPACE}.pause_and_restart`,
+                                    label: "Pause and Restart",
+                                    function: async () => {
+                                        await fetch(`/io.github.natescarlet.pause-resume/pause`, {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ restart_after_idle: true }),
+                                        });
+                                    },
+                                },
+                            ],
                             async setup() {
                                 let proxyPaused = false;
                                 let btnPause = null;
-                                
+
                                 function setButtonState(btn) {
                                     if (!btn) return;
                                     const isNewUI = !!document.getElementById('vue-app');
@@ -609,24 +649,37 @@ class GatewayHandlers:
                                     }
                                     btn.innerText = proxyPaused ? '▶️ Resume' : '⏸️ Pause';
                                 }
-                                
+
                                 function createPauseButton() {
                                     let btn = document.createElement('button');
-                                    btn.onclick = async () => {
-                                        let action = proxyPaused ? 'resume' : 'pause';
-                                        let resp = await fetch(`/io.github.natescarlet.pause-resume/${action}`, {method: 'POST'});
-                                        // 直接根据 API 响应立即更新状态，不依赖可能正在重连的 SSE
-                                        let data = await resp.json();
-                                        proxyPaused = data.paused;
-                                        setButtonState(btn);
+                                    btn.title = 'Ctrl+Click: Pause and restart when idle';
+                                    btn.onclick = async (e) => {
+                                        const ctrlPressed = e.ctrlKey || e.metaKey;
+                                        if (proxyPaused) {
+                                            let resp = await fetch(`/io.github.natescarlet.pause-resume/resume`, { method: 'POST' });
+                                            let data = await resp.json();
+                                            proxyPaused = data.paused;
+                                            setButtonState(btn);
+                                        } else {
+                                            let body = ctrlPressed ? JSON.stringify({ restart_after_idle: true }) : undefined;
+                                            let opts = { method: 'POST' };
+                                            if (body) {
+                                                opts.headers = { 'Content-Type': 'application/json' };
+                                                opts.body = body;
+                                            }
+                                            let resp = await fetch(`/io.github.natescarlet.pause-resume/pause`, opts);
+                                            let data = await resp.json();
+                                            proxyPaused = data.paused;
+                                            setButtonState(btn);
+                                        }
                                     };
-                                    
+
                                     setButtonState(btn);
                                     return btn;
                                 }
 
                                 const isNewUI = !!document.getElementById('vue-app');
-                                
+
                                 if (isNewUI) {
                                     if (app.menu && app.menu.settingsGroup && app.menu.settingsGroup.element) {
                                         btnPause = createPauseButton();
@@ -641,8 +694,11 @@ class GatewayHandlers:
                                         qMenu.appendChild(btnPause);
                                     }
                                 }
-                                
+
                                 let eventSource = null;
+                                let reconnectTimer = null;
+                                const RECONNECT_DELAY_MS = 3000;
+
                                 function connectSSE() {
                                     if (eventSource) {
                                         eventSource.close();
@@ -660,8 +716,6 @@ class GatewayHandlers:
                                         }
                                     };
                                     eventSource.onerror = () => {
-                                        // EventSource 自身会尝试自动重连，但为防止某些浏览器
-                                        // 在服务器重启后放弃重连，额外添加显式重连作为兜底
                                         if (eventSource) {
                                             eventSource.close();
                                             eventSource = null;
