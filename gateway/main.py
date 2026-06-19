@@ -66,7 +66,7 @@ async def main() -> None:
     # 3. 实例化技术持久化和工厂队列（读写接口分离）
     os.makedirs(config.data_dir, exist_ok=True)
     state_repo = SQLiteStateRepository(os.path.join(config.data_dir, "state.db"))
-    queue_reader, queue_writer = init_queue(config)
+    queue_reader, queue_writer, close_queue = init_queue(config)
 
     # 4. 实例化外部程序管理器
     process_manager = ExternalProgramManager(config.idle_program, config.busy_program)
@@ -148,6 +148,21 @@ async def main() -> None:
         logger.info("🛑 Gateway shutting down...")
         handlers.shutdown()
         await downstream_service.shutdown()
+
+        # 构建方释放自己创建的基础设施资源
+        try:
+            close_queue()
+        except Exception:
+            pass
+        try:
+            state_repo.close()
+        except Exception:
+            pass
+        try:
+            process_manager.cleanup()
+        except Exception:
+            pass
+
         try:
             await runner.cleanup()
         except Exception as e:

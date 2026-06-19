@@ -112,7 +112,3 @@ class Gateway:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
         is_busy = self.determine_busy_state(has_pending)
         return is_busy or scripts_running
-
-    def close(self) -> None:
-        """释放聚合根持有的持久化资源。"""
-        self._state_repo.close()

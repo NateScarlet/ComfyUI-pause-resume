@@ -75,11 +75,6 @@ class TaskQueueWriter(ABC):
         """按 ID 物理删除队列中的指定待处理任务。"""
         pass
 
-    @abstractmethod
-    def close(self) -> None:
-        """释放队列所占用的物理存储及连接资源。"""
-        pass
-
 
 class StateRepository(ABC):
     """负责网关运行时持久化状态（例如暂停/恢复状态）读写的仓储接口。"""
@@ -94,11 +89,6 @@ class StateRepository(ABC):
         """持久化保存网关的暂停设置状态。"""
         pass
 
-    @abstractmethod
-    def close(self) -> None:
-        """关闭仓储的物理连接资源。"""
-        pass
-
 
 class ProcessManager(ABC):
     """负责调度和管理网关在繁忙与空闲状态下需执行的外挂辅助程序（例如监控或挖矿进程）。"""
@@ -111,9 +101,4 @@ class ProcessManager(ABC):
     @abstractmethod
     def is_running(self) -> bool:
         """检测当前是否有正在运行的受控外部辅助进程。"""
-        pass
-
-    @abstractmethod
-    def cleanup(self) -> None:
-        """强制清理并终止所有由该管理器启动的外部子进程。"""
         pass

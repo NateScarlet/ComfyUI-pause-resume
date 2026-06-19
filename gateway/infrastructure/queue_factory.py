@@ -1,7 +1,7 @@
 import os
 import random
 import logging
-from typing import Tuple, Any
+from typing import Tuple, Any, Callable
 
 from gateway.config import GatewayConfig, BASE_DIR
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
@@ -22,8 +22,13 @@ def transfer_tasks(source: Any, dest: Any) -> None:
         dest.add_task(task)
 
 
-def init_queue(config: GatewayConfig) -> Tuple[TaskQueueReader, TaskQueueWriter]:
-    """根据配置初始化并实例化 TaskQueue，支持从旧的 JSON 队列数据迁移至新队列。"""
+def init_queue(
+    config: GatewayConfig,
+) -> Tuple[TaskQueueReader, TaskQueueWriter, Callable[[], None]]:
+    """根据配置初始化 TaskQueue，返回 (reader, writer, close_fn)。
+
+    close_fn 用于释放队列占用的底层资源，由构建方在关闭时调用。
+    """
     os.makedirs(config.data_dir, exist_ok=True)
 
     # 声明类型为同时实现读写接口的复合实例
@@ -58,4 +63,4 @@ def init_queue(config: GatewayConfig) -> Tuple[TaskQueueReader, TaskQueueWriter]
         except Exception as e:
             logger.error(f"❌ Migration failed: {e}")
 
-    return queue_instance, queue_instance
+    return queue_instance, queue_instance, queue_instance.close

@@ -408,24 +408,12 @@ class DownstreamAppService:
                 await asyncio.sleep(1)
 
     async def shutdown(self) -> None:
-        """优雅清理释放持有的资源与停止下游子程序。"""
+        """停止下游子程序并允许系统休眠。基础设施资源（数据库连接等）由构建方负责释放。"""
         self.exiting = True
-        self.gateway.close()
-        if self.queue_writer:
-            try:
-                self.queue_writer.close()
-            except Exception:
-                pass
         if self._process:
             try:
                 logger.info("Cleaning up downstream process...")
                 self._process.kill()
-            except Exception:
-                pass
-        if self.process_manager:
-            try:
-                logger.info("Cleaning up external programs...")
-                self.process_manager.cleanup()
             except Exception:
                 pass
         from gateway.infrastructure.system.power import PowerManagement
