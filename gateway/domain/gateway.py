@@ -90,49 +90,36 @@ class Gateway:
         self._event_bus = event_bus
 
         # 领域聚合根在构造时，自己订阅感兴趣的物理与业务事件，保持高内聚
-        self._unsubscribe_callbacks: List[Callable[[], None]] = []
-        self._unsubscribe_callbacks.append(
+        self._unsubscribe_callbacks: List[Callable[[], None]] = [
             self._event_bus.subscribe(
                 DownstreamExecutingChangedEvent,
                 self._handle_downstream_executing_changed,
-            )
-        )
-        self._unsubscribe_callbacks.append(
+            ),
             self._event_bus.subscribe(
                 DownstreamReadyChangedEvent,
                 self._handle_downstream_ready_changed,
-            )
-        )
-        self._unsubscribe_callbacks.append(
+            ),
             self._event_bus.subscribe(
                 DownstreamCrashedEvent,
                 self._handle_downstream_crashed,
-            )
-        )
-        self._unsubscribe_callbacks.append(
+            ),
             self._event_bus.subscribe(
                 QueueModifiedEvent,
                 self._handle_queue_modified,
-            )
-        )
-        self._unsubscribe_callbacks.append(
+            ),
             self._event_bus.subscribe(
                 DispatchSuccessEvent,
                 self._handle_dispatch_success,
-            )
-        )
-        self._unsubscribe_callbacks.append(
+            ),
             self._event_bus.subscribe(
                 DispatchFailedEvent,
                 self._handle_dispatch_failed,
-            )
-        )
-        self._unsubscribe_callbacks.append(
+            ),
             self._event_bus.subscribe(
                 ScriptStateChangedEvent,
                 self._handle_script_state_changed,
-            )
-        )
+            ),
+        ]
 
         # 初始同步阻止系统休眠和外挂脚本状态
         self._refresh()
