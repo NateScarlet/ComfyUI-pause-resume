@@ -256,24 +256,24 @@ class TestDomainGateway(unittest.TestCase):
     def test_calculate_dispatch_skip(self):
         """测试计算派发 skip 偏移量。"""
         # 情况 1：网关暂停，不能分发
-        g = _make_gateway(paused=True, downstream_ready=True)
-        self.assertIsNone(g.get_dispatch_skip(pending_count=10))
+        g = _make_gateway(paused=True, downstream_ready=True, pending_count=10)
+        self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 2：下游繁忙，不能分发
-        g = _make_gateway(paused=False, downstream_executing=True, downstream_ready=True)
-        self.assertIsNone(g.get_dispatch_skip(pending_count=10))
+        g = _make_gateway(paused=False, downstream_executing=True, downstream_ready=True, pending_count=10)
+        self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 3：下游未就绪，不能分发
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=False)
-        self.assertIsNone(g.get_dispatch_skip(pending_count=10))
+        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=False, pending_count=10)
+        self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 4：队列为空，不能分发
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=3)
-        self.assertIsNone(g.get_dispatch_skip(pending_count=0))
+        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=3, pending_count=0)
+        self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 5：正常派发，指定 pending_count=3 避免构造时重置 attempt_count
         g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, attempt_count=5, pending_count=3)
-        skip = g.get_dispatch_skip(pending_count=3)
+        skip = g.get_dispatch_skip()
         self.assertEqual(skip, 2)  # 5 % 3 = 2
 
     def test_determine_busy_state(self):

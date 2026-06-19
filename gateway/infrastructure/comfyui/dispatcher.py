@@ -69,8 +69,7 @@ class ComfyUITaskDispatcher(TaskDispatcher):
             return
         self._dispatching = True
         try:
-            pending_count = self._queue_reader.get_pending_count()
-            skip = self.gateway.get_dispatch_skip(pending_count)
+            skip = self.gateway.get_dispatch_skip()
             if skip is None:
                 return
 

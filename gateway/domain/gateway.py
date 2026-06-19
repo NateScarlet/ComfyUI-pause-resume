@@ -276,11 +276,12 @@ class Gateway:
         if not ev.is_permanent:
             self._attempt_count += 1
 
-    def get_dispatch_skip(self, pending_count: int) -> Optional[int]:
+    def get_dispatch_skip(self) -> Optional[int]:
         """核心派发调度决策（无副作用纯查询）。"""
         if self._paused or self._downstream_executing or not self._downstream_ready:
             return None
 
+        pending_count = self._queue_reader.get_pending_count()
         if pending_count <= 0:
             return None
 
