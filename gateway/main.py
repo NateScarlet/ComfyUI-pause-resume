@@ -24,8 +24,8 @@ from .presentation.routes import setup_routes
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
-    format="[GATEWAY] %(asctime)s %(levelname)-5s %(message)s",
-    datefmt="%H:%M:%S",
+    format="[GATEWAY] %(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
