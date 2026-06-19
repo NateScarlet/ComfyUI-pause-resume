@@ -6,5 +6,12 @@ if (Test-Path $envFile) {
 & pyright gateway/
 if ($LASTEXITCODE) {
     exit $LASTEXITCODE
-}   
+}
+& python -m unittest discover -s tests -t .
+if ($LASTEXITCODE) {
+    exit $LASTEXITCODE
+}
 & black gateway/
+if ($LASTEXITCODE) {
+    exit $LASTEXITCODE
+}
