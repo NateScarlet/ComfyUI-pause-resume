@@ -1,22 +1,25 @@
 from typing import Optional
+from gateway.shared.interfaces import StateRepository
 
 
 class Gateway:
     """网关核心业务领域的聚合根，控制网关生命周期、状态调度与决策逻辑。
 
     本类不依赖任何 I/O、HTTP 框架或操作系统底层 API，仅关注纯粹的业务状态转换。
+    持久化状态的读写通过注入的 StateRepository 抽象接口完成。
     """
 
     def __init__(
         self,
-        paused: bool,
+        state_repo: StateRepository,
         restart_after_idle_on_pause: bool = False,
         downstream_executing: bool = False,
         downstream_ready: bool = False,
         ever_active: bool = False,
         attempt_count: int = 0,
     ):
-        self.paused = paused
+        self._state_repo = state_repo
+        self.paused = state_repo.get_paused()
         self.restart_after_idle_on_pause = restart_after_idle_on_pause
         self.downstream_executing = downstream_executing
         self.downstream_ready = downstream_ready
@@ -30,6 +33,7 @@ class Gateway:
         """
         self.paused = True
         self.restart_after_idle_on_pause = restart_after_idle
+        self._state_repo.set_paused(True)
 
         if restart_after_idle and is_currently_idle:
             self.restart_after_idle_on_pause = False
@@ -40,6 +44,7 @@ class Gateway:
         """恢复队列，决策是否应当尝试向下一代发任务。"""
         self.paused = False
         self.restart_after_idle_on_pause = False
+        self._state_repo.set_paused(False)
         return True
 
     def set_downstream_executing(self, executing: bool) -> Optional[str]:
@@ -107,3 +112,7 @@ class Gateway:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
         is_busy = self.determine_busy_state(has_pending)
         return is_busy or scripts_running
+
+    def close(self) -> None:
+        """释放聚合根持有的持久化资源。"""
+        self._state_repo.close()

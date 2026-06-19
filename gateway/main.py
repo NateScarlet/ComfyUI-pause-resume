@@ -71,9 +71,8 @@ async def main() -> None:
     # 4. 实例化外部程序管理器
     process_manager = ExternalProgramManager(config.idle_program, config.busy_program)
 
-    # 5. 实例化领域模型聚合根 (Gateway)
-    initial_paused = state_repo.get_paused()
-    gateway = Gateway(paused=initial_paused)
+    # 5. 实例化领域模型聚合根 (Gateway)，从持久化仓储恢复暂停状态
+    gateway = Gateway(state_repo=state_repo)
 
     # 6. 实例化应用服务 (DownstreamAppService) 并依赖注入
     downstream_service = DownstreamAppService(
@@ -81,7 +80,6 @@ async def main() -> None:
         config=config,
         queue_reader=queue_reader,
         queue_writer=queue_writer,
-        state_repo=state_repo,
         process_manager=process_manager,
     )
 
@@ -93,7 +91,6 @@ async def main() -> None:
         gateway=gateway,
         queue_reader=queue_reader,
         queue_writer=queue_writer,
-        state_repo=state_repo,
         downstream_service=downstream_service,
     )
 

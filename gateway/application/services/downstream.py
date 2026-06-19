@@ -18,7 +18,6 @@ from gateway.shared.interfaces import (
     TaskQueueReader,
     TaskQueueWriter,
     ProcessManager,
-    StateRepository,
 )
 from gateway.domain.gateway import Gateway
 
@@ -37,14 +36,12 @@ class DownstreamAppService:
         config: GatewayConfig,
         queue_reader: TaskQueueReader,
         queue_writer: TaskQueueWriter,
-        state_repo: StateRepository,
         process_manager: ProcessManager,
     ):
         self.gateway = gateway
         self.config = config
         self.queue_reader = queue_reader
         self.queue_writer = queue_writer
-        self.state_repo = state_repo
         self.process_manager = process_manager
 
         # 运行时状态变量
@@ -413,11 +410,7 @@ class DownstreamAppService:
     async def shutdown(self) -> None:
         """优雅清理释放持有的资源与停止下游子程序。"""
         self.exiting = True
-        if self.state_repo:
-            try:
-                self.state_repo.close()
-            except Exception:
-                pass
+        self.gateway.close()
         if self.queue_writer:
             try:
                 self.queue_writer.close()

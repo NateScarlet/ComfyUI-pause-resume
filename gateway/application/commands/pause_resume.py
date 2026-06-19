@@ -1,6 +1,5 @@
 import logging
 from gateway.domain.gateway import Gateway
-from gateway.shared.interfaces import StateRepository
 from gateway.application.services.downstream import DownstreamAppService
 
 logger = logging.getLogger(__name__)
@@ -12,11 +11,9 @@ class PauseQueueCommandHandler:
     def __init__(
         self,
         gateway: Gateway,
-        state_repo: StateRepository,
         downstream_service: DownstreamAppService,
     ):
         self._gateway = gateway
-        self._state_repo = state_repo
         self._downstream_service = downstream_service
 
     def handle(self, restart_after_idle: bool = False) -> None:
@@ -27,7 +24,6 @@ class PauseQueueCommandHandler:
         is_currently_idle = not self._gateway.determine_busy_state(has_pending)
 
         decision = self._gateway.pause(restart_after_idle, is_currently_idle)
-        self._state_repo.set_paused(True)
 
         if decision == "RESTART_IMMEDIATELY":
             logger.info(
@@ -56,17 +52,14 @@ class ResumeQueueCommandHandler:
     def __init__(
         self,
         gateway: Gateway,
-        state_repo: StateRepository,
         downstream_service: DownstreamAppService,
     ):
         self._gateway = gateway
-        self._state_repo = state_repo
         self._downstream_service = downstream_service
 
     def handle(self) -> None:
         """执行恢复暂停，更新持久化状态并尝试分发派发任务。"""
         should_dispatch = self._gateway.resume()
-        self._state_repo.set_paused(False)
 
         logger.info("▶️ Queue Resumed")
 
