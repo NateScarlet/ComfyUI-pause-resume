@@ -73,6 +73,7 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     reader.get_pending_count.return_value = pending_count
     reader.get_pending.return_value = pending_tasks
     reader.get_running.return_value = running_tasks
+    reader.get_running_count.return_value = len(running_tasks)
 
     writer = MagicMock(spec=TaskQueueWriter)
     writer.requeue_running_if_exists.return_value = False

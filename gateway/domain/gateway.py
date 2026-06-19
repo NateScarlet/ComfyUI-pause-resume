@@ -142,9 +142,11 @@ class Gateway:
 
                 pending_count = self._queue_reader.get_pending_count(limit=1)
                 has_pending = pending_count > 0
+                running_count = self._queue_reader.get_running_count(limit=1)
+                has_running = running_count > 0
 
-                # 如果没有排队任务，重置所有计数
-                if not has_pending:
+                # 如果既没有排队任务也没有运行中任务，重置所有计数
+                if not has_pending and not has_running:
                     self._crash_count = 0
                     self._dispatch_skip_offset = 0
                     self._last_failed_task_id = None
