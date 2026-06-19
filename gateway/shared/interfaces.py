@@ -185,6 +185,11 @@ class TaskDispatcher(ABC):
         """尝试向下一代发任务。"""
         pass
 
+    @abstractmethod
+    def handle_failed_task(self, task: Task, error_msg: str) -> None:
+        """处理执行失败的坏任务（例如，备份至 failed_workflows 目录）。"""
+        pass
+
 
 class SystemPowerController(ABC):
     """负责控制系统电源状态（例如休眠阻止）的抽象接口。"""

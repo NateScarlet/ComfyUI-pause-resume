@@ -155,6 +155,21 @@ class ComfyUITaskDispatcher(TaskDispatcher):
         rel_failed_dir = os.path.relpath(failed_dir, BASE_DIR).replace(os.sep, "/")
         logger.info(f"💾 Failed workflow {task.prompt_id} saved to {rel_failed_dir}")
 
+    def handle_failed_task(self, task: Task, error_msg: str) -> None:
+        """处理执行失败的坏任务（备份至 failed_workflows 目录）。"""
+        try:
+            extra_data = json.loads(task.extra_data)
+            body: Dict[str, Any] = {
+                "prompt": task.prompt,
+                "prompt_id": task.prompt_id,
+                "extra_data": task.extra_data,
+            }
+            if extra_data.get("client_id"):
+                body["client_id"] = extra_data["client_id"]
+            self._save_failed_workflow(task, error_msg, body, extra_data, 500)
+        except Exception as e:
+            logger.error(f"Failed to handle failed task: {e}")
+
     def shutdown(self) -> None:
         """关闭分派器，拒绝新的派发。"""
         self._exiting = True

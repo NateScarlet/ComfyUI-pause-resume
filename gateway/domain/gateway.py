@@ -1,4 +1,4 @@
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 from gateway.shared.interfaces import (
     StateRepository,
     TaskQueueReader,
@@ -10,6 +10,7 @@ from gateway.shared.interfaces import (
     TaskDispatcher,
     EventBus,
 )
+from gateway.shared.models import Task
 from gateway.shared.events import (
     StateChangedEvent,
     StatusChangedEvent,
@@ -70,7 +71,10 @@ class Gateway:
 
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
+        self._cancel_dispatch_retry: Optional[Callable[[], None]] = None
+        self._last_failed_task_id: Optional[str] = None
         self._refreshing = False
+        self._refresh_needed = False
         self._crashed_executing = False
 
         self._downstream = downstream
@@ -109,6 +113,8 @@ class Gateway:
 
         # 初始同步阻止系统休眠和外挂脚本状态
         self._refresh()
+        self._event_bus.publish(StateChangedEvent(paused=self._paused))
+        self._event_bus.publish(StatusChangedEvent())
 
     @property
     def paused(self) -> bool:
@@ -118,39 +124,60 @@ class Gateway:
     def _refresh(self) -> None:
         """根据网关当前的业务决策，刷新阻止系统休眠、空闲重启超时与外挂脚本状态。"""
         if self._refreshing:
+            self._refresh_needed = True
             return
         self._refreshing = True
+        self._refresh_needed = False
         try:
-            pending_count = self._queue_reader.get_pending_count(limit=1)
-            has_pending = pending_count > 0
+            while True:
+                pending_count = self._queue_reader.get_pending_count(limit=1)
+                has_pending = pending_count > 0
 
-            # 如果没有排队任务，重置尝试计数
-            if not has_pending:
-                self._attempt_count = 0
+                # 如果没有排队任务，重置尝试计数
+                if not has_pending:
+                    self._attempt_count = 0
+                    self._last_failed_task_id = None
+                    if self._cancel_dispatch_retry:
+                        self._cancel_dispatch_retry()
+                        self._cancel_dispatch_retry = None
+                elif self._last_failed_task_id is not None:
+                    # 检查先前失败的任务是否已经不在队列中（例如被用户手动删除）
+                    pending_tasks: List[Task] = self._queue_reader.get_pending()
+                    running_tasks: List[Task] = self._queue_reader.get_running()
+                    active_ids = {t.prompt_id for t in pending_tasks + running_tasks}
+                    if self._last_failed_task_id not in active_ids:
+                        self._attempt_count = 0
+                        self._last_failed_task_id = None
 
-            is_busy = self._is_busy(has_pending)
+                is_busy = self._is_busy(has_pending)
 
-            # 更新空闲/繁忙外挂脚本运行状态
-            self._process_manager.update_state(is_busy, self._ever_active)
+                # 更新空闲/繁忙外挂脚本运行状态
+                self._process_manager.update_state(is_busy, self._ever_active)
 
-            # 必须在 update_state 触发运行状态变更之后，重新获取外挂脚本最新的实际运行状态，以保证后续判断基于最新数据
-            scripts_running = self._process_manager.is_running()
+                # 必须在 update_state 触发运行状态变更之后，重新获取外挂脚本最新的实际运行状态，以保证后续判断基于最新数据
+                scripts_running = self._process_manager.is_running()
 
-            should_prevent = self._should_prevent_sleep(has_pending, scripts_running)
+                should_prevent = self._should_prevent_sleep(
+                    has_pending, scripts_running
+                )
 
-            if should_prevent:
-                self._power_controller.prevent_sleep()
-            else:
-                self._power_controller.allow_sleep()
+                if should_prevent:
+                    self._power_controller.prevent_sleep()
+                else:
+                    self._power_controller.allow_sleep()
 
-            # 检测并触发进入或退出空闲状态
-            is_idle = not should_prevent
-            if is_idle and not self._is_idle:
-                self._is_idle = True
-                self._on_idle_entered()
-            elif not is_idle and self._is_idle:
-                self._is_idle = False
-                self._on_idle_exited()
+                # 检测并触发进入或退出空闲状态
+                is_idle = not should_prevent
+                if is_idle and not self._is_idle:
+                    self._is_idle = True
+                    self._on_idle_entered()
+                elif not is_idle and self._is_idle:
+                    self._is_idle = False
+                    self._on_idle_exited()
+
+                if not self._refresh_needed:
+                    break
+                self._refresh_needed = False
         finally:
             self._refreshing = False
 
@@ -180,6 +207,7 @@ class Gateway:
         """空闲超时到达时的自动重启决策。"""
         # 超时回调执行时必须进行防竞态空闲状态校验
         if not self._is_idle:
+            self._cancel_idle_timeout = None
             return
         self._cancel_idle_timeout = None
         # 重启下游代表重启到干净状态，重置 _ever_active
@@ -234,6 +262,8 @@ class Gateway:
                 self._crashed_executing = False
             else:
                 self._attempt_count = 0
+                self._last_failed_task_id = None
+                self._queue_writer.clear_running()
             self._refresh()
             self._event_bus.publish(StatusChangedEvent())
             self._dispatcher.try_dispatch()
@@ -241,17 +271,44 @@ class Gateway:
     def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
         """设置下游就绪状态，并在合适时触发派发。"""
         self._downstream_ready = ev.ready
-        if ev.ready and not self._paused:
-            self._dispatcher.try_dispatch()
+        self._refresh()
+        self._event_bus.publish(StatusChangedEvent())
+        if ev.ready:
+            if not self._paused:
+                self._dispatcher.try_dispatch()
+        else:
+            # 当下游变为不可用时，取消处于等待中的延迟重试
+            if self._cancel_dispatch_retry:
+                self._cancel_dispatch_retry()
+                self._cancel_dispatch_retry = None
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
-        if self._queue_writer.requeue_running_if_exists():
-            self._attempt_count += 1
-        # 记录崩溃导致的执行中断，以便在随后的 executing=False 事件中保留 attempt_count
-        self._crashed_executing = True
-        # 崩溃后会被重新拉起，拉起后重置为干净状态，因此将 _ever_active 设为 False
+        running_tasks: List[Task] = self._queue_reader.get_running()
         self._ever_active = False
+
+        if running_tasks:
+            task = running_tasks[0]
+            self._last_failed_task_id = task.prompt_id
+            pending_count = self._queue_reader.get_pending_count()
+            # 崩溃跳过逻辑降级策略：若是单任务队列，崩溃超过阈值直接标记为永久失败
+            if pending_count == 0 and self._attempt_count >= 2:
+                self._queue_writer.clear_running()
+                self._attempt_count = 0
+                self._last_failed_task_id = None
+                self._dispatcher.handle_failed_task(
+                    task, "Downstream crashed 3 times during execution."
+                )
+                self._crashed_executing = False
+            else:
+                if self._queue_writer.requeue_running_if_exists():
+                    self._attempt_count += 1
+                    self._crashed_executing = True
+        else:
+            if self._queue_writer.requeue_running_if_exists():
+                self._attempt_count += 1
+                self._crashed_executing = True
+
         self._event_bus.publish(StatusChangedEvent())
         self._refresh()
 
@@ -268,6 +325,9 @@ class Gateway:
 
     def _handle_dispatch_success(self, ev: DispatchSuccessEvent) -> None:
         """当派发任务成功时的业务反馈。"""
+        if self._cancel_dispatch_retry:
+            self._cancel_dispatch_retry()
+            self._cancel_dispatch_retry = None
         self._event_bus.publish(StatusChangedEvent())
 
     def _handle_dispatch_failed(self, ev: DispatchFailedEvent) -> None:
@@ -275,6 +335,16 @@ class Gateway:
         self._event_bus.publish(StatusChangedEvent())
         if not ev.is_permanent:
             self._attempt_count += 1
+            running_tasks: List[Task] = self._queue_reader.get_running()
+            if running_tasks:
+                self._last_failed_task_id = running_tasks[0].prompt_id
+
+            # 启动延迟重试驱动，避免瞬时网络异常引起高频无效空转
+            if self._cancel_dispatch_retry:
+                self._cancel_dispatch_retry()
+            self._cancel_dispatch_retry = self._timer.start_timeout(
+                5.0, self._dispatcher.try_dispatch
+            )
 
     def get_dispatch_skip(self) -> Optional[int]:
         """核心派发调度决策（无副作用纯查询）。"""

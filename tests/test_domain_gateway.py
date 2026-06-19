@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
+from gateway.shared.models import Task
 from gateway.shared.interfaces import (
     StateRepository,
     TaskQueueReader,
@@ -50,11 +51,28 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     """用 mock 的各个接口依赖快速构造测试用 Gateway。"""
     paused = kwargs.pop("paused", False)
     pending_count = kwargs.pop("pending_count", 0)
+    pending_tasks = kwargs.pop("pending_tasks", None)
+    running_tasks = kwargs.pop("running_tasks", None)
+
+    if pending_tasks is None:
+        pending_tasks = []
+        for i in range(pending_count):
+            t = MagicMock(spec=Task)
+            t.prompt_id = f"pending_id_{i}"
+            pending_tasks.append(t)
+    else:
+        pending_count = len(pending_tasks)
+
+    if running_tasks is None:
+        running_tasks = []
+
     repo = MagicMock(spec=StateRepository)
     repo.get_paused.return_value = paused
 
     reader = MagicMock(spec=TaskQueueReader)
     reader.get_pending_count.return_value = pending_count
+    reader.get_pending.return_value = pending_tasks
+    reader.get_running.return_value = running_tasks
 
     writer = MagicMock(spec=TaskQueueWriter)
     writer.requeue_running_if_exists.return_value = False
@@ -352,9 +370,9 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_pm.update_state.side_effect = mock_update_state
         g._refresh()
         
-        # 验证因为有防重入标志，mock_update_state 里的递归调用在第一层就 return 了，
-        # 所以最终 update_state 自 side_effect 设置后只额外执行了一次
-        self.assertEqual(call_count, 1)
+        # 验证因为引入了“脏标志+延迟刷新循环”模式，重入调用不会导致递归栈溢出，
+        # 而是以循环迭代的形式在当前刷新结束后依次补执行，因此会执行完所有请求（共5次调用）。
+        self.assertEqual(call_count, 5)
 
     def test_idle_timeout_state_validation(self):
         """测试在超时到达前已非空闲状态，不会触发下游重启。"""
@@ -406,6 +424,70 @@ class TestDomainGateway(unittest.TestCase):
         # 验证此时 attempt_count 依然保留为 1，崩溃标志被清空
         self.assertEqual(g._attempt_count, 1)
         self.assertFalse(g._crashed_executing)
+
+    def test_dispatch_failed_retry_and_cancel(self):
+        """测试临时派发失败会触发定时器延迟重试，且派发成功时可以取消该定时器。"""
+        # 1. 触发临时失败，确认定时器启动
+        g = _make_gateway(paused=False, pending_count=2)
+        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        self.assertEqual(g._attempt_count, 1)
+        g._mock_timer.start_timeout.assert_called_once_with(5.0, g._dispatcher.try_dispatch)
+        
+        # 2. 触发派发成功，确认定时器被取消
+        g._mock_timer_cancel.assert_not_called()
+        g._mock_event_bus.publish(DispatchSuccessEvent())
+        g._mock_timer_cancel.assert_called_once()
+
+    def test_single_task_crash_loop_fallback(self):
+        """测试单任务队列下，多次崩溃后触发降级策略，将坏任务标记为永久失败并移出队列。"""
+        # 构造网关：有 1 个正在运行的任务，0 个排队任务
+        t = MagicMock(spec=Task)
+        t.prompt_id = "bad_task_123"
+        g = _make_gateway(paused=False, pending_count=0, running_tasks=[t])
+        
+        # 在构造后，将已尝试次数设为 2（即第3次执行前崩溃）
+        g._attempt_count = 2
+        
+        # 触发物理崩溃事件
+        g._mock_event_bus.publish(DownstreamCrashedEvent())
+        
+        # 确认：运行中任务被清除，尝试计数被清零，且调用了 handle_failed_task 备份
+        g._mock_writer.clear_running.assert_called_once()
+        self.assertEqual(g._attempt_count, 0)
+        g._mock_dispatcher.handle_failed_task.assert_called_once_with(t, "Downstream crashed 3 times during execution.")
+        # 确认 crashed_executing 未被设为 True
+        self.assertFalse(g._crashed_executing)
+
+    def test_attempt_count_reset_when_last_failed_deleted(self):
+        """测试先前派发失败的坏任务被手动删除（不再处于队列中）后，尝试计数及失败 ID 自动复位。"""
+        # 1. 派发失败，记录坏任务 ID
+        t = MagicMock(spec=Task)
+        t.prompt_id = "task_999"
+        g = _make_gateway(paused=False, pending_tasks=[t], running_tasks=[t])
+        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        self.assertEqual(g._attempt_count, 1)
+        self.assertEqual(g._last_failed_task_id, "task_999")
+        
+        # 2. 从 pending 和 running 中将该任务彻底移除（模拟手动删除），触发队列刷新
+        g._mock_reader.get_pending.return_value = []
+        g._mock_reader.get_running.return_value = []
+        g._mock_reader.get_pending_count.return_value = 0
+        g._mock_event_bus.publish(QueueModifiedEvent())
+        
+        # 确认尝试计数与失败 ID 被清零
+        self.assertEqual(g._attempt_count, 0)
+        self.assertIsNone(g._last_failed_task_id)
+
+    def test_downstream_ready_changed_cancels_retry(self):
+        """测试当下游变为未就绪（offline）时，自动取消正在挂起的延迟派发重试。"""
+        g = _make_gateway(paused=False, pending_count=1)
+        g._mock_event_bus.publish(DispatchFailedEvent(is_permanent=False))
+        g._mock_timer.start_timeout.assert_called_once()
+        
+        # 下游变为未就绪
+        g._mock_timer_cancel.assert_not_called()
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=False))
+        g._mock_timer_cancel.assert_called_once()
 
 
 if __name__ == "__main__":
