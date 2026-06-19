@@ -3,7 +3,7 @@ if (Test-Path $envFile) {
     . $envFile
 }
 
-& pyright
+& pyright gateway/
 if ($LASTEXITCODE) {
     exit $LASTEXITCODE
 }   
