@@ -12,7 +12,7 @@ class StateChangedEvent:
 class StatusChangedEvent:
     """网关队列待处理或正在运行任务数量等状态发生变更的事件。"""
 
-    pass
+    queue_remaining: int
 
 
 @dataclass(frozen=True)

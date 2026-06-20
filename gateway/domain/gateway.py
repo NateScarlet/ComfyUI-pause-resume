@@ -123,7 +123,7 @@ class Gateway:
         # 初始同步阻止系统休眠和外挂脚本状态
         self._refresh()
         self._event_bus.publish(StateChangedEvent(paused=self._paused))
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
 
     @property
     def paused(self) -> bool:
@@ -321,14 +321,14 @@ class Gateway:
                 self._paused,
                 self._downstream_ready,
             )
-            self._event_bus.publish(StatusChangedEvent())
+            self._publish_status_changed()
             self._dispatcher.dispatch(skip)
 
     def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
         """设置下游就绪状态，并在合适时触发派发。"""
         self._downstream_ready = ev.ready
         self._refresh()
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
         if ev.ready:
             if not self._paused:
                 self._dispatcher.dispatch(self.get_dispatch_skip())
@@ -370,18 +370,18 @@ class Gateway:
                     self._crash_count += 1
                     self._crashed_executing = True
 
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
         self._refresh()
 
     def _handle_script_state_changed(self, ev: ScriptStateChangedEvent) -> None:
         """当外挂辅助程序状态发生变化时，决策并重新刷新阻止休眠与空闲超时等状态。"""
         self._refresh()
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
 
     def _handle_queue_modified(self, ev: QueueModifiedEvent) -> None:
         """当队列内容被修改（新任务入队、清空或删除）时的业务逻辑与副作用驱动。"""
         self._refresh()
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
         self._dispatcher.dispatch(self.get_dispatch_skip())
 
     def _handle_dispatch_success(self, ev: DispatchSuccessEvent) -> None:
@@ -390,11 +390,11 @@ class Gateway:
         if self._cancel_dispatch_retry:
             self._cancel_dispatch_retry()
             self._cancel_dispatch_retry = None
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
 
     def _handle_dispatch_failed(self, ev: DispatchFailedEvent) -> None:
         """当派发任务失败时的处理决策。"""
-        self._event_bus.publish(StatusChangedEvent())
+        self._publish_status_changed()
         if not ev.is_permanent:
             self._dispatch_skip_offset += 1
             self._last_failed_task_id = ev.task_id
@@ -430,6 +430,12 @@ class Gateway:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
         is_busy = self._is_busy(has_tasks)
         return is_busy or scripts_running
+
+    def _publish_status_changed(self) -> None:
+        """发布状态变更事件，并输出包含当前队列长度的 INFO 日志。"""
+        remaining = self._queue_reader.get_task_count()
+        logger.info("Queue status: queue_remaining=%d", remaining)
+        self._event_bus.publish(StatusChangedEvent(queue_remaining=remaining))
 
     def dispose(self) -> None:
         """取消所有事件订阅，释放聚合根持有的引用，防止内存泄漏。"""

@@ -364,16 +364,17 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_writer.requeue_running_if_exists.return_value = True
 
         # 初始化时调用过一次 _refresh（每次 _refresh 调用 get_task_count 一次）
+        # 并且触发一次 _publish_status_changed 里的 get_task_count
         initial_count_pending = g._mock_reader.get_task_count.call_count
         initial_count_running = g._mock_pm.is_running.call_count
-        self.assertEqual(initial_count_pending, 1)
+        self.assertEqual(initial_count_pending, 2)
         self.assertEqual(initial_count_running, 1)
 
         # 触发崩溃事件
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
-        # 崩溃后 _refresh 被触发，各计数应该加 1
-        self.assertEqual(g._mock_reader.get_task_count.call_count, 2)
+        # 崩溃后 _refresh 被触发，并且触发了 _publish_status_changed
+        self.assertEqual(g._mock_reader.get_task_count.call_count, 4)
         self.assertEqual(g._mock_pm.is_running.call_count, 2)
 
     def test_refresh_reentrancy_prevention(self):

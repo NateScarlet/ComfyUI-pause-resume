@@ -47,7 +47,7 @@ class GatewayHandlers:
 
         # 通过订阅 EventBus 事件来处理 WS 和 SSE 广播
         self._unsub_status = self._event_bus.subscribe(
-            StatusChangedEvent, lambda ev: self._on_ws_broadcast_triggered()
+            StatusChangedEvent, self._on_ws_broadcast_triggered
         )
         self._unsub_state = self._event_bus.subscribe(
             StateChangedEvent, lambda ev: self._on_sse_broadcast_triggered(ev.paused)
@@ -56,18 +56,22 @@ class GatewayHandlers:
         # WS 广播防抖控制变量
         self._broadcast_ws_scheduled: bool = False
         self._broadcast_ws_debounce_sec: float = 0.1
+        self._latest_queue_remaining: int = 0
 
-    def _on_ws_broadcast_triggered(self) -> None:
+    def _on_ws_broadcast_triggered(self, ev: StatusChangedEvent) -> None:
         """应用层通知：触发防抖的 WS 队列剩余数量状态广播。"""
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                loop.call_soon_threadsafe(self._schedule_broadcast_ws_status)
+                loop.call_soon_threadsafe(
+                    self._schedule_broadcast_ws_status, ev.queue_remaining
+                )
         except RuntimeError:
             pass
 
-    def _schedule_broadcast_ws_status(self) -> None:
+    def _schedule_broadcast_ws_status(self, remaining: int) -> None:
         """在事件循环中调度防抖广播逻辑。"""
+        self._latest_queue_remaining = remaining
         if self._broadcast_ws_scheduled:
             return
         self._broadcast_ws_scheduled = True
@@ -75,11 +79,14 @@ class GatewayHandlers:
         async def do_broadcast() -> None:
             await asyncio.sleep(self._broadcast_ws_debounce_sec)
             self._broadcast_ws_scheduled = False
-            remaining = self._queue_reader.get_task_count()
 
             msg = {
                 "type": "status",
-                "data": {"status": {"exec_info": {"queue_remaining": remaining}}},
+                "data": {
+                    "status": {
+                        "exec_info": {"queue_remaining": self._latest_queue_remaining}
+                    }
+                },
             }
             msg_str = json.dumps(msg)
 
