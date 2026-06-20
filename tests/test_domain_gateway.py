@@ -585,6 +585,51 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_dispatcher.dispatch.assert_called_once()
         g._mock_writer.clear_running.assert_called_once()
 
+    def test_pause_resume_cancels_restart_after_idle(self):
+        """测试 pause(restart_after_idle=True) 后立即 resume 会取消挂起的重启请求。"""
+        # 下游正在执行时暂停，并指定空闲时重启
+        g = _make_gateway(paused=False, downstream_executing=True)
+        g.pause(restart_after_idle=True)
+
+        self.assertTrue(g.paused)
+        self.assertTrue(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
+
+        # 恢复队列
+        g.resume()
+        self.assertFalse(g.paused)
+        self.assertFalse(g._restart_after_idle_on_pause)
+
+        # 模拟下游执行完成变为空闲，不应该触发重启
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        g._mock_downstream.restart.assert_not_called()
+
+    def test_pause_resume_cancels_idle_timeout_restart(self):
+        """测试 pause 后产生空闲超时定时器，resume 会取消该定时器防止非预期重启。"""
+        timer_callback = None
+        cancelled = False
+
+        def mock_start_timeout(seconds, callback):
+            nonlocal timer_callback
+            timer_callback = callback
+            def cancel():
+                nonlocal cancelled
+                cancelled = True
+            return cancel
+
+        timer = MagicMock(spec=Timer)
+        timer.start_timeout.side_effect = mock_start_timeout
+
+        # 1. 处于暂停状态，且 ever_active，会启动空闲超时定时器
+        g = _make_gateway(paused=True, ever_active=True, idle_restart_timeout=10, timer=timer)
+        self.assertTrue(g._is_idle)
+        self.assertIsNotNone(timer_callback)
+        self.assertFalse(cancelled)
+
+        # 2. 恢复队列，应该取消该空闲超时定时器
+        g.resume()
+        self.assertTrue(cancelled)
+
 
 if __name__ == "__main__":
     unittest.main()
