@@ -434,7 +434,7 @@ class Gateway:
     def _publish_status_changed(self) -> None:
         """发布状态变更事件，并输出包含当前队列长度的 INFO 日志。"""
         remaining = self._queue_reader.get_task_count()
-        logger.info("Queue status: queue_remaining=%d", remaining)
+        logger.info("Status: queue_remaining=%d", remaining)
         self._event_bus.publish(StatusChangedEvent(queue_remaining=remaining))
 
     def dispose(self) -> None:
