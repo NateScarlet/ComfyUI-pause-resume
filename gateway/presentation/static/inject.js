@@ -75,12 +75,11 @@ app.registerExtension({
       let btn = document.createElement("button");
       btn.title = "Ctrl+Click: Pause and restart when idle";
       btn.onclick = async (e) => {
-        const ctrlPressed = e.ctrlKey || e.metaKey;
         let data;
         if (paused) {
           data = await api.resume();
         } else {
-          data = await api.pause(ctrlPressed);
+          data = await api.pause(!e.shiftKey);
         }
         paused = data.paused;
         setButtonState(btn);
