@@ -25,7 +25,7 @@ start.cmd
 - `gateway/` - 代理网关的核心业务包目录
 - `gateway_data/` - 默认的数据存储目录（自动生成，可通过环境变量修改），其中包含：
   - `queue.db` - SQLite 队列数据库文件（启用 WAL 模式）
-  - `state.db` - SQLite 网关状态数据库文件，用于持久化暂停/恢复等运行状态
+  - `state.db` - SQLite 网关状态数据库文件，用于持久化暂停/恢复等运行状态和任务预估时间数据
   - `queue.json` - 传统 JSON 格式的保存队列文件（禁用 SQLite 队列时自动生成）
   - `queue.json.tmp` - 队列保存时产生的临时文件
   - `failed_workflows/` - 保存提交失败（如 400-500 错误）的任务信息的目录
@@ -45,6 +45,7 @@ start.cmd
 - `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在闲置时会自动停止）
 - `COMFYUI_QUEUE_TYPE`: 队列实现类型，支持 `sqlite`（默认值，启用 WAL 模式，推荐）或 `json`（传统 JSONFile 队列实现）
 - `COMFYUI_GATEWAY_DATA_DIR`: 网关数据存储目录（默认值 `gateway_data`，支持绝对路径或相对路径，相对路径会相对于启动脚本所在根目录解析）
+- `COMFYUI_ESTIMATION_BUCKET_CAPACITY`: 预估时间桶容量（默认 `100`），控制双桶轮换算法中每个桶的任务记录数量上限
 
 ## 技术说明
 

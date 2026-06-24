@@ -19,6 +19,23 @@ class RawJSON(str):
     pass
 
 
+@dataclass
+class TimeBucket:
+    """时间桶，用于双桶轮换算法。"""
+
+    avg_ms: int  # 平均执行时间（毫秒）
+    count: int  # 已记录的任务数量
+
+
+@dataclass
+class EstimationState:
+    """预估时间状态，包含双桶数据。"""
+
+    active: TimeBucket  # 当前有效窗口
+    staging: TimeBucket  # 新数据收集缓冲区
+    # 阶段由 active.count 推导：count < N 为初始阶段，count >= N 为轮换阶段
+
+
 @dataclass(frozen=True)
 class Task:
     """网关任务队列中的任务实体，采用不可变设计，防止并发修改。

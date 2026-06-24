@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
-from .models import Task, TaskStatus
+from .models import Task, TaskStatus, EstimationState
 
 T = TypeVar("T")
 
@@ -94,6 +94,16 @@ class StateRepository(ABC):
     @abstractmethod
     def set_paused(self, paused: bool) -> None:
         """持久化保存网关的暂停设置状态。"""
+        pass
+
+    @abstractmethod
+    def get_estimation_state(self) -> Optional[EstimationState]:
+        """获取预估时间状态，返回 None 表示无数据。"""
+        pass
+
+    @abstractmethod
+    def save_estimation_state(self, state: EstimationState) -> None:
+        """保存预估时间状态。"""
         pass
 
 

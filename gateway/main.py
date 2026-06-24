@@ -104,10 +104,18 @@ async def main() -> None:
         loop=loop,
     )
 
-    # 8. 启动时重入之前崩溃可能残留的正在运行任务（必须在实例化 Gateway 前完成）
+    # 8. 实例化预估时间服务
+    from .domain.estimation_service import EstimationService
+
+    estimation_service = EstimationService(
+        state_repo=state_repo,
+        bucket_capacity=config.estimation_bucket_capacity,
+    )
+
+    # 9. 启动时重入之前崩溃可能残留的正在运行任务（必须在实例化 Gateway 前完成）
     queue_writer.requeue_running()
 
-    # 9. 实例化领域模型聚合根 (Gateway)，直接注入所有依赖
+    # 10. 实例化领域模型聚合根 (Gateway)，直接注入所有依赖
     gateway = Gateway(
         state_repo=state_repo,
         queue_reader=queue_reader,
@@ -118,6 +126,7 @@ async def main() -> None:
         downstream=downstream_service,
         dispatcher=dispatcher,
         event_bus=event_bus,
+        estimation_service=estimation_service,
         idle_restart_timeout=config.idle_restart_timeout,
     )
 

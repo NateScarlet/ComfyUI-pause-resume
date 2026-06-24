@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -13,6 +14,7 @@ class StatusChangedEvent:
     """网关队列待处理或正在运行任务数量等状态发生变更的事件。"""
 
     queue_remaining: int
+    estimated_time_ms: Optional[int] = None  # 预估时间（毫秒）
 
 
 @dataclass(frozen=True)

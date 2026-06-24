@@ -47,6 +47,10 @@ class GatewayConfig:
         self.comfyui_extra_args = os.environ.get("COMFYUI_EXTRA_ARGS", "")
         self.proxy_host = os.environ.get("COMFYUI_HOST", "127.0.0.1")
         self.queue_type = os.environ.get("COMFYUI_QUEUE_TYPE", "sqlite").lower()
+        # 预估时间桶容量，默认100
+        self.estimation_bucket_capacity = int(
+            os.environ.get("COMFYUI_ESTIMATION_BUCKET_CAPACITY", "100")
+        )
 
         # 剥离了监听端口和地址后的，传递给下游 ComfyUI 进程的参数列表
         self.downstream_args: List[str] = []

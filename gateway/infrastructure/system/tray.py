@@ -75,6 +75,7 @@ class SystemTrayController:
 
         self._paused = app_facade.get_state.handle()
         self._queue_count = self._queue_reader.get_task_count()
+        self._estimated_time_ms: Optional[int] = None  # 预估时间（毫秒）
         self._restart_pending = False  # 是否正在等待暂停后重启
         self._icon: Optional[Any] = None
         self._thread: Optional[threading.Thread] = None
@@ -101,9 +102,24 @@ class SystemTrayController:
     def _get_current_icon(self) -> Any:
         return _icon_paused if self._paused else _icon_running
 
+    @staticmethod
+    def _format_duration(ms: int) -> str:
+        """将毫秒时间戳转换为可读格式（如 "5分30秒"）。"""
+        seconds = ms // 1000
+        minutes, secs = divmod(seconds, 60)
+        hours, mins = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours}时{mins}分{secs}秒"
+        elif minutes > 0:
+            return f"{minutes}分{secs}秒"
+        return f"{secs}秒"
+
     def _get_tooltip(self) -> str:
         state = "已暂停" if self._paused else "运行中"
-        return f"ComfyUI Gateway - {state} (队列: {self._queue_count})"
+        tooltip = f"ComfyUI Gateway - {state} (队列: {self._queue_count})"
+        if self._estimated_time_ms is not None:
+            tooltip += f" 预计: {self._format_duration(self._estimated_time_ms)}"
+        return tooltip
 
     # ── 事件回调（可能从非主线程调用，需线程安全） ──
 
@@ -121,6 +137,7 @@ class SystemTrayController:
     def on_status_changed(self, event: StatusChangedEvent) -> None:
         """响应队列数量变更事件，刷新托盘提示与菜单。"""
         self._queue_count = event.queue_remaining
+        self._estimated_time_ms = event.estimated_time_ms
         if self._icon is not None:
             self._icon.title = self._get_tooltip()
             self._icon.update_menu()
@@ -182,7 +199,10 @@ class SystemTrayController:
             return "立即重启" if self._restart_pending else "暂停后重启"
 
         def queue_text(_: Any) -> str:
-            return f"队列: {self._queue_count}"
+            text = f"队列: {self._queue_count}"
+            if self._estimated_time_ms is not None:
+                text += f" 预计: {self._format_duration(self._estimated_time_ms)}"
+            return text
 
         return pystray.Menu(
             pystray.MenuItem(queue_text, None, enabled=False),

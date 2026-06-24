@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Optional, Callable, List
 from gateway.shared.interfaces import (
     StateRepository,
@@ -23,6 +24,7 @@ from gateway.shared.events import (
     DispatchFailedEvent,
     ScriptStateChangedEvent,
 )
+from gateway.domain.estimation_service import EstimationService
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class Gateway:
         downstream: DownstreamClient,
         dispatcher: TaskDispatcher,
         event_bus: EventBus,
+        estimation_service: EstimationService,
         idle_restart_timeout: float = 0,
         restart_after_idle_on_pause: bool = False,
         downstream_executing: bool = False,
@@ -83,10 +86,12 @@ class Gateway:
         self._refreshing = False
         self._refresh_needed = False
         self._crashed_executing = False
+        self._task_start_time: Optional[int] = None  # 当前任务开始执行时间（毫秒）
 
         self._downstream = downstream
         self._dispatcher = dispatcher
         self._event_bus = event_bus
+        self._estimation_service = estimation_service
 
         # 领域聚合根在构造时，自己订阅感兴趣的物理与业务事件，保持高内聚
         self._unsubscribe_callbacks: List[Callable[[], None]] = [
@@ -295,8 +300,14 @@ class Gateway:
         if executing:
             # 只有在下游真正开始执行任务时，才将 _ever_active 设为 True
             self._ever_active = True
+            self._task_start_time = int(time.time() * 1000)
             self._refresh()
         else:
+            # 任务完成时记录执行时长（崩溃时不记录，避免污染预估数据）
+            if not self._crashed_executing and self._task_start_time is not None:
+                duration_ms = int(time.time() * 1000) - self._task_start_time
+                self._estimation_service.record_completion(duration_ms)
+            self._task_start_time = None
             # 如果是因为崩溃导致的执行结束，不能清零失败计数，否则无法完成崩溃跳过逻辑
             if self._crashed_executing:
                 self._crashed_executing = False
@@ -432,10 +443,33 @@ class Gateway:
         return is_busy or scripts_running
 
     def _publish_status_changed(self) -> None:
-        """发布状态变更事件，并输出包含当前队列长度的 INFO 日志。"""
+        """发布状态变更事件，并输出包含队列长度和预估时间的 INFO 日志。"""
         remaining = self._queue_reader.get_task_count()
-        logger.info("Status: queue_remaining=%d", remaining)
-        self._event_bus.publish(StatusChangedEvent(queue_remaining=remaining))
+        avg_ms = self._estimation_service.calculate_estimation()
+        # 计算所有剩余任务的总预估时间
+        estimated_ms = avg_ms * remaining if avg_ms is not None else None
+
+        if estimated_ms is not None:
+            seconds = estimated_ms // 1000
+            minutes, secs = divmod(seconds, 60)
+            hours, mins = divmod(minutes, 60)
+            if hours > 0:
+                time_str = f"{hours}h{mins}m{secs}s"
+            elif minutes > 0:
+                time_str = f"{minutes}m{secs}s"
+            else:
+                time_str = f"{secs}s"
+            logger.info(
+                "Status: queue_remaining=%d, estimated_time=%s", remaining, time_str
+            )
+        else:
+            logger.info("Status: queue_remaining=%d", remaining)
+
+        self._event_bus.publish(
+            StatusChangedEvent(
+                queue_remaining=remaining, estimated_time_ms=estimated_ms
+            )
+        )
 
     def dispose(self) -> None:
         """取消所有事件订阅，释放聚合根持有的引用，防止内存泄漏。"""

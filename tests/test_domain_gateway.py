@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
+from gateway.domain.estimation_service import EstimationService
 from gateway.shared.models import Task, TaskStatus
 from gateway.shared.interfaces import (
     StateRepository,
@@ -111,6 +112,10 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     downstream = MagicMock(spec=DownstreamClient)
     dispatcher = MagicMock(spec=TaskDispatcher)
     event_bus = MockEventBus()
+    
+    # 创建 mock 的 EstimationService
+    estimation_service = MagicMock(spec=EstimationService)
+    estimation_service.calculate_estimation.return_value = None
 
     g = Gateway(
         state_repo=repo,
@@ -122,6 +127,7 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
         downstream=downstream,
         dispatcher=dispatcher,
         event_bus=event_bus,
+        estimation_service=estimation_service,
         **kwargs
     )
     # 绑定 mock 物件方便后续断言
