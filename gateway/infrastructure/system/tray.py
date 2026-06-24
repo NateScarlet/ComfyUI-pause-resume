@@ -186,7 +186,9 @@ class SystemTrayController:
 
         return pystray.Menu(
             pystray.MenuItem(queue_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(pause_text, self._on_pause_resume),
             pystray.MenuItem(restart_text, self._on_restart),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", self._on_exit),
         )
