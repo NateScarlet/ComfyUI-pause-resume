@@ -14,6 +14,7 @@ from .infrastructure.queue_factory import init_queue
 from .infrastructure.system.program import ExternalProgramManager
 from .infrastructure.system.power import PowerManagement
 from .infrastructure.system.timer import AsyncioTimer
+from .infrastructure.system.tray import SystemTrayController
 from .domain.gateway import Gateway
 from .infrastructure.comfyui.downstream import ComfyUIDownstreamClient
 from .infrastructure.in_memory.event_bus import InMemoryEventBus
@@ -21,6 +22,7 @@ from .infrastructure.comfyui.dispatcher import ComfyUITaskDispatcher
 from .application.facade import AppFacade
 from .presentation.handlers import GatewayHandlers
 from .presentation.routes import setup_routes
+from .shared.events import StateChangedEvent, StatusChangedEvent
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
@@ -173,6 +175,30 @@ async def main() -> None:
     asyncio.create_task(downstream_service.monitor_downstream())
     dispatcher.dispatch(gateway.get_dispatch_skip())
 
+    # 17. 启动系统托盘控制器（如果可用）
+    tray_controller = None
+    tray_unsub_state = None
+    tray_unsub_status = None
+    try:
+        tray_controller = SystemTrayController(
+            app_facade=app_facade,
+            queue_reader=queue_reader,
+            downstream_service=downstream_service,
+            loop=loop,
+            exit_event=exit_event,
+        )
+        # 订阅事件以更新托盘状态
+        tray_unsub_state = event_bus.subscribe(
+            StateChangedEvent, tray_controller.on_state_changed
+        )
+        tray_unsub_status = event_bus.subscribe(
+            StatusChangedEvent, tray_controller.on_status_changed
+        )
+        tray_controller.start()
+        logger.info("🖥️ System tray controller started")
+    except ImportError as e:
+        logger.warning(f"System tray not available: {e}")
+
     # 13. 等待信号并优雅清理
     try:
         await exit_event.wait()
@@ -181,6 +207,13 @@ async def main() -> None:
     finally:
         logger.info("🛑 Gateway shutting down...")
         handlers.shutdown()
+        # 取消托盘事件订阅
+        if tray_unsub_state is not None:
+            tray_unsub_state()
+        if tray_unsub_status is not None:
+            tray_unsub_status()
+        if tray_controller is not None:
+            tray_controller.stop()
         await downstream_service.shutdown()
 
         # 构建方释放自己创建的基础设施资源

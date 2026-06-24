@@ -1,0 +1,7 @@
+[project]
+name = "ComfyUI-pause-resume"
+version = "0.0.1"
+requires-python = ">= 3.12"
+
+[project.optional-dependencies]
+tray = ["pystray >= 0.19.5"]
