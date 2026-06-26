@@ -15,7 +15,7 @@ from gateway.shared.interfaces import (
     EventBus,
     ProcessManager,
 )
-from gateway.shared.exceptions import DownstreamError
+from gateway.shared.exceptions import DownstreamError, DownstreamStartupTimeout
 from gateway.shared.events import (
     DownstreamExecutingChangedEvent,
     DownstreamReadyChangedEvent,
@@ -166,13 +166,20 @@ class ComfyUIDownstreamClient(DownstreamClient):
         ).start()
 
     async def wait_downstream_ready(self) -> None:
-        """以轮询 GET 的形式等待下游进程就绪。"""
-        url = f"http://127.0.0.1:{self._downstream_port}"
-        logger.info(f"⌛ Waiting for downstream service ({url})...")
+        """以轮询 GET 的形式等待下游进程就绪。
+
+        每轮循环动态构建 URL，以应对重启期间 _downstream_port 变化：
+        老 wait 会自动追随新端口，最终在新进程就绪后返回。
+        """
+        logger.info(
+            f"⌛ Waiting for downstream service (port {self._downstream_port})..."
+        )
         async with aiohttp.ClientSession() as session:
             for _ in range(300):
                 if self.exiting:
                     return
+                # 每次循环动态构建 URL，应对重启期间 port 变化
+                url = f"http://127.0.0.1:{self._downstream_port}"
                 try:
                     async with session.get(
                         url, timeout=aiohttp.ClientTimeout(total=3)
@@ -188,7 +195,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                     pass
                 await asyncio.sleep(1)
         logger.error("❌ Downstream wait timeout")
-        sys.exit(1)
+        raise DownstreamStartupTimeout("Downstream wait timeout")
 
     async def restart_downstream(self) -> None:
         """优雅关闭下游老进程并拉起新的下游。"""

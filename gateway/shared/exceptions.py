@@ -17,3 +17,9 @@ class DownstreamError(GatewayError):
         super().__init__(f"Downstream error {status_code}: {message}")
         self.status_code = status_code
         self.message = message
+
+
+class DownstreamStartupTimeout(GatewayError):
+    """等待下游进程就绪超时。"""
+
+    pass

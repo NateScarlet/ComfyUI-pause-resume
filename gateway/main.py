@@ -23,6 +23,7 @@ from .application.facade import AppFacade
 from .presentation.handlers import GatewayHandlers
 from .presentation.routes import setup_routes
 from .shared.events import StateChangedEvent, StatusChangedEvent
+from .shared.exceptions import DownstreamStartupTimeout
 
 logging.basicConfig(
     level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
@@ -158,8 +159,14 @@ async def main() -> None:
     async def bootstrap_downstream() -> None:
         if downstream_service.exiting:
             return
-        downstream_service.start_downstream()
-        await downstream_service.wait_downstream_ready()
+        try:
+            downstream_service.start_downstream()
+            await downstream_service.wait_downstream_ready()
+        except DownstreamStartupTimeout:
+            logger.error(
+                "❌ Downstream failed to start within timeout, shutting down..."
+            )
+            loop.call_soon_threadsafe(exit_event.set)
 
     asyncio.create_task(bootstrap_downstream())
 
