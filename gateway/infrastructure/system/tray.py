@@ -3,7 +3,8 @@ import threading
 from typing import Optional, Any
 
 from gateway.application.facade import AppFacade
-from gateway.shared.interfaces import DownstreamClient
+from gateway.shared.interfaces import DownstreamClient, TaskQueueReader
+from gateway.shared.models import TaskStatus
 from gateway.shared.events import StateChangedEvent, StatusChangedEvent
 
 logger = logging.getLogger(__name__)
@@ -31,16 +32,19 @@ def _create_icon(color: str) -> Any:
 
 
 _icon_running: Optional[Any] = None
+_icon_stopping: Optional[Any] = None
 _icon_paused: Optional[Any] = None
 
 
 def _ensure_icons() -> None:
     """延迟创建图标单例，避免模块导入时即依赖 Pillow。"""
-    global _icon_running, _icon_paused
+    global _icon_running, _icon_stopping, _icon_paused
     if _icon_running is None:
         _icon_running = _create_icon("#4CAF50")
+    if _icon_stopping is None:
+        _icon_stopping = _create_icon("#FFC107")
     if _icon_paused is None:
-        _icon_paused = _create_icon("#FF9800")
+        _icon_paused = _create_icon("#F44336")
 
 
 def _create_pystray_icon(icon: Any, title: str, menu: Any) -> Any:
@@ -58,7 +62,7 @@ class SystemTrayController:
     def __init__(
         self,
         app_facade: AppFacade,
-        queue_reader: Any,
+        queue_reader: TaskQueueReader,
         downstream_service: DownstreamClient,
         loop: Any,
         exit_event: Any,
@@ -214,7 +218,19 @@ class SystemTrayController:
         if original_on_taskbarcreated is not None:
             icon._on_taskbarcreated = patched_on_taskbarcreated
 
+    def _is_stopping(self) -> bool:
+        """是否处于"正在停止"过渡态：已暂停但仍有任务正在下游执行，等待其完成。
+
+        注意：仅依据队列剩余数量不足以判定，因为暂停后 PENDING 任务不会再被派发，
+        但仍会保留在队列中。真正的过渡态只由"是否仍有任务在下游执行"决定。
+        """
+        if not self._paused:
+            return False
+        return self._queue_reader.get_task_count(TaskStatus.RUNNING, limit=1) > 0
+
     def _get_current_icon(self) -> Any:
+        if self._is_stopping():
+            return _icon_stopping
         return _icon_paused if self._paused else _icon_running
 
     @staticmethod
@@ -230,7 +246,12 @@ class SystemTrayController:
         return f"{secs}秒"
 
     def _get_tooltip(self) -> str:
-        state = "已暂停" if self._paused else "运行中"
+        if self._is_stopping():
+            state = "正在停止"
+        elif self._paused:
+            state = "已暂停"
+        else:
+            state = "运行中"
         tooltip = f"ComfyUI Gateway - {state} (队列: {self._queue_count})"
         if self._estimated_time_ms is not None:
             tooltip += f" 预计: {self._format_duration(self._estimated_time_ms)}"
@@ -254,6 +275,8 @@ class SystemTrayController:
         self._queue_count = event.queue_remaining
         self._estimated_time_ms = event.estimated_time_ms
         if self._icon is not None:
+            # 队列归零会令"正在停止"过渡为"已停止"，故需同步刷新图标
+            self._icon.icon = self._get_current_icon()
             self._icon.title = self._get_tooltip()
             self._icon.update_menu()
 
