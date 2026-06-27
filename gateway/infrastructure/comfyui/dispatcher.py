@@ -92,7 +92,7 @@ class ComfyUITaskDispatcher(TaskDispatcher):
             try:
                 await self._downstream.send_prompt(task.prompt_id, body)
                 logger.info(f"📤 Sent workflow {task.prompt_id} to downstream")
-                self._event_bus.publish(DispatchSuccessEvent())
+                self._event_bus.publish(DispatchSuccessEvent(prompt_id=task.prompt_id))
             except DownstreamError as de:
                 logger.error(
                     f"Failed to send workflow {task.prompt_id}: {de.status_code} - {de.message}"

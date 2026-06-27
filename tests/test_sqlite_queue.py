@@ -26,7 +26,7 @@ class TestSQLiteQueue(unittest.TestCase):
         # 检查 user_version 是否确实升级为了 4
         cursor.execute("PRAGMA user_version")
         version = cursor.fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
 
         # 检查旧表 tasks_v2 确实已被物理删除 (或者不存在)
         cursor.execute(
@@ -89,7 +89,7 @@ class TestSQLiteQueue(unittest.TestCase):
         self.assertEqual(s1.prompt_id, "prompt-1")
         self.assertEqual(s1.status, TaskStatus.PENDING)
         self.assertEqual(s1.workflow_id, "workflow-1")
-        self.assertFalse(hasattr(s1, "extra_data"))
+        self.assertIsNotNone(s1.extra_data)
         self.assertEqual(s1.create_time, 1000)
 
         # 验证支持通过 workflow_id 进行 SQL 精确过滤
@@ -216,7 +216,7 @@ class TestSQLiteQueue(unittest.TestCase):
             # 3. 验证升级是否最终成功，且旧表已被删除，新表数据完整
             cursor = queue._conn.cursor()
             cursor.execute("PRAGMA user_version")
-            self.assertEqual(cursor.fetchone()[0], 4)
+            self.assertEqual(cursor.fetchone()[0], 5)
 
             # tasks_v2 应该被 DROP 掉了
             cursor.execute(

@@ -138,6 +138,7 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
                     status=status,
                     workflow_id=w_id,
                     create_time=t.create_time,
+                    extra_data=t.extra_data,
                 )
             )
         return result
@@ -168,6 +169,27 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
             self._pending_queue.append(task)
             self._pending_queue.sort(key=lambda t: t.number)
             self._save()
+
+    def save_task(self, task: Task) -> bool:
+        """保存任务数据实体（如果已存在则更新，如果不存在则返回 False）。"""
+        with self._lock:
+            # 1. 检查并更新 queue_running 中的任务
+            for i, t in enumerate(self._queue_running):
+                if t.prompt_id == task.prompt_id:
+                    self._queue_running[i] = task
+                    self._save()
+                    return True
+
+            # 2. 检查并更新 pending_queue 中的任务
+            for i, t in enumerate(self._pending_queue):
+                if t.prompt_id == task.prompt_id:
+                    self._pending_queue[i] = task
+                    self._pending_queue.sort(key=lambda t: t.number)
+                    self._save()
+                    return True
+
+            # 3. 不存在则直接返回 False，防止复活任务
+            return False
 
     def pop_task(self, skip: int = 0) -> Optional[Task]:
         """弹出指定偏移量的待处理任务，并将其更新标记为正在运行。"""

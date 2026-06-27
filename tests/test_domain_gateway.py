@@ -473,7 +473,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_timer.start_timeout.assert_called_once_with(5.0, g._retry_dispatch)
 
         g._mock_timer_cancel.assert_not_called()
-        g._mock_event_bus.publish(DispatchSuccessEvent())
+        g._mock_event_bus.publish(DispatchSuccessEvent(prompt_id="task_test"))
         g._mock_timer_cancel.assert_called_once()
 
         # 场景 B：重试回调触发时，应清除取消函数并以最新 skip 触发派发

@@ -51,6 +51,14 @@ class TaskSummary:
     status: TaskStatus
     workflow_id: Optional[str]
     create_time: int
+    extra_data: Optional[RawJSON] = None
+
+    # 物理下游执行反馈字段 (解耦各自独立)
+    outputs: Optional[RawJSON] = None
+    preview_output: Optional[RawJSON] = None
+    execution_start_time: Optional[float] = None
+    execution_end_time: Optional[float] = None
+    execution_error: Optional[RawJSON] = None
 
 
 @dataclass(frozen=True)
@@ -63,9 +71,17 @@ class Task:
     number: float
     prompt_id: str
     prompt: RawJSON
+    # 注意：extra_data 严禁随意添加网关内部的业务数据，否则会导致客户端在 Requeue 或导入/导出时造成严重污染。有新数据需要持久化时必须新增数据库字段。
     extra_data: RawJSON
     outputs_to_execute: Sequence[str]
     create_time: int
+
+    # 物理下游执行反馈字段 (解耦各自独立)
+    outputs: Optional[RawJSON] = None
+    preview_output: Optional[RawJSON] = None
+    execution_start_time: Optional[float] = None
+    execution_end_time: Optional[float] = None
+    execution_error: Optional[RawJSON] = None
 
     def to_list(self) -> List[Any]:
         """将当前任务实体序列化为 ComfyUI 原生 /queue 接口期望的 5 项列表格式。"""

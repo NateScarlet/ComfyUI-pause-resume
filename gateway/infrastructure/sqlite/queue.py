@@ -33,7 +33,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             cursor.execute("PRAGMA user_version")
             db_version = cursor.fetchone()[0]
 
-            SUPPORTED_VERSION = 4
+            SUPPORTED_VERSION = 5
             if db_version > SUPPORTED_VERSION:
                 raise RuntimeError(
                     f"Database version error: The database version is {db_version}, "
@@ -214,6 +214,32 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 logger.info(
                     "✅ SQLite schema migration to version 4 completed successfully."
                 )
+                db_version = 4
+            if db_version < 5:
+                logger.info(
+                    "🔧 Migrating SQLite schema to version 5: Adding execution & outputs columns..."
+                )
+                columns_to_add = [
+                    ("outputs", "TEXT"),
+                    ("preview_output", "TEXT"),
+                    ("execution_start_time", "REAL"),
+                    ("execution_end_time", "REAL"),
+                    ("execution_error", "TEXT"),
+                ]
+                for col_name, col_type in columns_to_add:
+                    try:
+                        cursor.execute(
+                            f"ALTER TABLE jobs ADD COLUMN {col_name} {col_type}"
+                        )
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column" not in str(e).lower():
+                            raise
+                cursor.execute("PRAGMA user_version = 5")
+                self._conn.commit()
+                logger.info(
+                    "✅ SQLite schema migration to version 5 completed successfully."
+                )
+                db_version = 5
 
     @staticmethod
     def _row_to_task(row: Any) -> Task:
@@ -225,6 +251,11 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             extra_data=RawJSON(row[3]),
             outputs_to_execute=json.loads(row[4]),
             create_time=row[5],
+            outputs=RawJSON(row[6]) if row[6] else None,
+            preview_output=RawJSON(row[7]) if row[7] else None,
+            execution_start_time=row[8],
+            execution_end_time=row[9],
+            execution_error=RawJSON(row[10]) if row[10] else None,
         )
 
     @staticmethod
@@ -236,6 +267,12 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             status=TaskStatus(row[2]),
             workflow_id=row[3],
             create_time=row[4],
+            extra_data=RawJSON(row[5]) if row[5] else None,
+            outputs=RawJSON(row[6]) if row[6] else None,
+            preview_output=RawJSON(row[7]) if row[7] else None,
+            execution_start_time=row[8],
+            execution_end_time=row[9],
+            execution_error=RawJSON(row[10]) if row[10] else None,
         )
 
     def get_tasks(
@@ -278,14 +315,14 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 db_params.append(offset)
 
             cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error, status "
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
             result: List[Tuple[TaskStatus, Task]] = []
             for row in cursor.fetchall():
                 task = self._row_to_task(row)
-                task_status = TaskStatus(row[6])
+                task_status = TaskStatus(row[11])
                 result.append((task_status, task))
 
             return result
@@ -329,9 +366,9 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 limit_offset_clause += " LIMIT -1 OFFSET ?"
                 db_params.append(offset)
 
-            # 查询中彻底省去了 extra_data 列，完全避免了大 JSON 文本的 I/O 损耗
+            # 查询中彻底省去了 prompt 和 outputs_to_execute 列，完全避免了大 JSON 文本的 I/O 损耗
             cursor.execute(
-                "SELECT number, id, status, workflow_id, create_time "
+                "SELECT number, id, status, workflow_id, create_time, extra_data, outputs, preview_output, execution_start_time, execution_end_time, execution_error "
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
@@ -417,7 +454,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             t_serialize = (time.perf_counter() - t_serialize_start) * 1000
 
             cursor.execute(
-                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, NULL, NULL)",
                 (
                     task.prompt_id,
                     task.number,
@@ -437,12 +474,71 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             f"serialize={t_serialize:.1f}ms commit={t_commit:.1f}ms total={t_total:.1f}ms"
         )
 
+    def save_task(self, task: Task) -> bool:
+        """保存任务数据实体（如果已存在则更新，不存在则插入）。"""
+        w_id = None
+        if task.extra_data:
+            try:
+                extra_data = json.loads(task.extra_data)
+                w_id = extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id")
+            except Exception:
+                pass
+
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT 1 FROM jobs WHERE id = ?", (task.prompt_id,))
+            exists = cursor.fetchone() is not None
+
+            outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
+
+            if exists:
+                cursor.execute(
+                    "UPDATE jobs SET number = ?, prompt = ?, extra_data = ?, workflow_id = ?, outputs_to_execute = ?, create_time = ?, outputs = ?, preview_output = ?, execution_start_time = ?, execution_end_time = ?, execution_error = ? WHERE id = ?",
+                    (
+                        task.number,
+                        task.prompt,
+                        task.extra_data,
+                        w_id,
+                        outputs_str,
+                        task.create_time,
+                        str(task.outputs) if task.outputs else None,
+                        str(task.preview_output) if task.preview_output else None,
+                        task.execution_start_time,
+                        task.execution_end_time,
+                        str(task.execution_error) if task.execution_error else None,
+                        task.prompt_id,
+                    ),
+                )
+                changed = cursor.rowcount > 0
+            else:
+                cursor.execute(
+                    "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                    (
+                        task.prompt_id,
+                        task.number,
+                        task.prompt,
+                        task.extra_data,
+                        w_id,
+                        outputs_str,
+                        task.create_time,
+                        str(task.outputs) if task.outputs else None,
+                        str(task.preview_output) if task.preview_output else None,
+                        task.execution_start_time,
+                        task.execution_end_time,
+                        str(task.execution_error) if task.execution_error else None,
+                    ),
+                )
+                changed = True
+
+            self._conn.commit()
+            return changed
+
     def pop_task(self, skip: int = 0) -> Optional[Task]:
         """弹出指定偏移量的待处理任务，并将其更新标记为正在运行。"""
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM jobs WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error FROM jobs WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
                 (skip,),
             )
             row = cursor.fetchone()
@@ -558,13 +654,13 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error, status "
                 "FROM jobs WHERE id = ?",
                 (prompt_id,),
             )
             row = cursor.fetchone()
             if row:
                 task = self._row_to_task(row)
-                task_status = TaskStatus(row[6])
+                task_status = TaskStatus(row[11])
                 return task_status, task
             return None

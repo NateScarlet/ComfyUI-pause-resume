@@ -253,6 +253,43 @@ class ComfyUIDownstreamClient(DownstreamClient):
             else:
                 await asyncio.sleep(1)
 
+    async def get_queue(self) -> Optional[Dict[str, Any]]:
+        """从下游获取原生队列数据（接口实现）。"""
+        if not self._downstream_ready:
+            return None
+        url = f"http://127.0.0.1:{self._downstream_port}/queue"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        res = await resp.json()
+                        if isinstance(res, dict):
+                            return cast(Dict[str, Any], res)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.debug(f"Error fetching /queue from downstream: {e}")
+        return None
+
+    async def get_history(
+        self, max_items: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """从下游获取原生历史数据（接口实现）。"""
+        if not self._downstream_ready:
+            return None
+        url = f"http://127.0.0.1:{self._downstream_port}/history"
+        params: Dict[str, str] = {}
+        if max_items is not None:
+            params["max_items"] = str(max_items)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        res = await resp.json()
+                        if isinstance(res, dict):
+                            return cast(Dict[str, Any], res)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.debug(f"Error fetching /history from downstream: {e}")
+        return None
+
     async def shutdown(self) -> None:
         """停止下游子程序。"""
         self.exiting = True

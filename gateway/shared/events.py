@@ -49,7 +49,7 @@ class QueueModifiedEvent:
 class DispatchSuccessEvent:
     """任务成功派发至下游 ComfyUI 的事件。"""
 
-    pass
+    prompt_id: str
 
 
 @dataclass(frozen=True)

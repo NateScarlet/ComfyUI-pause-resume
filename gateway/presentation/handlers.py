@@ -29,6 +29,44 @@ logger = logging.getLogger(__name__)
 class GatewayHandlers:
     """HTTP/SSE/WebSocket 反向代理请求处理器，承载了表示层与 web 框架的具体交互。"""
 
+    @staticmethod
+    def _parse_outputs_count(outputs_json_str: Union[str, None]) -> int:
+        """解析 outputs 字典的 JSON 字符串并扁平化计算生成资产文件数量。"""
+        if not outputs_json_str:
+            return 0
+
+        ds_outputs = json.loads(outputs_json_str)
+        if not isinstance(ds_outputs, dict):
+            raise ValueError(
+                f"Failed parsing outputs count: root of JSON outputs is not a dict, got {type(ds_outputs)}"
+            )
+
+        count = 0
+        ds_outputs_dict = cast(Dict[str, Any], ds_outputs)
+        for node_id, node_outputs in ds_outputs_dict.items():
+            if not isinstance(node_outputs, dict):
+                raise ValueError(
+                    f"Unexpected node outputs format for node '{node_id}' in presentation: expected dict, got {type(node_outputs)}"
+                )
+
+            node_outputs_dict = cast(Dict[str, Any], node_outputs)
+            for media_type, items in node_outputs_dict.items():
+                if media_type == "animated" or not isinstance(items, list):
+                    continue
+
+                for item in cast(List[Any], items):
+                    if not isinstance(item, dict):
+                        lower_filename = str(item).lower()
+                        is_3d = any(
+                            lower_filename.endswith(ext)
+                            for ext in {".obj", ".fbx", ".gltf", ".glb", ".usdz"}
+                        )
+                        if is_3d or media_type == "text":
+                            count += 1
+                        continue
+                    count += 1
+        return count
+
     def __init__(
         self,
         app: AppFacade,
@@ -384,14 +422,37 @@ class GatewayHandlers:
                 def make_job_dict(
                     summary: TaskSummary, status_str: str
                 ) -> Dict[str, Any]:
-                    return {
+                    outputs_count = 0
+                    preview_output = None
+                    execution_error = None
+
+                    outputs_count = self._parse_outputs_count(summary.outputs)
+
+                    if summary.preview_output:
+                        preview_output = json.loads(summary.preview_output)
+
+                    if summary.execution_error:
+                        execution_error = json.loads(summary.execution_error)
+
+                    # 移除不需要返回的 None 属性，降低传输开销，同时保持接口健壮性
+                    res = {
                         "id": summary.prompt_id,
                         "status": status_str,
                         "priority": summary.number,
                         "create_time": summary.create_time,
-                        "outputs_count": 0,
+                        "outputs_count": outputs_count,
                         "workflow_id": summary.workflow_id,
                     }
+                    if preview_output is not None:
+                        res["preview_output"] = preview_output
+                    if summary.execution_start_time is not None:
+                        res["execution_start_time"] = summary.execution_start_time
+                    if summary.execution_end_time is not None:
+                        res["execution_end_time"] = summary.execution_end_time
+                    if execution_error is not None:
+                        res["execution_error"] = execution_error
+
+                    return res
 
                 jobs_json: List[Dict[str, Any]] = []
                 for summary in tasks_page:
@@ -455,23 +516,57 @@ class GatewayHandlers:
                     status_str = (
                         "in_progress" if status == TaskStatus.RUNNING else status.value
                     )
-                    extra_data = json.loads(task.extra_data)
-                    extra_pnginfo = extra_data.get("extra_pnginfo", {})
-                    workflow = extra_pnginfo.get("workflow", {})
+                    extra_data: Dict[str, Any] = {}
+                    if task.extra_data:
+                        try:
+                            parsed = json.loads(task.extra_data)
+                            if isinstance(parsed, dict):
+                                extra_data = cast(Dict[str, Any], parsed)
+                        except Exception:
+                            pass
+                    extra_pnginfo = cast(
+                        Dict[str, Any], extra_data.get("extra_pnginfo", {})
+                    )
+                    workflow = cast(Dict[str, Any], extra_pnginfo.get("workflow", {}))
                     workflow_id = workflow.get("id")
+
+                    outputs_val = None
+                    if task.outputs:
+                        outputs_val = json.loads(task.outputs)
+                    outputs_count = self._parse_outputs_count(task.outputs)
+
+                    preview_output_val = None
+                    if task.preview_output:
+                        preview_output_val = json.loads(task.preview_output)
+
+                    execution_error_val = None
+                    if task.execution_error:
+                        execution_error_val = json.loads(task.execution_error)
 
                     job_detail = {
                         "id": task.prompt_id,
                         "status": status_str,
                         "priority": task.number,
                         "create_time": task.create_time,
-                        "outputs_count": 0,
+                        "outputs_count": outputs_count,
                         "workflow_id": workflow_id,
                         "workflow": {
                             "prompt": task.prompt,
                             "extra_data": task.extra_data,
                         },
                     }
+
+                    if outputs_val is not None:
+                        job_detail["outputs"] = outputs_val
+                    if preview_output_val is not None:
+                        job_detail["preview_output"] = preview_output_val
+                    if task.execution_start_time is not None:
+                        job_detail["execution_start_time"] = task.execution_start_time
+                    if task.execution_end_time is not None:
+                        job_detail["execution_end_time"] = task.execution_end_time
+                    if execution_error_val is not None:
+                        job_detail["execution_error"] = execution_error_val
+
                     return web.json_response(job_detail, dumps=raw_json_dumps)
 
         # 5. 拦截清空/删除操作：POST /queue (带 clear 或 delete)

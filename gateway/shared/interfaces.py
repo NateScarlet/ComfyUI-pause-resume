@@ -114,6 +114,14 @@ class TaskQueueWriter(ABC):
         """更新符合条件的任务的状态。"""
         pass
 
+    @abstractmethod
+    def save_task(self, task: Task) -> bool:
+        """保存任务的完整最新状态（支持新增或更新现有任务）。
+
+        如果保存（或更新）成功返回 True，否则返回 False。
+        """
+        pass
+
 
 class StateRepository(ABC):
     """负责网关运行时持久化状态（例如暂停/恢复状态）读写的仓储接口。"""
@@ -186,6 +194,18 @@ class DownstreamClient(ABC):
     @abstractmethod
     async def interrupt(self, prompt_id: Optional[str] = None) -> None:
         """向物理 ComfyUI 服务发送中断执行信号。"""
+        pass
+
+    @abstractmethod
+    async def get_queue(self) -> Optional[Dict[str, Any]]:
+        """从下游获取原生队列数据。"""
+        pass
+
+    @abstractmethod
+    async def get_history(
+        self, max_items: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """从下游获取原生历史数据。"""
         pass
 
 

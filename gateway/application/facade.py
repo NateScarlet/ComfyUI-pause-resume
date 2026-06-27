@@ -1,3 +1,4 @@
+from typing import Optional, Any
 from gateway.domain.gateway import Gateway
 from gateway.shared.interfaces import (
     TaskQueueReader,
@@ -45,6 +46,7 @@ class AppFacade:
         self.get_job_detail = get_job_detail
         self.get_job_count = get_job_count
         self.get_state = get_state
+        self._outputs_importer: Optional[Any] = None
 
     @classmethod
     def create(
@@ -56,7 +58,9 @@ class AppFacade:
         event_bus: EventBus,
     ) -> "AppFacade":
         """快速实例化门面，在内部组装所有的命令与查询处理器，极大减轻启动根的代码量。"""
-        return cls(
+        from .sync import TaskDownstreamSyncer
+
+        facade = cls(
             add_task=AddTaskCommandHandler(queue_writer, event_bus),
             pause_queue=PauseQueueCommandHandler(gateway),
             resume_queue=ResumeQueueCommandHandler(gateway),
@@ -70,3 +74,9 @@ class AppFacade:
             get_job_count=GetJobCountQueryHandler(queue_reader),
             get_state=GetStateQueryHandler(gateway),
         )
+
+        # 实例化后台同步服务，订阅事件以从下游同步省略信息及 assets
+        facade._outputs_importer = TaskDownstreamSyncer(
+            queue_reader, queue_writer, downstream_client, event_bus
+        )
+        return facade
