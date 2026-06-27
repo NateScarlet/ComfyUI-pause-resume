@@ -14,7 +14,7 @@ from gateway.shared.interfaces import (
     DownstreamClient,
     EventBus,
 )
-from gateway.shared.models import TaskStatus, Task, TaskFilters
+from gateway.shared.models import TaskStatus, TaskFilters, TaskSummary
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
 from gateway.shared.exceptions import GatewayError, TaskNotFoundError
 from gateway.application.facade import AppFacade
@@ -381,26 +381,26 @@ class GatewayHandlers:
                 # 3.5. 在表现层将 Domain Model 转换为符合 API 规范的格式并计时
                 t_format_start = time.perf_counter()
 
-                def make_job_dict(task: Task, status_str: str) -> Dict[str, Any]:
-                    extra_data = json.loads(task.extra_data)
-                    extra_pnginfo = extra_data.get("extra_pnginfo", {})
-                    workflow = extra_pnginfo.get("workflow", {})
-                    workflow_id = workflow.get("id")
+                def make_job_dict(
+                    summary: TaskSummary, status_str: str
+                ) -> Dict[str, Any]:
                     return {
-                        "id": task.prompt_id,
+                        "id": summary.prompt_id,
                         "status": status_str,
-                        "priority": task.number,
-                        "create_time": task.create_time,
+                        "priority": summary.number,
+                        "create_time": summary.create_time,
                         "outputs_count": 0,
-                        "workflow_id": workflow_id,
+                        "workflow_id": summary.workflow_id,
                     }
 
                 jobs_json: List[Dict[str, Any]] = []
-                for status, task in tasks_page:
+                for summary in tasks_page:
                     status_str = (
-                        "in_progress" if status == TaskStatus.RUNNING else status.value
+                        "in_progress"
+                        if summary.status == TaskStatus.RUNNING
+                        else summary.status.value
                     )
-                    jobs_json.append(make_job_dict(task, status_str))
+                    jobs_json.append(make_job_dict(summary, status_str))
 
                 has_more = (offset_val + len(jobs_json)) < total
 

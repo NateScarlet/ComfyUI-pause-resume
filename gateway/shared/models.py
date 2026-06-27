@@ -40,6 +40,20 @@ class EstimationState:
 
 
 @dataclass(frozen=True)
+class TaskSummary:
+    """网关任务队列中任务的轻量级摘要，用于列表页展示。
+
+    去掉了体积庞大的 prompt 和 outputs_to_execute 字段。
+    """
+
+    number: float
+    prompt_id: str
+    status: TaskStatus
+    workflow_id: Optional[str]
+    create_time: int
+
+
+@dataclass(frozen=True)
 class Task:
     """网关任务队列中的任务实体，采用不可变设计，防止并发修改。
 

@@ -4,7 +4,7 @@ import threading
 from typing import List, Optional, Tuple, Set, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters
+from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters, TaskSummary
 from gateway.shared.utils import RawJSONEncoder
 
 
@@ -103,6 +103,44 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
                 result = result[start:]
 
             return result
+
+    def get_task_summaries(
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        desc: bool = False,
+    ) -> List[TaskSummary]:
+        """获取符合条件的任务摘要列表，支持分页限制和排序方向。"""
+        tasks = self.get_tasks(
+            filter_by=filter_by,
+            limit=limit,
+            offset=offset,
+            desc=desc,
+        )
+        result: List[TaskSummary] = []
+        for status, t in tasks:
+            w_id = None
+            if t.extra_data:
+                try:
+                    extra_data = json.loads(t.extra_data)
+                    w_id = (
+                        extra_data.get("extra_pnginfo", {})
+                        .get("workflow", {})
+                        .get("id")
+                    )
+                except Exception:
+                    pass
+            result.append(
+                TaskSummary(
+                    number=t.number,
+                    prompt_id=t.prompt_id,
+                    status=status,
+                    workflow_id=w_id,
+                    create_time=t.create_time,
+                )
+            )
+        return result
 
     def get_task_count(
         self,

@@ -6,7 +6,7 @@ import json
 from typing import List, Optional, Tuple, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters
+from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters, TaskSummary
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             cursor.execute("PRAGMA user_version")
             db_version = cursor.fetchone()[0]
 
-            SUPPORTED_VERSION = 2
+            SUPPORTED_VERSION = 4
             if db_version > SUPPORTED_VERSION:
                 raise RuntimeError(
                     f"Database version error: The database version is {db_version}, "
@@ -103,6 +103,117 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
 
                 cursor.execute("PRAGMA user_version = 2")
                 self._conn.commit()
+                db_version = 2
+
+            if db_version < 3:
+                logger.info(
+                    "🔧 Migrating SQLite schema: Creating indexes on 'tasks_v2'..."
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_number ON tasks_v2 (status, number)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_number ON tasks_v2 (number)"
+                )
+                cursor.execute("PRAGMA user_version = 3")
+                self._conn.commit()
+                logger.info(
+                    "✅ SQLite schema migration to version 3 completed successfully."
+                )
+                db_version = 3
+
+            if db_version < 4:
+                logger.info(
+                    "🔧 Migrating SQLite schema to version 4: Creating 'jobs' table and migrating data..."
+                )
+                # 1. 创建全新的 jobs 表
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS jobs (
+                        id TEXT PRIMARY KEY,
+                        number INTEGER,
+                        prompt TEXT,
+                        extra_data TEXT,
+                        workflow_id TEXT,
+                        outputs_to_execute TEXT,
+                        status TEXT,
+                        create_time INTEGER
+                    )
+                """)
+
+                # 2. 创建以 job 为命名的全新索引
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_status_number ON jobs (status, number)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_number ON jobs (number)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_workflow_id ON jobs (workflow_id)"
+                )
+
+                # 3. 检查旧表 tasks_v2 是否存在并搬迁数据
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks_v2'"
+                )
+                old_table_exists = cursor.fetchone()
+
+                if old_table_exists:
+                    logger.info(
+                        "📦 Found legacy 'tasks_v2' table. Migrating data to 'jobs'..."
+                    )
+                    select_cursor = self._conn.cursor()
+                    insert_cursor = self._conn.cursor()
+                    select_cursor.execute(
+                        "SELECT id, number, prompt, extra_data, outputs_to_execute, status, create_time FROM tasks_v2"
+                    )
+                    for row in select_cursor:
+                        (
+                            task_id,
+                            number,
+                            prompt_str,
+                            extra_data_str,
+                            outputs_str,
+                            status,
+                            create_time,
+                        ) = row
+
+                        # 提取 workflow_id
+                        w_id = None
+                        if extra_data_str:
+                            try:
+                                extra_data = json.loads(extra_data_str)
+                                w_id = (
+                                    extra_data.get("extra_pnginfo", {})
+                                    .get("workflow", {})
+                                    .get("id")
+                                )
+                            except Exception:
+                                pass
+
+                        insert_cursor.execute(
+                            "INSERT OR REPLACE INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                task_id,
+                                number,
+                                prompt_str,
+                                extra_data_str,
+                                w_id,
+                                outputs_str,
+                                status,
+                                create_time,
+                            ),
+                        )
+
+                    # 4. 删除旧的 tasks_v2 表
+                    cursor.execute("DROP TABLE tasks_v2")
+                    logger.info("✅ Data migration to 'jobs' table completed.")
+
+                cursor.execute("PRAGMA user_version = 4")
+                self._conn.commit()
+                logger.info(
+                    "✅ SQLite schema migration to version 4 completed successfully."
+                )
 
     @staticmethod
     def _row_to_task(row: Any) -> Task:
@@ -114,6 +225,17 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             extra_data=RawJSON(row[3]),
             outputs_to_execute=json.loads(row[4]),
             create_time=row[5],
+        )
+
+    @staticmethod
+    def _row_to_task_summary(row: Any) -> TaskSummary:
+        """将 DB 查询出的行数据转化为不可变的 TaskSummary 实体。"""
+        return TaskSummary(
+            number=row[0],
+            prompt_id=row[1],
+            status=TaskStatus(row[2]),
+            workflow_id=row[3],
+            create_time=row[4],
         )
 
     def get_tasks(
@@ -136,62 +258,86 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                     params.extend(s.value for s in filter_by.statuses)
 
                 if filter_by.workflow_id is not None:
-                    # 数据库层粗筛：通过 LIKE 排除绝大部分数据，只反序列化可能匹配的行
-                    where_parts.append("extra_data LIKE ?")
-                    params.append(f"%{filter_by.workflow_id}%")
+                    # 直接通过 SQL 进行精确查找，完美利用索引
+                    where_parts.append("workflow_id = ?")
+                    params.append(filter_by.workflow_id)
 
             where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
             order_dir = "DESC" if desc else "ASC"
 
-            # 如果存在内存细筛（如通过 workflow_id），我们必须加载所有粗筛结果到内存，
-            # 过滤后再在 Python 内存里执行 LIMIT/OFFSET 切片。
-            # 如果没有内存细筛，直接将分页下限推给 SQL 引擎以保障极致性能。
-            has_memory_filter = (
-                filter_by is not None and filter_by.workflow_id is not None
-            )
-
             limit_offset_clause = ""
             db_params = list(params)
-            if not has_memory_filter:
-                if limit is not None:
-                    limit_offset_clause += " LIMIT ?"
-                    db_params.append(limit)
-                    if offset is not None:
-                        limit_offset_clause += " OFFSET ?"
-                        db_params.append(offset)
-                elif offset is not None:
-                    limit_offset_clause += " LIMIT -1 OFFSET ?"
+            if limit is not None:
+                limit_offset_clause += " LIMIT ?"
+                db_params.append(limit)
+                if offset is not None:
+                    limit_offset_clause += " OFFSET ?"
                     db_params.append(offset)
+            elif offset is not None:
+                limit_offset_clause += " LIMIT -1 OFFSET ?"
+                db_params.append(offset)
 
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
-                f"FROM tasks_v2 {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
+                f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
             result: List[Tuple[TaskStatus, Task]] = []
-            if not has_memory_filter:
-                for row in cursor.fetchall():
-                    task = self._row_to_task(row)
-                    task_status = TaskStatus(row[6])
-                    result.append((task_status, task))
-            else:
-                skipped = 0
-                for row in cursor:
-                    task = self._row_to_task(row)
-                    task_status = TaskStatus(row[6])
-                    # 内存细筛
-                    if filter_by is not None and not filter_by.matches(
-                        task_status, task
-                    ):
-                        continue
+            for row in cursor.fetchall():
+                task = self._row_to_task(row)
+                task_status = TaskStatus(row[6])
+                result.append((task_status, task))
 
-                    if offset is not None and skipped < offset:
-                        skipped += 1
-                        continue
+            return result
 
-                    result.append((task_status, task))
-                    if limit is not None and len(result) >= limit:
-                        break
+    def get_task_summaries(
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        desc: bool = False,
+    ) -> List[TaskSummary]:
+        """获取符合条件的任务摘要列表，支持分页限制和排序方向。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            where_parts: List[str] = []
+            params: List[Any] = []
+
+            if filter_by is not None:
+                if filter_by.statuses is not None:
+                    placeholders = ",".join("?" for _ in filter_by.statuses)
+                    where_parts.append(f"status IN ({placeholders})")
+                    params.extend(s.value for s in filter_by.statuses)
+
+                if filter_by.workflow_id is not None:
+                    # 直接通过 SQL 进行精确查找，完美利用索引
+                    where_parts.append("workflow_id = ?")
+                    params.append(filter_by.workflow_id)
+
+            where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+            order_dir = "DESC" if desc else "ASC"
+
+            limit_offset_clause = ""
+            db_params = list(params)
+            if limit is not None:
+                limit_offset_clause += " LIMIT ?"
+                db_params.append(limit)
+                if offset is not None:
+                    limit_offset_clause += " OFFSET ?"
+                    db_params.append(offset)
+            elif offset is not None:
+                limit_offset_clause += " LIMIT -1 OFFSET ?"
+                db_params.append(offset)
+
+            # 查询中彻底省去了 extra_data 列，完全避免了大 JSON 文本的 I/O 损耗
+            cursor.execute(
+                "SELECT number, id, status, workflow_id, create_time "
+                f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
+                db_params,
+            )
+            result: List[TaskSummary] = []
+            for row in cursor.fetchall():
+                result.append(self._row_to_task_summary(row))
 
             return result
 
@@ -202,42 +348,33 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
     ) -> int:
         """获取符合条件的任务数量。"""
         t_start = time.perf_counter()
-        has_memory_filter = filter_by is not None and filter_by.workflow_id is not None
+        with self._lock:
+            cursor = self._conn.cursor()
+            where_parts: List[str] = []
+            params: List[Any] = []
 
-        if not has_memory_filter:
-            with self._lock:
-                cursor = self._conn.cursor()
-                where_parts: List[str] = []
-                params: List[Any] = []
+            if filter_by is not None:
+                if filter_by.statuses is not None:
+                    placeholders = ",".join("?" for _ in filter_by.statuses)
+                    where_parts.append(f"status IN ({placeholders})")
+                    params.extend(s.value for s in filter_by.statuses)
 
-                if filter_by is not None:
-                    if filter_by.statuses is not None:
-                        placeholders = ",".join("?" for _ in filter_by.statuses)
-                        where_parts.append(f"status IN ({placeholders})")
-                        params.extend(s.value for s in filter_by.statuses)
+                if filter_by.workflow_id is not None:
+                    where_parts.append("workflow_id = ?")
+                    params.append(filter_by.workflow_id)
 
-                where_clause = (
-                    " WHERE " + " AND ".join(where_parts) if where_parts else ""
-                )
+            where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
 
-                if limit is not None:
-                    cursor.execute(
-                        f"SELECT 1 FROM tasks_v2 {where_clause} LIMIT ?",
-                        params + [limit],
-                    )
-                    result = len(cursor.fetchall())
-                else:
-                    cursor.execute(
-                        f"SELECT COUNT(*) FROM tasks_v2 {where_clause}", params
-                    )
-                    row = cursor.fetchone()
-                    result = row[0] if row else 0
-        else:
-            # 存在内存细筛时，通过 get_tasks 获取精细化过滤的任务并统计其数量
-            tasks = self.get_tasks(filter_by=filter_by)
-            result = len(tasks)
             if limit is not None:
-                result = min(result, limit)
+                cursor.execute(
+                    f"SELECT 1 FROM jobs {where_clause} LIMIT ?",
+                    params + [limit],
+                )
+                result = len(cursor.fetchall())
+            else:
+                cursor.execute(f"SELECT COUNT(*) FROM jobs {where_clause}", params)
+                row = cursor.fetchone()
+                result = row[0] if row else 0
 
         t_total = (time.perf_counter() - t_start) * 1000
         if t_total > 10:
@@ -263,6 +400,16 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
     def add_task(self, task: Task) -> None:
         """添加新任务到待处理队列中。"""
         t_start = time.perf_counter()
+
+        # 提取 workflow_id 以便写入数据库物理列
+        w_id = None
+        if task.extra_data:
+            try:
+                extra_data = json.loads(task.extra_data)
+                w_id = extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id")
+            except Exception:
+                pass
+
         with self._lock:
             cursor = self._conn.cursor()
             t_serialize_start = time.perf_counter()
@@ -270,12 +417,13 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             t_serialize = (time.perf_counter() - t_serialize_start) * 1000
 
             cursor.execute(
-                "INSERT INTO tasks_v2 (id, number, prompt, extra_data, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
                 (
                     task.prompt_id,
                     task.number,
                     task.prompt,
                     task.extra_data,
+                    w_id,
                     outputs_str,
                     task.create_time,
                 ),
@@ -294,14 +442,14 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM tasks_v2 WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time FROM jobs WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
                 (skip,),
             )
             row = cursor.fetchone()
             if row:
                 target_id = row[1]
                 cursor.execute(
-                    "UPDATE tasks_v2 SET status = 'running' WHERE id = ?", (target_id,)
+                    "UPDATE jobs SET status = 'running' WHERE id = ?", (target_id,)
                 )
                 self._conn.commit()
                 return self._row_to_task(row)
@@ -312,7 +460,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'"
+                "UPDATE jobs SET status = 'pending' WHERE status = 'running'"
             )
             self._conn.commit()
 
@@ -321,7 +469,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "UPDATE tasks_v2 SET status = 'pending' WHERE status = 'running'"
+                "UPDATE jobs SET status = 'pending' WHERE status = 'running'"
             )
             changed = cursor.rowcount > 0
             self._conn.commit()
@@ -331,14 +479,14 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         """清空所有正在运行的任务。"""
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute("DELETE FROM tasks_v2 WHERE status = 'running'")
+            cursor.execute("DELETE FROM jobs WHERE status = 'running'")
             self._conn.commit()
 
     def clear_pending(self) -> None:
         """清空所有排队待处理的任务。"""
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute("DELETE FROM tasks_v2 WHERE status = 'pending'")
+            cursor.execute("DELETE FROM jobs WHERE status = 'pending'")
             self._conn.commit()
 
     def delete_pending(self, prompt_ids: List[str]) -> None:
@@ -349,7 +497,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             cursor = self._conn.cursor()
             placeholders = ",".join("?" for _ in prompt_ids)
             cursor.execute(
-                f"DELETE FROM tasks_v2 WHERE status = 'pending' AND id IN ({placeholders})",
+                f"DELETE FROM jobs WHERE status = 'pending' AND id IN ({placeholders})",
                 tuple(prompt_ids),
             )
             self._conn.commit()
@@ -375,7 +523,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
 
             cursor.execute(
-                f"UPDATE tasks_v2 SET status = ?{where_clause}",
+                f"UPDATE jobs SET status = ?{where_clause}",
                 [new_status.value] + params,
             )
             changed = cursor.rowcount > 0
@@ -395,7 +543,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         )
         cursor = self._conn.cursor()
         cursor.execute(
-            "DELETE FROM tasks_v2 WHERE status IN ('completed', 'failed', 'cancelled') AND create_time < ?",
+            "DELETE FROM jobs WHERE status IN ('completed', 'failed', 'cancelled') AND create_time < ?",
             (expire_time,),
         )
         self._conn.commit()
@@ -411,7 +559,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             cursor = self._conn.cursor()
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
-                "FROM tasks_v2 WHERE id = ?",
+                "FROM jobs WHERE id = ?",
                 (prompt_id,),
             )
             row = cursor.fetchone()

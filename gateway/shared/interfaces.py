@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
-from .models import Task, TaskStatus, EstimationState, TaskFilters
+from .models import Task, TaskStatus, EstimationState, TaskFilters, TaskSummary
 
 T = TypeVar("T")
 
@@ -33,6 +33,17 @@ class TaskQueueReader(ABC):
         desc: bool = False,
     ) -> List[Tuple[TaskStatus, Task]]:
         """获取符合筛选条件的任务列表，支持分页限制和排序方向。"""
+        pass
+
+    @abstractmethod
+    def get_task_summaries(
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        desc: bool = False,
+    ) -> List[TaskSummary]:
+        """获取符合筛选条件的任务摘要列表，支持分页限制和排序方向。"""
         pass
 
     @abstractmethod

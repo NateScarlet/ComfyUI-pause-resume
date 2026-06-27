@@ -1,6 +1,6 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from gateway.shared.interfaces import TaskQueueReader
-from gateway.shared.models import Task, TaskStatus, TaskFilters
+from gateway.shared.models import TaskFilters, TaskSummary
 
 
 class GetJobsQueryHandler:
@@ -16,9 +16,9 @@ class GetJobsQueryHandler:
         limit: Optional[int] = None,
         offset: int = 0,
         desc: bool = True,
-    ) -> List[Tuple[TaskStatus, Task]]:
+    ) -> List[TaskSummary]:
         """从网关本地队列中获取历史任务，支持排序、过滤和分页展示。"""
-        return self._queue_reader.get_tasks(
+        return self._queue_reader.get_task_summaries(
             filter_by=filter_by,
             limit=limit,
             offset=offset,
