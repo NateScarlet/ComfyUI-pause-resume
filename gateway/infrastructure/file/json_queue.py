@@ -4,7 +4,7 @@ import threading
 from typing import List, Optional, Tuple, Set, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON, TaskStatus
+from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters
 from gateway.shared.utils import RawJSONEncoder
 
 
@@ -73,29 +73,46 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
         os.replace(temp_file, self._queue_file)
 
     def get_tasks(
-        self, status: Optional[TaskStatus] = None
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        desc: bool = False,
     ) -> List[Tuple[TaskStatus, Task]]:
-        """获取指定状态的任务列表，每项附带状态标记；status=None 时返回全部任务。"""
+        """获取符合条件的任务列表，支持分页限制和排序方向。"""
         with self._lock:
             result: List[Tuple[TaskStatus, Task]] = []
-            if status is None or status == TaskStatus.RUNNING:
+            statuses = filter_by.statuses if filter_by is not None else None
+            if statuses is None or TaskStatus.RUNNING in statuses:
                 result.extend((TaskStatus.RUNNING, t) for t in self._queue_running)
-            if status is None or status == TaskStatus.PENDING:
+            if statuses is None or TaskStatus.PENDING in statuses:
                 result.extend((TaskStatus.PENDING, t) for t in self._pending_queue)
+
+            if filter_by is not None:
+                result = [
+                    item for item in result if filter_by.matches(item[0], item[1])
+                ]
+
+            if desc:
+                result.reverse()
+
+            start = offset if offset is not None else 0
+            if limit is not None:
+                result = result[start : start + limit]
+            elif offset is not None:
+                result = result[start:]
+
             return result
 
     def get_task_count(
-        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
     ) -> int:
-        """获取指定状态的任务数量；status=None 时返回全部任务数量。"""
+        """获取符合条件的任务数量。"""
         with self._lock:
-            if status is None:
-                cnt = len(self._pending_queue) + len(self._queue_running)
-            elif status == TaskStatus.PENDING:
-                cnt = len(self._pending_queue)
-            else:
-                cnt = len(self._queue_running)
-
+            tasks = self.get_tasks(filter_by=filter_by)
+            cnt = len(tasks)
             if limit is not None:
                 return min(cnt, limit)
             return cnt
@@ -166,6 +183,94 @@ class JSONFileQueue(TaskQueueReader, TaskQueueWriter):
                 t for t in self._pending_queue if t.prompt_id not in to_delete
             ]
             self._save()
+
+    def update_task_status(
+        self,
+        new_status: TaskStatus,
+        prompt_id: Optional[str] = None,
+        filter_status: Optional[TaskStatus] = None,
+    ) -> bool:
+        """更新指定任务的状态。对于已完成/已失败/已取消任务直接丢弃。"""
+        with self._lock:
+            changed = False
+            if new_status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
+                original_running_len = len(self._queue_running)
+                self._queue_running = [
+                    t
+                    for t in self._queue_running
+                    if not (
+                        (prompt_id is None or t.prompt_id == prompt_id)
+                        and (
+                            filter_status is None or filter_status == TaskStatus.RUNNING
+                        )
+                    )
+                ]
+                if len(self._queue_running) != original_running_len:
+                    changed = True
+
+                original_pending_len = len(self._pending_queue)
+                self._pending_queue = [
+                    t
+                    for t in self._pending_queue
+                    if not (
+                        (prompt_id is None or t.prompt_id == prompt_id)
+                        and (
+                            filter_status is None or filter_status == TaskStatus.PENDING
+                        )
+                    )
+                ]
+                if len(self._pending_queue) != original_pending_len:
+                    changed = True
+
+                if changed:
+                    self._save()
+            elif new_status == TaskStatus.RUNNING:
+                matched_tasks: List[Task] = []
+                new_pending: List[Task] = []
+                for t in self._pending_queue:
+                    if (prompt_id is None or t.prompt_id == prompt_id) and (
+                        filter_status is None or filter_status == TaskStatus.PENDING
+                    ):
+                        matched_tasks.append(t)
+                    else:
+                        new_pending.append(t)
+                if matched_tasks:
+                    self._pending_queue = new_pending
+                    self._queue_running = [matched_tasks[0]]
+                    self._save()
+                    changed = True
+            elif new_status == TaskStatus.PENDING:
+                matched_tasks: List[Task] = []
+                new_running: List[Task] = []
+                for t in self._queue_running:
+                    if (prompt_id is None or t.prompt_id == prompt_id) and (
+                        filter_status is None or filter_status == TaskStatus.RUNNING
+                    ):
+                        matched_tasks.append(t)
+                    else:
+                        new_running.append(t)
+                if matched_tasks:
+                    self._queue_running = new_running
+                    self._pending_queue.extend(matched_tasks)
+                    self._pending_queue.sort(key=lambda t: t.number)
+                    self._save()
+                    changed = True
+            return changed
+
+    def get_task_by_id(self, prompt_id: str) -> Optional[Tuple[TaskStatus, Task]]:
+        """根据 ID 获取任务及其当前状态。"""
+        with self._lock:
+            for t in self._queue_running:
+                if t.prompt_id == prompt_id:
+                    return TaskStatus.RUNNING, t
+            for t in self._pending_queue:
+                if t.prompt_id == prompt_id:
+                    return TaskStatus.PENDING, t
+            return None
 
     def close(self) -> None:
         """关闭队列资源。"""

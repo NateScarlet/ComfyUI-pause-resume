@@ -11,7 +11,7 @@ if ($LASTEXITCODE) {
 if ($LASTEXITCODE) {
     exit $LASTEXITCODE
 }
-& black gateway/
+& black gateway/ --target-version py312
 if ($LASTEXITCODE) {
     exit $LASTEXITCODE
 }

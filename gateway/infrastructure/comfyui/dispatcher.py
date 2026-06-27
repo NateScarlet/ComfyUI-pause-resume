@@ -6,7 +6,7 @@ import asyncio
 from typing import Optional, Dict, Any, cast
 
 from gateway.config import BASE_DIR, GatewayConfig
-from gateway.shared.models import Task
+from gateway.shared.models import Task, TaskStatus
 from gateway.shared.interfaces import (
     TaskDispatcher,
     TaskQueueReader,
@@ -105,7 +105,9 @@ class ComfyUITaskDispatcher(TaskDispatcher):
                 )
 
                 if is_permanent:
-                    self._queue_writer.clear_running()
+                    self._queue_writer.update_task_status(
+                        TaskStatus.FAILED, prompt_id=task.prompt_id
+                    )
                     try:
                         self._save_failed_workflow(
                             task, de.message, body, extra_data, de.status_code

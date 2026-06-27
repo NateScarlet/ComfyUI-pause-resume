@@ -103,6 +103,20 @@ class ComfyUIDownstreamClient(DownstreamClient):
             logger.error(f"Error fetching jobs from downstream: {e}")
         return []
 
+    async def interrupt(self, prompt_id: Optional[str] = None) -> None:
+        """向物理 ComfyUI 服务发送中断执行信号（接口实现）。"""
+        url = f"http://127.0.0.1:{self._downstream_port}/interrupt"
+        body = {"prompt_id": prompt_id} if prompt_id else {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=body) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"Failed to send interrupt to downstream: status={resp.status}"
+                        )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Network error sending interrupt to downstream: {e}")
+
     def start_downstream(self) -> None:
         """在系统空闲端口上拉起下游进程。"""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

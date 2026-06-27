@@ -4,7 +4,7 @@ from typing import Optional, Any
 
 from gateway.application.facade import AppFacade
 from gateway.shared.interfaces import DownstreamClient, TaskQueueReader
-from gateway.shared.models import TaskStatus
+from gateway.shared.models import TaskStatus, TaskFilters
 from gateway.shared.events import StateChangedEvent, StatusChangedEvent
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,9 @@ class SystemTrayController:
         self._exit_event = exit_event
 
         self._paused = app_facade.get_state.handle()
-        self._queue_count = self._queue_reader.get_task_count()
+        self._queue_count = self._queue_reader.get_task_count(
+            TaskFilters([TaskStatus.PENDING, TaskStatus.RUNNING])
+        )
         self._estimated_time_ms: Optional[int] = None  # 预估时间（毫秒）
         self._restart_pending = False  # 是否正在等待暂停后重启
         self._icon: Optional[Any] = None
@@ -226,7 +228,12 @@ class SystemTrayController:
         """
         if not self._paused:
             return False
-        return self._queue_reader.get_task_count(TaskStatus.RUNNING, limit=1) > 0
+        return (
+            self._queue_reader.get_task_count(
+                TaskFilters([TaskStatus.RUNNING]), limit=1
+            )
+            > 0
+        )
 
     def _get_current_icon(self) -> Any:
         if self._is_stopping():

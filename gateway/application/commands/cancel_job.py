@@ -1,0 +1,59 @@
+from gateway.shared.interfaces import (
+    TaskQueueReader,
+    TaskQueueWriter,
+    DownstreamClient,
+    EventBus,
+)
+from gateway.shared.models import TaskStatus
+from gateway.shared.events import QueueModifiedEvent
+from gateway.shared.exceptions import TaskNotFoundError
+
+
+class CancelJobCommandHandler:
+    """取消指定任务（作业）的 Command Handler。"""
+
+    def __init__(
+        self,
+        queue_reader: TaskQueueReader,
+        queue_writer: TaskQueueWriter,
+        downstream_client: DownstreamClient,
+        event_bus: EventBus,
+    ):
+        self._queue_reader = queue_reader
+        self._queue_writer = queue_writer
+        self._downstream_client = downstream_client
+        self._event_bus = event_bus
+
+    async def handle(self, job_id: str) -> bool:
+        """取消待处理（pending）或执行中（running）的作业。
+
+        如果成功取消，返回 True；
+        若作业已经是终态（已完成/失败/已取消），返回 False；
+        如果未找到此作业，则抛出 TaskNotFoundError。
+        """
+        # 1. 查找任务及其状态
+        res = self._queue_reader.get_task_by_id(job_id)
+        if res is None:
+            raise TaskNotFoundError(f"Job {job_id} not found.")
+
+        target_status, _ = res
+
+        # 2. 如果任务已经是终态，则返回 False 表示未做更改
+        if target_status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            return False
+
+        # 3. 更新任务状态为 CANCELLED
+        self._queue_writer.update_task_status(TaskStatus.CANCELLED, prompt_id=job_id)
+
+        # 4. 如果该任务正在运行，还要向 ComfyUI 发送物理中断信号
+        if target_status == TaskStatus.RUNNING:
+            await self._downstream_client.interrupt(job_id)
+
+        # 5. 广播队列修改事件，驱动网关刷新及状态推送
+        self._event_bus.publish(QueueModifiedEvent())
+
+        return True

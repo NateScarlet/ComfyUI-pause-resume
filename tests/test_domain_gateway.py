@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
 from gateway.domain.estimation_service import EstimationService
-from gateway.shared.models import Task, TaskStatus
+from gateway.shared.models import Task, TaskStatus, TaskFilters
 from gateway.shared.interfaces import (
     StateRepository,
     TaskQueueReader,
@@ -72,23 +72,31 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
 
     reader = MagicMock(spec=TaskQueueReader)
 
-    def _default_get_tasks(status=None):
+    def _default_get_tasks(filter_by=None, limit=None, offset=None, desc=False):
+        statuses = filter_by.statuses if filter_by is not None else None
         result = []
-        if status is None or status == TaskStatus.RUNNING:
+        if not statuses:
             result.extend((TaskStatus.RUNNING, t) for t in running_tasks)
-        if status is None or status == TaskStatus.PENDING:
             result.extend((TaskStatus.PENDING, t) for t in pending_tasks)
+        else:
+            if TaskStatus.RUNNING in statuses:
+                result.extend((TaskStatus.RUNNING, t) for t in running_tasks)
+            if TaskStatus.PENDING in statuses:
+                result.extend((TaskStatus.PENDING, t) for t in pending_tasks)
         return result
 
     reader.get_tasks.side_effect = _default_get_tasks
 
-    def _default_get_task_count(status=None, limit=None):
-        if status is None:
+    def _default_get_task_count(filter_by=None, limit=None):
+        statuses = filter_by.statuses if filter_by is not None else None
+        if not statuses:
             cnt = pending_count + len(running_tasks)
-        elif status == TaskStatus.PENDING:
-            cnt = pending_count
         else:
-            cnt = len(running_tasks)
+            cnt = 0
+            if TaskStatus.PENDING in statuses:
+                cnt += pending_count
+            if TaskStatus.RUNNING in statuses:
+                cnt += len(running_tasks)
         if limit is not None:
             return min(cnt, limit)
         return cnt
@@ -489,7 +497,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamCrashedEvent())
         
         # 确认：运行中任务被清除，崩溃计数被清零，且调用了 handle_failed_task 备份
-        g._mock_writer.clear_running.assert_called_once()
+        g._mock_writer.update_task_status.assert_called_once_with(TaskStatus.FAILED, prompt_id="bad_task_123")
         self.assertEqual(g._crash_count, 0)
         g._mock_dispatcher.handle_failed_task.assert_called_once_with(t, "Downstream crashed 3 times during execution.")
         # 确认 crashed_executing 未被设为 True
@@ -506,8 +514,8 @@ class TestDomainGateway(unittest.TestCase):
         self.assertEqual(g._last_failed_task_id, "task_999")
         
         # 2. 从 pending 和 running 中将该任务彻底移除（模拟手动删除），触发队列刷新
-        g._mock_reader.get_tasks.side_effect = lambda status=None: []
-        g._mock_reader.get_task_count.side_effect = lambda status=None, limit=None: 0
+        g._mock_reader.get_tasks.side_effect = lambda filter_by=None: []
+        g._mock_reader.get_task_count.side_effect = lambda filter_by=None, limit=None: 0
         g._mock_event_bus.publish(QueueModifiedEvent())
         
         # 确认崩溃计数、派发偏移与失败 ID 被清零
@@ -528,7 +536,9 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_full_normal_dispatch_cycle(self):
         """测试完整的正常派发周期：got prompt → Prompt executed → 自动派发下一个任务。"""
-        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2)
+        t = MagicMock(spec=Task)
+        t.prompt_id = "running_task_id"
+        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2, running_tasks=[t])
 
         # 第 1 步：下游开始执行（got prompt）
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
@@ -541,7 +551,7 @@ class TestDomainGateway(unittest.TestCase):
 
         # 验证：执行完毕后应该自动触发派发下一个任务
         g._mock_dispatcher.dispatch.assert_called()
-        g._mock_writer.clear_running.assert_called_once()
+        g._mock_writer.update_task_status.assert_called_once_with(TaskStatus.COMPLETED, filter_status=TaskStatus.RUNNING)
 
         # 验证 get_dispatch_skip 返回了合法的 skip 值
         skip = g.get_dispatch_skip()
@@ -550,12 +560,14 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_executing_false_guards_against_duplicate_events(self):
         """测试 _downstream_executing 已是 False 时再收到 executing=False 不会重复处理。"""
+        t = MagicMock(spec=Task)
+        t.prompt_id = "running_task_id"
         # 但也不应该跳过关键逻辑——如果下游从未收到过 executing=True，
         # 则 _downstream_executing 初始就是 False，此时收到 executing=False
         # 会因为 guard 而直接返回，导致 clear_running 和 dispatch 都不执行。
         # 这个测试确认 guard 的行为。
         g = _make_gateway(paused=False, downstream_ready=True, pending_count=2,
-                          downstream_executing=False)
+                          downstream_executing=False, running_tasks=[t])
 
         # 在 _downstream_executing 已是 False 时发布 executing=False
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
@@ -563,11 +575,15 @@ class TestDomainGateway(unittest.TestCase):
         # guard 生效：因为 _downstream_executing == executing，直接返回
         # dispatch 不应被调用
         g._mock_dispatcher.dispatch.assert_not_called()
-        g._mock_writer.clear_running.assert_not_called()
+        g._mock_writer.update_task_status.assert_not_called()
 
     def test_multiple_tasks_auto_dispatch_chain(self):
         """测试多任务自动链式派发：一个任务完成后自动派发下一个，再下一个。"""
-        g = _make_gateway(paused=False, downstream_ready=True, pending_count=3)
+        t1 = MagicMock(spec=Task)
+        t1.prompt_id = "task_1"
+        t2 = MagicMock(spec=Task)
+        t2.prompt_id = "task_2"
+        g = _make_gateway(paused=False, downstream_ready=True, pending_count=3, running_tasks=[t1])
 
         # 预置 _downstream_executing = True 模拟下游正在执行第一个任务
         g._downstream_executing = True
@@ -575,14 +591,16 @@ class TestDomainGateway(unittest.TestCase):
 
         # 第一次 "Prompt executed in" → 应该触发 dispatch
         g._mock_dispatcher.dispatch.reset_mock()
+        g._mock_writer.update_task_status.reset_mock()
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertFalse(g._downstream_executing)
         g._mock_dispatcher.dispatch.assert_called_once()
-        g._mock_writer.clear_running.assert_called_once()
+        g._mock_writer.update_task_status.assert_called_once_with(TaskStatus.COMPLETED, filter_status=TaskStatus.RUNNING)
 
         # 模拟 dispatch 成功后下游再次开始执行（got prompt）
         g._mock_dispatcher.dispatch.reset_mock()
-        g._mock_writer.clear_running.reset_mock()
+        g._mock_writer.update_task_status.reset_mock()
+        g._mock_reader.get_tasks.side_effect = lambda statuses=None: [(TaskStatus.RUNNING, t2)]
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
         self.assertTrue(g._downstream_executing)
 
@@ -590,7 +608,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertFalse(g._downstream_executing)
         g._mock_dispatcher.dispatch.assert_called_once()
-        g._mock_writer.clear_running.assert_called_once()
+        g._mock_writer.update_task_status.assert_called_once_with(TaskStatus.COMPLETED, filter_status=TaskStatus.RUNNING)
 
     def test_pause_resume_cancels_restart_after_idle(self):
         """测试 pause(restart_after_idle=True) 后立即 resume 会取消挂起的重启请求。"""

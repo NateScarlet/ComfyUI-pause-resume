@@ -14,9 +14,9 @@ from gateway.shared.interfaces import (
     DownstreamClient,
     EventBus,
 )
-from gateway.shared.models import TaskStatus
+from gateway.shared.models import TaskStatus, Task, TaskFilters
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
-from gateway.shared.exceptions import GatewayError
+from gateway.shared.exceptions import GatewayError, TaskNotFoundError
 from gateway.application.facade import AppFacade
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -190,9 +190,25 @@ class GatewayHandlers:
         ):
             return web.Response(status=404, text="Not Found")
 
-        if not self._downstream_service.downstream_ready:
-            method = request.method
-            accept = request.headers.get("Accept", "")
+        method = request.method
+        accept = request.headers.get("Accept", "")
+
+        # 检查是否为网关可以独立处理的本地接口，放行其 503 检查
+        is_local_jobs_api = (
+            (method == "GET" and path in ("/api/jobs", "/api/jobs/"))
+            or (
+                method == "GET"
+                and path.startswith("/api/jobs/")
+                and len(path.strip("/").split("/")) == 3
+            )
+            or (
+                method == "POST"
+                and path.startswith("/api/jobs/")
+                and path.endswith("/cancel")
+            )
+        )
+
+        if not self._downstream_service.downstream_ready and not is_local_jobs_api:
             if method == "GET" and (
                 path == "/" or path == "/index.html" or "text/html" in accept
             ):
@@ -279,8 +295,73 @@ class GatewayHandlers:
         # 3. 拦截合并 jobs 查询：GET /api/jobs
         if method == "GET" and path in ("/api/jobs", "/api/jobs/"):
             query_params = {k: v for k, v in request.rel_url.query.items()}
-            res_data = await self._app.get_jobs.handle(query_params)
-            return web.json_response(res_data)
+            try:
+                tasks_page, total = await self._app.get_jobs.handle(query_params)
+
+                # 在表现层将 Domain Model 转换为符合 API 规范的格式
+                def make_job_dict(task: Task, status_str: str) -> Dict[str, Any]:
+                    extra_data = json.loads(task.extra_data)
+                    extra_pnginfo = extra_data.get("extra_pnginfo", {})
+                    workflow = extra_pnginfo.get("workflow", {})
+                    workflow_id = workflow.get("id")
+                    return {
+                        "id": task.prompt_id,
+                        "status": status_str,
+                        "priority": task.number,
+                        "create_time": task.create_time,
+                        "outputs_count": 0,
+                        "workflow_id": workflow_id,
+                    }
+
+                jobs_json: List[Dict[str, Any]] = []
+                for status, task in tasks_page:
+                    status_str = (
+                        "in_progress" if status == TaskStatus.RUNNING else status.value
+                    )
+                    jobs_json.append(make_job_dict(task, status_str))
+
+                limit_val = None
+                if query_params.get("limit"):
+                    try:
+                        limit_val = int(query_params["limit"])
+                    except ValueError:
+                        pass
+                offset_val = 0
+                if query_params.get("offset"):
+                    try:
+                        offset_val = int(query_params["offset"])
+                    except ValueError:
+                        pass
+
+                has_more = (offset_val + len(jobs_json)) < total
+
+                res_data = {
+                    "jobs": jobs_json,
+                    "pagination": {
+                        "offset": offset_val,
+                        "limit": limit_val,
+                        "total": total,
+                        "has_more": has_more,
+                    },
+                }
+                return web.json_response(res_data)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+
+        # 3.5. 拦截具体 job 取消：POST /api/jobs/{job_id}/cancel
+        if (
+            method == "POST"
+            and path.startswith("/api/jobs/")
+            and path.endswith("/cancel")
+        ):
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[3] == "cancel":
+                job_id = parts[2]
+                try:
+                    cancelled = await self._app.cancel_job.handle(job_id)
+                    return web.json_response({"cancelled": cancelled})
+                except TaskNotFoundError:
+                    return web.Response(status=404, text="Job not found")
 
         # 4. 拦截具体 job 详情查询：GET /api/jobs/{job_id}
         if method == "GET" and path.startswith("/api/jobs/"):
@@ -288,8 +369,29 @@ class GatewayHandlers:
             if len(parts) == 3:
                 job_id = parts[2]
                 res_data = await self._app.get_job_detail.handle(job_id)
-                if res_data:
-                    return web.json_response(res_data, dumps=raw_json_dumps)
+                if res_data is not None:
+                    status, task = res_data
+                    status_str = (
+                        "in_progress" if status == TaskStatus.RUNNING else status.value
+                    )
+                    extra_data = json.loads(task.extra_data)
+                    extra_pnginfo = extra_data.get("extra_pnginfo", {})
+                    workflow = extra_pnginfo.get("workflow", {})
+                    workflow_id = workflow.get("id")
+
+                    job_detail = {
+                        "id": task.prompt_id,
+                        "status": status_str,
+                        "priority": task.number,
+                        "create_time": task.create_time,
+                        "outputs_count": 0,
+                        "workflow_id": workflow_id,
+                        "workflow": {
+                            "prompt": task.prompt,
+                            "extra_data": task.extra_data,
+                        },
+                    }
+                    return web.json_response(job_detail, dumps=raw_json_dumps)
 
         # 5. 拦截清空/删除操作：POST /queue (带 clear 或 delete)
         if method == "POST" and path in ("/queue", "/api/queue"):
@@ -340,8 +442,13 @@ class GatewayHandlers:
                                                     Dict[str, Any], data_json
                                                 )
                                                 if data_dict.get("type") == "status":
-                                                    remaining = (
-                                                        self._queue_reader.get_task_count()
+                                                    remaining = self._queue_reader.get_task_count(
+                                                        TaskFilters(
+                                                            [
+                                                                TaskStatus.PENDING,
+                                                                TaskStatus.RUNNING,
+                                                            ]
+                                                        )
                                                     )
                                                     data_payload = data_dict.get("data")
                                                     if isinstance(data_payload, dict):

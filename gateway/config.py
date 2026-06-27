@@ -51,6 +51,9 @@ class GatewayConfig:
         self.estimation_bucket_capacity = int(
             os.environ.get("COMFYUI_ESTIMATION_BUCKET_CAPACITY", "100")
         )
+        self.history_retention_days = int(
+            os.environ.get("COMFYUI_HISTORY_RETENTION_DAYS", "90")
+        )
 
         # 剥离了监听端口和地址后的，传递给下游 ComfyUI 进程的参数列表
         self.downstream_args: List[str] = []

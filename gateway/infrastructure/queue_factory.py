@@ -33,7 +33,9 @@ def init_queue(
             )
         db_path = os.path.join(config.data_dir, "queue.db")
         logger.info(f"🗃️ Using SQLiteQueue. DB path: {db_path}")
-        queue_instance = SQLiteQueue(db_path)
+        queue_instance = SQLiteQueue(
+            db_path, history_retention_days=config.history_retention_days
+        )
 
     # 检查并迁移旧根目录下的 queue.json
     old_json_path = os.path.join(BASE_DIR, "queue.json")

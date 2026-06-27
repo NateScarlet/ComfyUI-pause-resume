@@ -6,7 +6,7 @@ import json
 from typing import List, Optional, Tuple, Any
 
 from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON, TaskStatus
+from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
     """基于 SQLite3 数据库实现的任务队列，支持高并发读写，并集成了 WAL 日志模式。"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, history_retention_days: int = 90):
         self._db_path = db_path
+        self._history_retention_days = history_retention_days
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             self._db_path, check_same_thread=False, timeout=30.0
@@ -116,56 +117,132 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         )
 
     def get_tasks(
-        self, status: Optional[TaskStatus] = None
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        desc: bool = False,
     ) -> List[Tuple[TaskStatus, Task]]:
-        """获取指定状态的任务列表，每项附带状态标记；status=None 时返回全部任务。"""
+        """获取符合条件的任务列表，支持分页限制和排序方向。"""
         with self._lock:
             cursor = self._conn.cursor()
-            if status is None:
-                where_clause = ""
-            elif status == TaskStatus.PENDING:
-                where_clause = "WHERE status = 'pending'"
-            else:
-                where_clause = "WHERE status = 'running'"
+            where_parts: List[str] = []
+            params: List[Any] = []
+
+            if filter_by is not None:
+                if filter_by.statuses is not None:
+                    placeholders = ",".join("?" for _ in filter_by.statuses)
+                    where_parts.append(f"status IN ({placeholders})")
+                    params.extend(s.value for s in filter_by.statuses)
+
+                if filter_by.workflow_id is not None:
+                    # 数据库层粗筛：通过 LIKE 排除绝大部分数据，只反序列化可能匹配的行
+                    where_parts.append("extra_data LIKE ?")
+                    params.append(f"%{filter_by.workflow_id}%")
+
+            where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+            order_dir = "DESC" if desc else "ASC"
+
+            # 如果存在内存细筛（如通过 workflow_id），我们必须加载所有粗筛结果到内存，
+            # 过滤后再在 Python 内存里执行 LIMIT/OFFSET 切片。
+            # 如果没有内存细筛，直接将分页下限推给 SQL 引擎以保障极致性能。
+            has_memory_filter = (
+                filter_by is not None and filter_by.workflow_id is not None
+            )
+
+            limit_offset_clause = ""
+            db_params = list(params)
+            if not has_memory_filter:
+                if limit is not None:
+                    limit_offset_clause += " LIMIT ?"
+                    db_params.append(limit)
+                    if offset is not None:
+                        limit_offset_clause += " OFFSET ?"
+                        db_params.append(offset)
+                elif offset is not None:
+                    limit_offset_clause += " LIMIT -1 OFFSET ?"
+                    db_params.append(offset)
 
             cursor.execute(
                 "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
-                f"FROM tasks_v2 {where_clause} ORDER BY number ASC"
+                f"FROM tasks_v2 {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
+                db_params,
             )
             result: List[Tuple[TaskStatus, Task]] = []
-            for row in cursor.fetchall():
-                task = self._row_to_task(row)
-                task_status = TaskStatus(row[6])
-                result.append((task_status, task))
+            if not has_memory_filter:
+                for row in cursor.fetchall():
+                    task = self._row_to_task(row)
+                    task_status = TaskStatus(row[6])
+                    result.append((task_status, task))
+            else:
+                skipped = 0
+                for row in cursor:
+                    task = self._row_to_task(row)
+                    task_status = TaskStatus(row[6])
+                    # 内存细筛
+                    if filter_by is not None and not filter_by.matches(
+                        task_status, task
+                    ):
+                        continue
+
+                    if offset is not None and skipped < offset:
+                        skipped += 1
+                        continue
+
+                    result.append((task_status, task))
+                    if limit is not None and len(result) >= limit:
+                        break
+
             return result
 
     def get_task_count(
-        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
     ) -> int:
-        """获取指定状态的任务数量；status=None 时返回全部任务数量。"""
+        """获取符合条件的任务数量。"""
         t_start = time.perf_counter()
-        with self._lock:
-            cursor = self._conn.cursor()
-            if status is None:
-                where_clause = ""
-            elif status == TaskStatus.PENDING:
-                where_clause = "WHERE status = 'pending'"
-            else:
-                where_clause = "WHERE status = 'running'"
+        has_memory_filter = filter_by is not None and filter_by.workflow_id is not None
 
-            if limit is not None:
-                cursor.execute(
-                    f"SELECT 1 FROM tasks_v2 {where_clause} LIMIT ?", (limit,)
+        if not has_memory_filter:
+            with self._lock:
+                cursor = self._conn.cursor()
+                where_parts: List[str] = []
+                params: List[Any] = []
+
+                if filter_by is not None:
+                    if filter_by.statuses is not None:
+                        placeholders = ",".join("?" for _ in filter_by.statuses)
+                        where_parts.append(f"status IN ({placeholders})")
+                        params.extend(s.value for s in filter_by.statuses)
+
+                where_clause = (
+                    " WHERE " + " AND ".join(where_parts) if where_parts else ""
                 )
-                result = len(cursor.fetchall())
-            else:
-                cursor.execute(f"SELECT COUNT(*) FROM tasks_v2 {where_clause}")
-                row = cursor.fetchone()
-                result = row[0] if row else 0
+
+                if limit is not None:
+                    cursor.execute(
+                        f"SELECT 1 FROM tasks_v2 {where_clause} LIMIT ?",
+                        params + [limit],
+                    )
+                    result = len(cursor.fetchall())
+                else:
+                    cursor.execute(
+                        f"SELECT COUNT(*) FROM tasks_v2 {where_clause}", params
+                    )
+                    row = cursor.fetchone()
+                    result = row[0] if row else 0
+        else:
+            # 存在内存细筛时，通过 get_tasks 获取精细化过滤的任务并统计其数量
+            tasks = self.get_tasks(filter_by=filter_by)
+            result = len(tasks)
+            if limit is not None:
+                result = min(result, limit)
+
         t_total = (time.perf_counter() - t_start) * 1000
         if t_total > 10:
             logger.debug(
-                f"SQLite get_task_count(status={status}, limit={limit}) = {result} took {t_total:.1f}ms"
+                f"SQLite get_task_count(filter_by={filter_by}, limit={limit}) = {result} took {t_total:.1f}ms"
             )
         return result
 
@@ -277,7 +354,69 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             )
             self._conn.commit()
 
+    def update_task_status(
+        self,
+        new_status: TaskStatus,
+        prompt_id: Optional[str] = None,
+        filter_status: Optional[TaskStatus] = None,
+    ) -> bool:
+        """更新指定任务的状态。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            where_parts: List[str] = []
+            params: List[Any] = []
+            if prompt_id is not None:
+                where_parts.append("id = ?")
+                params.append(prompt_id)
+            if filter_status is not None:
+                where_parts.append("status = ?")
+                params.append(filter_status.value)
+
+            where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+
+            cursor.execute(
+                f"UPDATE tasks_v2 SET status = ?{where_clause}",
+                [new_status.value] + params,
+            )
+            changed = cursor.rowcount > 0
+            self._conn.commit()
+            if changed and new_status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
+                self._cleanup_expired_history()
+            return changed
+
+    def _cleanup_expired_history(self) -> None:
+        """清理已过期（如超过 retention_days）的非活动任务历史记录。"""
+        expire_time = int(time.time() * 1000) - (
+            self._history_retention_days * 24 * 3600 * 1000
+        )
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "DELETE FROM tasks_v2 WHERE status IN ('completed', 'failed', 'cancelled') AND create_time < ?",
+            (expire_time,),
+        )
+        self._conn.commit()
+
     def close(self) -> None:
-        """关闭 SQLite 数据库连接。"""
+        """释放数据库连接资源。"""
         with self._lock:
             self._conn.close()
+
+    def get_task_by_id(self, prompt_id: str) -> Optional[Tuple[TaskStatus, Task]]:
+        """根据 ID 获取任务及其当前状态。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, status "
+                "FROM tasks_v2 WHERE id = ?",
+                (prompt_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                task = self._row_to_task(row)
+                task_status = TaskStatus(row[6])
+                return task_status, task
+            return None

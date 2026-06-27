@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence, List, Any
+from typing import Sequence, List, Any, Optional
 
 
 class TaskStatus(str, Enum):
@@ -8,6 +8,9 @@ class TaskStatus(str, Enum):
 
     PENDING = "pending"
     RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class RawJSON(str):
@@ -59,3 +62,29 @@ class Task:
             self.extra_data,
             list(self.outputs_to_execute),
         ]
+
+
+@dataclass
+class TaskFilters:
+    """网关任务过滤条件，支持底层数据库粗筛和内存细筛。"""
+
+    statuses: Optional[List[TaskStatus]] = None
+    workflow_id: Optional[str] = None
+
+    def matches(self, status: TaskStatus, task: Task) -> bool:
+        """内存细筛：判断一个任务是否真正匹配此过滤器。"""
+        if self.statuses is not None and status not in self.statuses:
+            return False
+        if self.workflow_id is not None:
+            import json
+
+            try:
+                extra_data = json.loads(task.extra_data)
+                extra_pnginfo = extra_data.get("extra_pnginfo", {})
+                workflow = extra_pnginfo.get("workflow", {})
+                w_id = workflow.get("id")
+                if w_id != self.workflow_id:
+                    return False
+            except (json.JSONDecodeError, TypeError, KeyError):
+                return False
+        return True

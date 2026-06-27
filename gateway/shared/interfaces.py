@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
-from .models import Task, TaskStatus, EstimationState
+from .models import Task, TaskStatus, EstimationState, TaskFilters
 
 T = TypeVar("T")
 
@@ -26,16 +26,27 @@ class TaskQueueReader(ABC):
 
     @abstractmethod
     def get_tasks(
-        self, status: Optional[TaskStatus] = None
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        desc: bool = False,
     ) -> List[Tuple[TaskStatus, Task]]:
-        """获取指定状态的任务列表，每项附带状态标记；status=None 时返回全部任务。"""
+        """获取符合筛选条件的任务列表，支持分页限制和排序方向。"""
         pass
 
     @abstractmethod
     def get_task_count(
-        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+        self,
+        filter_by: Optional[TaskFilters] = None,
+        limit: Optional[int] = None,
     ) -> int:
-        """获取指定状态的任务数量；status=None 时返回全部任务数量。支持 limit 防止全扫描。"""
+        """获取符合筛选条件的任务数量；filter_by=None 时返回全部任务数量。"""
+        pass
+
+    @abstractmethod
+    def get_task_by_id(self, prompt_id: str) -> Optional[Tuple[TaskStatus, Task]]:
+        """根据 ID 获取任务及其当前状态。如果不存在返回 None。"""
         pass
 
 
@@ -80,6 +91,16 @@ class TaskQueueWriter(ABC):
     @abstractmethod
     def delete_pending(self, prompt_ids: List[str]) -> None:
         """按 ID 物理删除队列中的指定待处理任务。"""
+        pass
+
+    @abstractmethod
+    def update_task_status(
+        self,
+        new_status: TaskStatus,
+        prompt_id: Optional[str] = None,
+        filter_status: Optional[TaskStatus] = None,
+    ) -> bool:
+        """更新符合条件的任务的状态。"""
         pass
 
 
@@ -149,6 +170,11 @@ class DownstreamClient(ABC):
     @abstractmethod
     async def get_jobs(self, query_params: Dict[str, str]) -> List[Dict[str, Any]]:
         """从下游 ComfyUI 原生 API 获取历史作业列表。"""
+        pass
+
+    @abstractmethod
+    async def interrupt(self, prompt_id: Optional[str] = None) -> None:
+        """向物理 ComfyUI 服务发送中断执行信号。"""
         pass
 
 

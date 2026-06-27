@@ -8,6 +8,7 @@ from gateway.shared.interfaces import (
 from .commands.add_task import AddTaskCommandHandler
 from .commands.pause_resume import PauseQueueCommandHandler, ResumeQueueCommandHandler
 from .commands.modify_queue import ModifyQueueCommandHandler
+from .commands.cancel_job import CancelJobCommandHandler
 from .queries.get_queue import GetQueueQueryHandler
 from .queries.get_jobs import GetJobsQueryHandler, GetJobDetailQueryHandler
 from .queries.get_state import GetStateQueryHandler
@@ -25,6 +26,7 @@ class AppFacade:
         pause_queue: PauseQueueCommandHandler,
         resume_queue: ResumeQueueCommandHandler,
         modify_queue: ModifyQueueCommandHandler,
+        cancel_job: CancelJobCommandHandler,
         get_queue: GetQueueQueryHandler,
         get_jobs: GetJobsQueryHandler,
         get_job_detail: GetJobDetailQueryHandler,
@@ -34,6 +36,7 @@ class AppFacade:
         self.pause_queue = pause_queue
         self.resume_queue = resume_queue
         self.modify_queue = modify_queue
+        self.cancel_job = cancel_job
         self.get_queue = get_queue
         self.get_jobs = get_jobs
         self.get_job_detail = get_job_detail
@@ -54,8 +57,11 @@ class AppFacade:
             pause_queue=PauseQueueCommandHandler(gateway),
             resume_queue=ResumeQueueCommandHandler(gateway),
             modify_queue=ModifyQueueCommandHandler(queue_writer, event_bus),
+            cancel_job=CancelJobCommandHandler(
+                queue_reader, queue_writer, downstream_client, event_bus
+            ),
             get_queue=GetQueueQueryHandler(queue_reader),
-            get_jobs=GetJobsQueryHandler(queue_reader, downstream_client),
+            get_jobs=GetJobsQueryHandler(queue_reader),
             get_job_detail=GetJobDetailQueryHandler(queue_reader),
             get_state=GetStateQueryHandler(gateway),
         )

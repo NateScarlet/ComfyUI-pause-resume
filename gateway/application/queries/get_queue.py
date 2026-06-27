@@ -1,6 +1,6 @@
 from typing import List, Tuple
 from gateway.shared.interfaces import TaskQueueReader
-from gateway.shared.models import Task, TaskStatus
+from gateway.shared.models import Task, TaskStatus, TaskFilters
 
 
 class GetQueueQueryHandler:
@@ -11,4 +11,6 @@ class GetQueueQueryHandler:
 
     def handle(self) -> List[Tuple[TaskStatus, Task]]:
         """返回原始任务列表，格式转换由表示层负责。"""
-        return self._queue_reader.get_tasks()
+        return self._queue_reader.get_tasks(
+            TaskFilters([TaskStatus.PENDING, TaskStatus.RUNNING])
+        )
