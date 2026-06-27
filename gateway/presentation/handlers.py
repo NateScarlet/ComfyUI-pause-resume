@@ -294,11 +294,93 @@ class GatewayHandlers:
 
         # 3. 拦截合并 jobs 查询：GET /api/jobs
         if method == "GET" and path in ("/api/jobs", "/api/jobs/"):
+            t_total_start = time.perf_counter()
             query_params = {k: v for k, v in request.rel_url.query.items()}
             try:
-                tasks_page, total = await self._app.get_jobs.handle(query_params)
+                # 3.1. 解析并验证 status 参数
+                valid_statuses = {
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }
+                status_param = query_params.get("status")
+                if status_param:
+                    status_filter = [
+                        s.strip().lower() for s in status_param.split(",") if s.strip()
+                    ]
+                    statuses: List[TaskStatus] = []
+                    invalid_statuses: List[str] = []
+                    for sf in status_filter:
+                        if sf == "pending":
+                            statuses.append(TaskStatus.PENDING)
+                        elif sf == "in_progress":
+                            statuses.append(TaskStatus.RUNNING)
+                        elif sf == "completed":
+                            statuses.append(TaskStatus.COMPLETED)
+                        elif sf == "failed":
+                            statuses.append(TaskStatus.FAILED)
+                        elif sf == "cancelled":
+                            statuses.append(TaskStatus.CANCELLED)
+                        else:
+                            invalid_statuses.append(sf)
+                    if invalid_statuses:
+                        raise ValueError(
+                            f"Invalid status value(s): {', '.join(invalid_statuses)}. "
+                            f"Valid values: {', '.join(sorted(valid_statuses))}"
+                        )
+                else:
+                    statuses = [
+                        TaskStatus.PENDING,
+                        TaskStatus.RUNNING,
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    ]
 
-                # 在表现层将 Domain Model 转换为符合 API 规范的格式
+                # 3.2. 解析并验证 limit / offset
+                limit_val = None
+                if query_params.get("limit"):
+                    try:
+                        limit_val = int(query_params["limit"])
+                    except ValueError:
+                        pass
+                offset_val = 0
+                if query_params.get("offset"):
+                    try:
+                        offset_val = int(query_params["offset"])
+                    except ValueError:
+                        pass
+
+                # 3.3. 解析排序与 workflow_id
+                sort_order = query_params.get("sort_order", "desc").lower()
+                reverse = sort_order == "desc"
+                workflow_id_param = query_params.get("workflow_id")
+
+                # 3.4. 构造 TaskFilters 条件并调用应用层
+                filter_by = TaskFilters(
+                    statuses=statuses, workflow_id=workflow_id_param
+                )
+
+                # 获取任务列表并计时
+                t_get_jobs_start = time.perf_counter()
+                tasks_page = await self._app.get_jobs.handle(
+                    filter_by=filter_by,
+                    limit=limit_val,
+                    offset=offset_val,
+                    desc=reverse,
+                )
+                t_get_jobs = (time.perf_counter() - t_get_jobs_start) * 1000
+
+                # 获取任务总数并计时
+                t_get_job_count_start = time.perf_counter()
+                total = await self._app.get_job_count.handle(filter_by=filter_by)
+                t_get_job_count = (time.perf_counter() - t_get_job_count_start) * 1000
+
+                # 3.5. 在表现层将 Domain Model 转换为符合 API 规范的格式并计时
+                t_format_start = time.perf_counter()
+
                 def make_job_dict(task: Task, status_str: str) -> Dict[str, Any]:
                     extra_data = json.loads(task.extra_data)
                     extra_pnginfo = extra_data.get("extra_pnginfo", {})
@@ -320,19 +402,6 @@ class GatewayHandlers:
                     )
                     jobs_json.append(make_job_dict(task, status_str))
 
-                limit_val = None
-                if query_params.get("limit"):
-                    try:
-                        limit_val = int(query_params["limit"])
-                    except ValueError:
-                        pass
-                offset_val = 0
-                if query_params.get("offset"):
-                    try:
-                        offset_val = int(query_params["offset"])
-                    except ValueError:
-                        pass
-
                 has_more = (offset_val + len(jobs_json)) < total
 
                 res_data = {
@@ -344,7 +413,19 @@ class GatewayHandlers:
                         "has_more": has_more,
                     },
                 }
-                return web.json_response(res_data)
+                t_format_data = (time.perf_counter() - t_format_start) * 1000
+
+                # 3.6. 计算总响应耗时并组装 Server-Timing 头部
+                t_total = (time.perf_counter() - t_total_start) * 1000
+                server_timing = (
+                    f"get_jobs;dur={t_get_jobs:.2f}, "
+                    f"get_job_count;dur={t_get_job_count:.2f}, "
+                    f"format_data;dur={t_format_data:.2f}, "
+                    f"total;dur={t_total:.2f}"
+                )
+                headers = {"Server-Timing": server_timing}
+
+                return web.json_response(res_data, headers=headers)
             except ValueError as e:
                 return web.json_response({"error": str(e)}, status=400)
 

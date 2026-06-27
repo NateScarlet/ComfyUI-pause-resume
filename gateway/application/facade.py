@@ -10,7 +10,9 @@ from .commands.pause_resume import PauseQueueCommandHandler, ResumeQueueCommandH
 from .commands.modify_queue import ModifyQueueCommandHandler
 from .commands.cancel_job import CancelJobCommandHandler
 from .queries.get_queue import GetQueueQueryHandler
-from .queries.get_jobs import GetJobsQueryHandler, GetJobDetailQueryHandler
+from .queries.get_jobs import GetJobsQueryHandler
+from .queries.get_job_detail import GetJobDetailQueryHandler
+from .queries.get_job_count import GetJobCountQueryHandler
 from .queries.get_state import GetStateQueryHandler
 
 
@@ -30,6 +32,7 @@ class AppFacade:
         get_queue: GetQueueQueryHandler,
         get_jobs: GetJobsQueryHandler,
         get_job_detail: GetJobDetailQueryHandler,
+        get_job_count: GetJobCountQueryHandler,
         get_state: GetStateQueryHandler,
     ):
         self.add_task = add_task
@@ -40,6 +43,7 @@ class AppFacade:
         self.get_queue = get_queue
         self.get_jobs = get_jobs
         self.get_job_detail = get_job_detail
+        self.get_job_count = get_job_count
         self.get_state = get_state
 
     @classmethod
@@ -63,5 +67,6 @@ class AppFacade:
             get_queue=GetQueueQueryHandler(queue_reader),
             get_jobs=GetJobsQueryHandler(queue_reader),
             get_job_detail=GetJobDetailQueryHandler(queue_reader),
+            get_job_count=GetJobCountQueryHandler(queue_reader),
             get_state=GetStateQueryHandler(gateway),
         )
