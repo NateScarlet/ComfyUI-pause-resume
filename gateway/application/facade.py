@@ -1,12 +1,12 @@
 from typing import Optional, Any
 from gateway.domain.gateway import Gateway
 from gateway.shared.interfaces import (
-    TaskQueueReader,
-    TaskQueueWriter,
+    JobQueueReader,
+    JobQueueWriter,
     DownstreamClient,
     EventBus,
 )
-from .commands.add_task import AddTaskCommandHandler
+from .commands.add_job import AddJobCommandHandler
 from .commands.pause_resume import PauseQueueCommandHandler, ResumeQueueCommandHandler
 from .commands.modify_queue import ModifyQueueCommandHandler
 from .commands.cancel_job import CancelJobCommandHandler
@@ -25,7 +25,7 @@ class AppFacade:
 
     def __init__(
         self,
-        add_task: AddTaskCommandHandler,
+        add_job: AddJobCommandHandler,
         pause_queue: PauseQueueCommandHandler,
         resume_queue: ResumeQueueCommandHandler,
         modify_queue: ModifyQueueCommandHandler,
@@ -36,7 +36,7 @@ class AppFacade:
         get_job_count: GetJobCountQueryHandler,
         get_state: GetStateQueryHandler,
     ):
-        self.add_task = add_task
+        self.add_job = add_job
         self.pause_queue = pause_queue
         self.resume_queue = resume_queue
         self.modify_queue = modify_queue
@@ -52,16 +52,16 @@ class AppFacade:
     def create(
         cls,
         gateway: Gateway,
-        queue_reader: TaskQueueReader,
-        queue_writer: TaskQueueWriter,
+        queue_reader: JobQueueReader,
+        queue_writer: JobQueueWriter,
         downstream_client: DownstreamClient,
         event_bus: EventBus,
     ) -> "AppFacade":
         """快速实例化门面，在内部组装所有的命令与查询处理器，极大减轻启动根的代码量。"""
-        from .sync import TaskDownstreamSyncer
+        from .sync import JobDownstreamSyncer
 
         facade = cls(
-            add_task=AddTaskCommandHandler(queue_writer, event_bus),
+            add_job=AddJobCommandHandler(queue_writer, event_bus),
             pause_queue=PauseQueueCommandHandler(gateway),
             resume_queue=ResumeQueueCommandHandler(gateway),
             modify_queue=ModifyQueueCommandHandler(queue_writer, event_bus),
@@ -76,7 +76,7 @@ class AppFacade:
         )
 
         # 实例化后台同步服务，订阅事件以从下游同步省略信息及 assets
-        facade._outputs_importer = TaskDownstreamSyncer(
+        facade._outputs_importer = JobDownstreamSyncer(
             queue_reader, queue_writer, downstream_client, event_bus
         )
         return facade

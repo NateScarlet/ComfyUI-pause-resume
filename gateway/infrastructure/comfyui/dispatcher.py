@@ -6,11 +6,11 @@ import asyncio
 from typing import Optional, Dict, Any, cast
 
 from gateway.config import BASE_DIR, GatewayConfig
-from gateway.shared.models import Task, TaskStatus
+from gateway.shared.models import Job, JobStatus
 from gateway.shared.interfaces import (
-    TaskDispatcher,
-    TaskQueueReader,
-    TaskQueueWriter,
+    JobDispatcher,
+    JobQueueReader,
+    JobQueueWriter,
     DownstreamClient,
     EventBus,
 )
@@ -20,14 +20,14 @@ from gateway.shared.events import DispatchSuccessEvent, DispatchFailedEvent
 logger = logging.getLogger(__name__)
 
 
-class ComfyUITaskDispatcher(TaskDispatcher):
+class ComfyUIJobDispatcher(JobDispatcher):
     """ComfyUI 技术规范任务分派器，负责调用下游发送任务以及维护队列副作用。"""
 
     def __init__(
         self,
         config: GatewayConfig,
-        queue_reader: TaskQueueReader,
-        queue_writer: TaskQueueWriter,
+        queue_reader: JobQueueReader,
+        queue_writer: JobQueueWriter,
         downstream: DownstreamClient,
         event_bus: EventBus,
         loop: asyncio.AbstractEventLoop,
@@ -48,19 +48,19 @@ class ComfyUITaskDispatcher(TaskDispatcher):
 
     def _schedule_dispatch(self, skip: Optional[int]) -> None:
         logger.debug("_schedule_dispatch: creating task, skip=%s", skip)
-        asyncio.create_task(self._try_send_task(skip))
+        asyncio.create_task(self._try_send(skip))
 
-    async def _try_send_task(self, skip: Optional[int]) -> None:
+    async def _try_send(self, skip: Optional[int]) -> None:
         """执行派发任务的具体副作用。"""
         logger.debug(
-            "_try_send_task: entered, skip=%s dispatching=%s exiting=%s",
+            "_try_send: entered, skip=%s dispatching=%s exiting=%s",
             skip,
             self._dispatching,
             self._exiting,
         )
         if self._dispatching or self._exiting:
             logger.debug(
-                "_try_send_task: skipped (dispatching=%s exiting=%s)",
+                "_try_send: skipped (dispatching=%s exiting=%s)",
                 self._dispatching,
                 self._exiting,
             )
@@ -68,49 +68,47 @@ class ComfyUITaskDispatcher(TaskDispatcher):
         self._dispatching = True
         try:
             if skip is None:
-                logger.debug("_try_send_task: skip is None, nothing to dispatch")
+                logger.debug("_try_send: skip is None, nothing to dispatch")
                 return
 
-            task = self._queue_writer.pop_task(skip)
-            if task is None:
-                logger.warning("_try_send_task: pop_task(skip=%s) returned None", skip)
+            job = self._queue_writer.pop(skip)
+            if job is None:
+                logger.warning("_try_send: pop(skip=%s) returned None", skip)
                 return
 
-            logger.info(
-                "_try_send_task: dispatching task %s (skip=%s)", task.prompt_id, skip
-            )
+            logger.info("_try_send: dispatching job %s (skip=%s)", job.prompt_id, skip)
 
-            extra_data = json.loads(task.extra_data)
+            extra_data = json.loads(job.extra_data)
             body: Dict[str, Any] = {
-                "prompt": task.prompt,
-                "prompt_id": task.prompt_id,
-                "extra_data": task.extra_data,
+                "prompt": job.prompt,
+                "prompt_id": job.prompt_id,
+                "extra_data": job.extra_data,
             }
             if extra_data.get("client_id"):
                 body["client_id"] = extra_data["client_id"]
 
             try:
-                await self._downstream.send_prompt(task.prompt_id, body)
-                logger.info(f"📤 Sent workflow {task.prompt_id} to downstream")
-                self._event_bus.publish(DispatchSuccessEvent(prompt_id=task.prompt_id))
+                await self._downstream.send_prompt(job.prompt_id, body)
+                logger.info(f"📤 Sent workflow {job.prompt_id} to downstream")
+                self._event_bus.publish(DispatchSuccessEvent(prompt_id=job.prompt_id))
             except DownstreamError as de:
                 logger.error(
-                    f"Failed to send workflow {task.prompt_id}: {de.status_code} - {de.message}"
+                    f"Failed to send workflow {job.prompt_id}: {de.status_code} - {de.message}"
                 )
                 is_permanent = 400 <= de.status_code <= 500
                 self._event_bus.publish(
                     DispatchFailedEvent(
-                        task_id=task.prompt_id, is_permanent=is_permanent
+                        prompt_id=job.prompt_id, is_permanent=is_permanent
                     )
                 )
 
                 if is_permanent:
-                    self._queue_writer.update_task_status(
-                        TaskStatus.FAILED, prompt_id=task.prompt_id
+                    self._queue_writer.update_status(
+                        JobStatus.FAILED, prompt_id=job.prompt_id
                     )
                     try:
                         self._save_failed_workflow(
-                            task, de.message, body, extra_data, de.status_code
+                            job, de.message, body, extra_data, de.status_code
                         )
                     except (OSError, TypeError) as save_err:
                         logger.error(
@@ -121,7 +119,7 @@ class ComfyUITaskDispatcher(TaskDispatcher):
             except (json.JSONDecodeError, OSError) as e:
                 logger.error(f"Error sending workflow: {e}")
                 self._event_bus.publish(
-                    DispatchFailedEvent(task_id=task.prompt_id, is_permanent=False)
+                    DispatchFailedEvent(prompt_id=job.prompt_id, is_permanent=False)
                 )
                 self._queue_writer.requeue_running()
         finally:
@@ -129,7 +127,7 @@ class ComfyUITaskDispatcher(TaskDispatcher):
 
     def _save_failed_workflow(
         self,
-        task: Task,
+        task: Job,
         error_msg: str,
         body: Dict[str, Any],
         extra_data: Dict[str, Any],
@@ -166,18 +164,18 @@ class ComfyUITaskDispatcher(TaskDispatcher):
         rel_failed_dir = os.path.relpath(failed_dir, BASE_DIR).replace(os.sep, "/")
         logger.info(f"💾 Failed workflow {task.prompt_id} saved to {rel_failed_dir}")
 
-    def handle_failed_task(self, task: Task, error_msg: str) -> None:
+    def handle_failed_job(self, job: Job, error_msg: str) -> None:
         """处理执行失败的坏任务（备份至 failed_workflows 目录）。"""
         try:
-            extra_data = json.loads(task.extra_data)
+            extra_data = json.loads(job.extra_data)
             body: Dict[str, Any] = {
-                "prompt": task.prompt,
-                "prompt_id": task.prompt_id,
-                "extra_data": task.extra_data,
+                "prompt": job.prompt,
+                "prompt_id": job.prompt_id,
+                "extra_data": job.extra_data,
             }
             if extra_data.get("client_id"):
                 body["client_id"] = extra_data["client_id"]
-            self._save_failed_workflow(task, error_msg, body, extra_data, 500)
+            self._save_failed_workflow(job, error_msg, body, extra_data, 500)
         except (OSError, json.JSONDecodeError, TypeError) as e:
             logger.error(f"Failed to handle failed task: {e}")
 

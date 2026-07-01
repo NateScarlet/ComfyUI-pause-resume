@@ -2,15 +2,15 @@ import uuid
 import time
 import json
 from typing import Optional, Dict, Any
-from gateway.shared.models import Task, RawJSON
-from gateway.shared.interfaces import TaskQueueWriter, EventBus
+from gateway.shared.models import Job, RawJSON
+from gateway.shared.interfaces import JobQueueWriter, EventBus
 from gateway.shared.events import QueueModifiedEvent
 
 
-class AddTaskCommandHandler:
+class AddJobCommandHandler:
     """处理添加任务写指令的 Handler。"""
 
-    def __init__(self, queue_writer: TaskQueueWriter, event_bus: EventBus):
+    def __init__(self, queue_writer: JobQueueWriter, event_bus: EventBus):
         self._queue_writer = queue_writer
         self._event_bus = event_bus
 
@@ -29,24 +29,24 @@ class AddTaskCommandHandler:
             prompt_id = str(uuid.uuid4())
 
         if number is not None:
-            task_number = number
+            job_number = number
         else:
-            task_number = float(self._queue_writer.new_task_number())
+            job_number = float(self._queue_writer.new_number())
             if front:
-                task_number = -task_number
+                job_number = -job_number
 
         create_time = int(time.time() * 1000)
-        task = Task(
-            number=task_number,
+        job = Job(
+            number=job_number,
             prompt_id=prompt_id,
             prompt=RawJSON(json.dumps(prompt, ensure_ascii=False)),
             extra_data=RawJSON(json.dumps(extra_data, ensure_ascii=False)),
             outputs_to_execute=[],
             create_time=create_time,
         )
-        self._queue_writer.add_task(task)
+        self._queue_writer.add(job)
 
         # 发布事件，由网关自行订阅处理
         self._event_bus.publish(QueueModifiedEvent())
 
-        return {"prompt_id": prompt_id, "number": task_number}
+        return {"prompt_id": prompt_id, "number": job_number}

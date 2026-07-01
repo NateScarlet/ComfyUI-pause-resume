@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
-from .models import Task, TaskStatus, EstimationState, TaskFilters, TaskSummary
+from .models import Job, JobStatus, EstimationState, JobFilters, JobSummary
 
 T = TypeVar("T")
 
@@ -21,61 +21,61 @@ class EventBus(ABC):
         pass
 
 
-class TaskQueueReader(ABC):
-    """网关任务队列的只读查询接口，隔离了写操作，符合读写分离与最小接口原则。"""
+class JobQueueReader(ABC):
+    """任务队列的只读查询接口，隔离了写操作，符合读写分离与最小接口原则。"""
 
     @abstractmethod
-    def get_tasks(
+    def list(
         self,
-        filter_by: Optional[TaskFilters] = None,
+        filter_by: Optional[JobFilters] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[Tuple[TaskStatus, Task]]:
+    ) -> List[Tuple[JobStatus, Job]]:
         """获取符合筛选条件的任务列表，支持分页限制和排序方向。"""
         pass
 
     @abstractmethod
-    def get_task_summaries(
+    def get_summaries(
         self,
-        filter_by: Optional[TaskFilters] = None,
+        filter_by: Optional[JobFilters] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[TaskSummary]:
+    ) -> List[JobSummary]:
         """获取符合筛选条件的任务摘要列表，支持分页限制和排序方向。"""
         pass
 
     @abstractmethod
-    def get_task_count(
+    def count(
         self,
-        filter_by: Optional[TaskFilters] = None,
+        filter_by: Optional[JobFilters] = None,
         limit: Optional[int] = None,
     ) -> int:
         """获取符合筛选条件的任务数量；filter_by=None 时返回全部任务数量。"""
         pass
 
     @abstractmethod
-    def get_task_by_id(self, prompt_id: str) -> Optional[Tuple[TaskStatus, Task]]:
+    def get(self, prompt_id: str) -> Optional[Tuple[JobStatus, Job]]:
         """根据 ID 获取任务及其当前状态。如果不存在返回 None。"""
         pass
 
 
-class TaskQueueWriter(ABC):
-    """网关任务队列的写操作接口，负责队列数据的增删改和生命周期管理。"""
+class JobQueueWriter(ABC):
+    """任务队列的写操作接口，负责队列数据的增删改和生命周期管理。"""
 
     @abstractmethod
-    def new_task_number(self) -> int:
+    def new_number(self) -> int:
         """分配生成一个新的唯一自增任务序号。"""
         pass
 
     @abstractmethod
-    def add_task(self, task: Task) -> None:
+    def add(self, job: Job) -> None:
         """添加新的待处理任务至任务队列。"""
         pass
 
     @abstractmethod
-    def pop_task(self, skip: int = 0) -> Optional[Task]:
+    def pop(self, skip: int = 0) -> Optional[Job]:
         """弹出指定偏移量的待处理任务，并将其更新标记为正在运行。"""
         pass
 
@@ -105,17 +105,17 @@ class TaskQueueWriter(ABC):
         pass
 
     @abstractmethod
-    def update_task_status(
+    def update_status(
         self,
-        new_status: TaskStatus,
+        new_status: JobStatus,
         prompt_id: Optional[str] = None,
-        filter_status: Optional[TaskStatus] = None,
+        filter_status: Optional[JobStatus] = None,
     ) -> bool:
         """更新符合条件的任务的状态。"""
         pass
 
     @abstractmethod
-    def save_task(self, task: Task) -> bool:
+    def save(self, job: Job) -> bool:
         """保存任务的完整最新状态（支持新增或更新现有任务）。
 
         如果保存（或更新）成功返回 True，否则返回 False。
@@ -209,7 +209,7 @@ class DownstreamClient(ABC):
         pass
 
 
-class TaskDispatcher(ABC):
+class JobDispatcher(ABC):
     """负责向下一代发任务的抽象调度器接口。"""
 
     @abstractmethod
@@ -218,7 +218,7 @@ class TaskDispatcher(ABC):
         pass
 
     @abstractmethod
-    def handle_failed_task(self, task: Task, error_msg: str) -> None:
+    def handle_failed_job(self, job: Job, error_msg: str) -> None:
         """处理执行失败的坏任务（例如，备份至 failed_workflows 目录）。"""
         pass
 

@@ -18,7 +18,7 @@ from .infrastructure.system.tray import SystemTrayController
 from .domain.gateway import Gateway
 from .infrastructure.comfyui.downstream import ComfyUIDownstreamClient
 from .infrastructure.in_memory.event_bus import InMemoryEventBus
-from .infrastructure.comfyui.dispatcher import ComfyUITaskDispatcher
+from .infrastructure.comfyui.dispatcher import ComfyUIJobDispatcher
 from .application.facade import AppFacade
 from .presentation.handlers import GatewayHandlers
 from .presentation.routes import setup_routes
@@ -96,7 +96,7 @@ async def main() -> None:
     )
 
     # 7. 实例化应用层任务分派器
-    dispatcher = ComfyUITaskDispatcher(
+    dispatcher = ComfyUIJobDispatcher(
         config=config,
         queue_reader=queue_reader,
         queue_writer=queue_writer,

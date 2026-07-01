@@ -3,16 +3,16 @@ import time
 from typing import Optional, Callable, List
 from gateway.shared.interfaces import (
     StateRepository,
-    TaskQueueReader,
-    TaskQueueWriter,
+    JobQueueReader,
+    JobQueueWriter,
     ProcessManager,
     SystemPowerController,
     Timer,
     DownstreamClient,
-    TaskDispatcher,
+    JobDispatcher,
     EventBus,
 )
-from gateway.shared.models import Task, TaskStatus, TaskFilters
+from gateway.shared.models import Job, JobStatus, JobFilters
 from gateway.shared.events import (
     StateChangedEvent,
     StatusChangedEvent,
@@ -39,13 +39,13 @@ class Gateway:
     def __init__(
         self,
         state_repo: StateRepository,
-        queue_reader: TaskQueueReader,
-        queue_writer: TaskQueueWriter,
+        queue_reader: JobQueueReader,
+        queue_writer: JobQueueWriter,
         process_manager: ProcessManager,
         power_controller: SystemPowerController,
         timer: Timer,
         downstream: DownstreamClient,
-        dispatcher: TaskDispatcher,
+        dispatcher: JobDispatcher,
         event_bus: EventBus,
         estimation_service: EstimationService,
         idle_restart_timeout: float = 0,
@@ -82,11 +82,11 @@ class Gateway:
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
         self._cancel_dispatch_retry: Optional[Callable[[], None]] = None
-        self._last_failed_task_id: Optional[str] = None
+        self._last_failed_job_id: Optional[str] = None
         self._refreshing = False
         self._refresh_needed = False
         self._crashed_executing = False
-        self._task_start_time: Optional[int] = None  # 当前任务开始执行时间（毫秒）
+        self._job_start_time: Optional[int] = None  # 当前任务开始执行时间（毫秒）
 
         self._downstream = downstream
         self._dispatcher = dispatcher
@@ -145,34 +145,34 @@ class Gateway:
         try:
             for _ in range(10):
 
-                total_count = self._queue_reader.get_task_count(
-                    TaskFilters([TaskStatus.PENDING, TaskStatus.RUNNING]), limit=1
+                total_count = self._queue_reader.count(
+                    JobFilters([JobStatus.PENDING, JobStatus.RUNNING]), limit=1
                 )
-                has_tasks = total_count > 0
+                has_jobs = total_count > 0
 
                 # 如果没有任何任务，重置所有计数
-                if not has_tasks:
+                if not has_jobs:
                     self._crash_count = 0
                     self._dispatch_skip_offset = 0
-                    self._last_failed_task_id = None
+                    self._last_failed_job_id = None
                     if self._cancel_dispatch_retry:
                         self._cancel_dispatch_retry()
                         self._cancel_dispatch_retry = None
-                elif self._last_failed_task_id is not None:
+                elif self._last_failed_job_id is not None:
                     # 检查先前失败的任务是否已经不在队列中（例如被用户手动删除）
-                    all_tasks = [
+                    all_jobs = [
                         t
-                        for _, t in self._queue_reader.get_tasks(
-                            TaskFilters([TaskStatus.PENDING, TaskStatus.RUNNING])
+                        for _, t in self._queue_reader.list(
+                            JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
                         )
                     ]
-                    active_ids = {t.prompt_id for t in all_tasks}
-                    if self._last_failed_task_id not in active_ids:
+                    active_ids = {t.prompt_id for t in all_jobs}
+                    if self._last_failed_job_id not in active_ids:
                         self._crash_count = 0
                         self._dispatch_skip_offset = 0
-                        self._last_failed_task_id = None
+                        self._last_failed_job_id = None
 
-                is_busy = self._is_busy(has_tasks)
+                is_busy = self._is_busy(has_jobs)
 
                 # 更新空闲/繁忙外挂脚本运行状态
                 self._process_manager.update_state(is_busy, self._ever_active)
@@ -180,7 +180,7 @@ class Gateway:
                 # 必须在 update_state 触发运行状态变更之后，重新获取外挂脚本最新的实际运行状态，以保证后续判断基于最新数据
                 scripts_running = self._process_manager.is_running()
 
-                should_prevent = self._should_prevent_sleep(has_tasks, scripts_running)
+                should_prevent = self._should_prevent_sleep(has_jobs, scripts_running)
 
                 if should_prevent:
                     self._power_controller.prevent_sleep()
@@ -307,14 +307,14 @@ class Gateway:
         if executing:
             # 只有在下游真正开始执行任务时，才将 _ever_active 设为 True
             self._ever_active = True
-            self._task_start_time = int(time.time() * 1000)
+            self._job_start_time = int(time.time() * 1000)
             self._refresh()
         else:
             # 任务完成时记录执行时长（崩溃时不记录，避免污染预估数据）
-            if not self._crashed_executing and self._task_start_time is not None:
-                duration_ms = int(time.time() * 1000) - self._task_start_time
+            if not self._crashed_executing and self._job_start_time is not None:
+                duration_ms = int(time.time() * 1000) - self._job_start_time
                 self._estimation_service.record_completion(duration_ms)
-            self._task_start_time = None
+            self._job_start_time = None
 
             # 如果是因为崩溃导致的执行结束，不能清零失败计数，否则无法完成崩溃跳过逻辑
             if self._crashed_executing:
@@ -323,15 +323,15 @@ class Gateway:
                 # 说明任务成功完成，应重置崩溃计数并清理运行队列
                 if self._ever_active:
                     self._crash_count = 0
-                    self._last_failed_task_id = None
-                    self._queue_writer.update_task_status(
-                        TaskStatus.COMPLETED, filter_status=TaskStatus.RUNNING
+                    self._last_failed_job_id = None
+                    self._queue_writer.update_status(
+                        JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
                     )
             else:
                 self._crash_count = 0
-                self._last_failed_task_id = None
-                self._queue_writer.update_task_status(
-                    TaskStatus.COMPLETED, filter_status=TaskStatus.RUNNING
+                self._last_failed_job_id = None
+                self._queue_writer.update_status(
+                    JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
                 )
             self._refresh()
             skip = self.get_dispatch_skip()
@@ -339,7 +339,7 @@ class Gateway:
                 "DownstreamExecutingChanged: executing=False done, dispatch_skip=%s "
                 "(pending=%s crashed=%s paused=%s ready=%s)",
                 skip,
-                self._queue_reader.get_task_count(TaskFilters([TaskStatus.PENDING])),
+                self._queue_reader.count(JobFilters([JobStatus.PENDING])),
                 self._crashed_executing,
                 self._paused,
                 self._downstream_ready,
@@ -361,34 +361,33 @@ class Gateway:
                 self._cancel_dispatch_retry()
                 self._cancel_dispatch_retry = None
             self._dispatch_skip_offset = 0
-            self._last_failed_task_id = None
+            self._last_failed_job_id = None
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
-        running_tasks: List[Task] = [
-            t
-            for _, t in self._queue_reader.get_tasks(TaskFilters([TaskStatus.RUNNING]))
+        running_jobs: List[Job] = [
+            t for _, t in self._queue_reader.list(JobFilters([JobStatus.RUNNING]))
         ]
         self._ever_active = False
 
-        if running_tasks:
-            task = running_tasks[0]
+        if running_jobs:
+            job = running_jobs[0]
             # 如果崩溃的任务与上次失败的任务不同，重置崩溃计数（按任务隔离）
             if (
-                self._last_failed_task_id is not None
-                and self._last_failed_task_id != task.prompt_id
+                self._last_failed_job_id is not None
+                and self._last_failed_job_id != job.prompt_id
             ):
                 self._crash_count = 0
-            self._last_failed_task_id = task.prompt_id
+            self._last_failed_job_id = job.prompt_id
             # 崩溃超过阈值直接标记为永久失败，避免阻塞整个队列
             if self._crash_count >= 2:
-                self._queue_writer.update_task_status(
-                    TaskStatus.FAILED, prompt_id=task.prompt_id
+                self._queue_writer.update_status(
+                    JobStatus.FAILED, prompt_id=job.prompt_id
                 )
                 self._crash_count = 0
-                self._last_failed_task_id = None
-                self._dispatcher.handle_failed_task(
-                    task, "Downstream crashed 3 times during execution."
+                self._last_failed_job_id = None
+                self._dispatcher.handle_failed_job(
+                    job, "Downstream crashed 3 times during execution."
                 )
                 self._crashed_executing = False
             else:
@@ -423,7 +422,7 @@ class Gateway:
         self._publish_status_changed()
         if not ev.is_permanent:
             self._dispatch_skip_offset += 1
-            self._last_failed_task_id = ev.task_id
+            self._last_failed_job_id = ev.prompt_id
 
             # 启动延迟重试驱动，避免瞬时网络异常引起高频无效空转
             if self._cancel_dispatch_retry:
@@ -442,27 +441,25 @@ class Gateway:
         if self._paused or self._downstream_executing or not self._downstream_ready:
             return None
 
-        pending_count = self._queue_reader.get_task_count(
-            TaskFilters([TaskStatus.PENDING])
-        )
+        pending_count = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
         if pending_count <= 0:
             return None
 
         return self._dispatch_skip_offset % pending_count
 
-    def _is_busy(self, has_tasks: bool) -> bool:
+    def _is_busy(self, has_jobs: bool) -> bool:
         """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
-        return self._downstream_executing or (not self._paused and has_tasks)
+        return self._downstream_executing or (not self._paused and has_jobs)
 
-    def _should_prevent_sleep(self, has_tasks: bool, scripts_running: bool) -> bool:
+    def _should_prevent_sleep(self, has_jobs: bool, scripts_running: bool) -> bool:
         """决策当前网关是否应当阻止操作系统进入休眠。"""
-        is_busy = self._is_busy(has_tasks)
+        is_busy = self._is_busy(has_jobs)
         return is_busy or scripts_running
 
     def _publish_status_changed(self) -> None:
         """发布状态变更事件，并输出包含队列长度和预估时间的 INFO 日志。"""
-        remaining = self._queue_reader.get_task_count(
-            TaskFilters([TaskStatus.PENDING, TaskStatus.RUNNING])
+        remaining = self._queue_reader.count(
+            JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
         )
         avg_ms = self._estimation_service.calculate_estimation()
         # 计算所有剩余任务的总预估时间

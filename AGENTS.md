@@ -7,8 +7,8 @@
 - 
 - **clean_architecture_ddd:** 所有网关业务状态机的流转、休眠决策和任务派发计算逻辑，必须定义在领域层（`gateway/domain/`）的聚合根（如 `Gateway`）中。应用层（`gateway/application/`）作为轻量级编排层，仅负责胶水装配和执行副作用，禁止编写具体的业务状态转移判定（防止贫血模型）。
 - **clean_architecture_ddd:** 领域层与应用层不得直接依赖任何具体技术细节（如 `aiohttp`, `sqlite3`）。所有底层技术实现均需在 `gateway/infrastructure/` 下开发，并通过依赖注入注入到应用层所声明的抽象接口（在 `gateway/shared/interfaces.py` 中定义）上。
-- **cqrs_isp:** 物理队列读写划分为 `TaskQueueReader` 与 `TaskQueueWriter`。对于所有的查询（Queries），只允许注入 `TaskQueueReader`，禁止获取写入接口，遵循最小接口原则与读写分离契约。
-- **shared_layer:** 纯数据模型（如 `Task`, `RawJSON`）、系统自定义异常和核心抽象接口必须存放在允许所有层导入的 `gateway/shared/` 包中。该包不得依赖项目中的其他任何包，以完全避免循环导入并降低类型转换开销。
+- **cqrs_isp:** 物理队列读写划分为 `JobQueueReader` 与 `JobQueueWriter`。对于所有的查询（Queries），只允许注入 `JobQueueReader`，禁止获取写入接口，遵循最小接口原则与读写分离契约。
+- **shared_layer:** 纯数据模型（如 `Job`, `RawJSON`）、系统自定义异常和核心抽象接口必须存放在允许所有层导入的 `gateway/shared/` 包中。该包不得依赖项目中的其他任何包，以完全避免循环导入并降低类型转换开销。
 - **facade_injection:** 表示层的 `GatewayHandlers` 只允许注入聚合后的 `AppFacade` 门面及 `DownstreamAppService` 服务。禁止在控制器中单独注入多个散装的 Command/Query Handler，控制器调用均需经过 `self._app.xxx.handle()` 执行，以保证开闭原则。
 - **resource_lifecycle:** 抽象接口（`gateway/shared/interfaces.py`）禁止定义 `close()`、`cleanup()` 等资源释放方法——资源生命周期是基础设施实现细节，不属于业务契约。资源释放由组合根（`main.py`）负责，遵循"谁创建谁释放"原则。当工厂函数创建了需要释放的资源时，必须将清理回调作为返回值显式交还给调用方（如 `init_queue` 返回 `(reader, writer, close_fn)` 三元组），禁止依赖 `hasattr` 或方法名约定。
 - **术语：**　接口层就是表现层，不要和 shared/interfaces 语言层面的接口混淆

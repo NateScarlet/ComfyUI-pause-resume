@@ -4,7 +4,7 @@ class GatewayError(Exception):
     pass
 
 
-class TaskNotFoundError(GatewayError):
+class JobNotFoundError(GatewayError):
     """请求的任务在队列中未找到时抛出此异常。"""
 
     pass

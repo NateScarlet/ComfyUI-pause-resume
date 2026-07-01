@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Sequence, List, Any, Optional
 
 
-class TaskStatus(str, Enum):
+class JobStatus(str, Enum):
     """任务在队列中的状态。"""
 
     PENDING = "pending"
@@ -40,15 +40,15 @@ class EstimationState:
 
 
 @dataclass(frozen=True)
-class TaskSummary:
-    """网关任务队列中任务的轻量级摘要，用于列表页展示。
+class JobSummary:
+    """任务队列中任务的轻量级摘要，用于列表页展示。
 
     去掉了体积庞大的 prompt 和 outputs_to_execute 字段。
     """
 
     number: float
     prompt_id: str
-    status: TaskStatus
+    status: JobStatus
     workflow_id: Optional[str]
     create_time: int
     extra_data: Optional[RawJSON] = None
@@ -62,8 +62,8 @@ class TaskSummary:
 
 
 @dataclass(frozen=True)
-class Task:
-    """网关任务队列中的任务实体，采用不可变设计，防止并发修改。
+class Job:
+    """任务队列中的任务实体，采用不可变设计，防止并发修改。
 
     为了提升网关在并发状态下的吞吐性能，prompt 和 extra_data 以 RawJSON 存储。
     """
@@ -95,13 +95,13 @@ class Task:
 
 
 @dataclass
-class TaskFilters:
-    """网关任务过滤条件，支持底层数据库粗筛和内存细筛。"""
+class JobFilters:
+    """队列任务过滤条件，支持底层数据库粗筛和内存细筛。"""
 
-    statuses: Optional[List[TaskStatus]] = None
+    statuses: Optional[List[JobStatus]] = None
     workflow_id: Optional[str] = None
 
-    def matches(self, status: TaskStatus, task: Task) -> bool:
+    def matches(self, status: JobStatus, job: Job) -> bool:
         """内存细筛：判断一个任务是否真正匹配此过滤器。"""
         if self.statuses is not None and status not in self.statuses:
             return False
@@ -109,7 +109,7 @@ class TaskFilters:
             import json
 
             try:
-                extra_data = json.loads(task.extra_data)
+                extra_data = json.loads(job.extra_data)
                 extra_pnginfo = extra_data.get("extra_pnginfo", {})
                 workflow = extra_pnginfo.get("workflow", {})
                 w_id = workflow.get("id")

@@ -4,7 +4,7 @@ import os
 import time
 import json
 from gateway.infrastructure.sqlite.queue import SQLiteQueue
-from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters, TaskSummary
+from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
 
 
 class TestSQLiteQueue(unittest.TestCase):
@@ -47,10 +47,10 @@ class TestSQLiteQueue(unittest.TestCase):
         self.assertIn("idx_jobs_number", indexes)
         self.assertIn("idx_jobs_workflow_id", indexes)
 
-    def test_get_task_summaries(self):
-        """测试 get_task_summaries 能够正确返回 TaskSummary，且字段匹配正确。"""
+    def test_get_summaries(self):
+        """测试 get_summaries 能够正确返回 TaskSummary，且字段匹配正确。"""
         # 写入测试数据
-        task1 = Task(
+        job1 = Job(
             number=1.0,
             prompt_id="prompt-1",
             prompt=RawJSON('{"foo": "bar"}'),
@@ -58,7 +58,7 @@ class TestSQLiteQueue(unittest.TestCase):
             outputs_to_execute=["output-1"],
             create_time=1000,
         )
-        task2 = Task(
+        job2 = Job(
             number=2.0,
             prompt_id="prompt-2",
             prompt=RawJSON('{"hello": "world"}'),
@@ -67,48 +67,48 @@ class TestSQLiteQueue(unittest.TestCase):
             create_time=2000,
         )
 
-        self.queue.add_task(task1)
-        self.queue.add_task(task2)
+        self.queue.add(job1)
+        self.queue.add(job2)
 
-        # 验证默认的 get_tasks，确认字段检索依然完整
-        tasks = self.queue.get_tasks()
-        self.assertEqual(len(tasks), 2)
-        self.assertEqual(tasks[0][1].prompt_id, "prompt-1")
+        # 验证默认的 list，确认字段检索依然完整
+        jobs = self.queue.list()
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(jobs[0][1].prompt_id, "prompt-1")
 
-        # 验证专用的 get_task_summaries
-        summaries = self.queue.get_task_summaries()
+        # 验证专用的 get_summaries
+        summaries = self.queue.get_summaries()
         self.assertEqual(len(summaries), 2)
 
         # 检查返回列表的类型是否均为特定的 TaskSummary
         for summary in summaries:
-            self.assertIsInstance(summary, TaskSummary)
+            self.assertIsInstance(summary, JobSummary)
 
         # 校验各个数据字段内容是否正确，确认 workflow_id 已提取出来且没有 extra_data 字段
         s1 = summaries[0]
         self.assertEqual(s1.number, 1.0)
         self.assertEqual(s1.prompt_id, "prompt-1")
-        self.assertEqual(s1.status, TaskStatus.PENDING)
+        self.assertEqual(s1.status, JobStatus.PENDING)
         self.assertEqual(s1.workflow_id, "workflow-1")
         self.assertIsNotNone(s1.extra_data)
         self.assertEqual(s1.create_time, 1000)
 
         # 验证支持通过 workflow_id 进行 SQL 精确过滤
-        workflow_filter = TaskFilters(workflow_id="workflow-2")
-        summaries_filtered = self.queue.get_task_summaries(filter_by=workflow_filter)
+        workflow_filter = JobFilters(workflow_id="workflow-2")
+        summaries_filtered = self.queue.get_summaries(filter_by=workflow_filter)
         self.assertEqual(len(summaries_filtered), 1)
         self.assertEqual(summaries_filtered[0].prompt_id, "prompt-2")
 
         # 验证排序机制 (DESC)
-        summaries_desc = self.queue.get_task_summaries(desc=True)
+        summaries_desc = self.queue.get_summaries(desc=True)
         self.assertEqual(summaries_desc[0].prompt_id, "prompt-2")
 
         # 验证分页限制与偏移量
-        summaries_page = self.queue.get_task_summaries(limit=1, offset=1)
+        summaries_page = self.queue.get_summaries(limit=1, offset=1)
         self.assertEqual(len(summaries_page), 1)
         self.assertEqual(summaries_page[0].prompt_id, "prompt-2")
 
     def test_performance_benchmark(self):
-        """性能基准测试：在大体积 extra_data 负载下，验证 get_task_summaries 比 get_tasks 具有极其恐怖的性能领先优势。"""
+        """性能基准测试：在大体积 extra_data 负载下，验证 get_summaries 比 list 具有极其恐怖的性能领先优势。"""
         # 构造大体积的 extra_data (包含庞大的 workflow 节点数据，大概 200KB)
         big_workflow_data = {
             "extra_pnginfo": {
@@ -122,31 +122,31 @@ class TestSQLiteQueue(unittest.TestCase):
 
         # 写入 500 个带超大 extra_data 负载的任务
         for i in range(500):
-            task = Task(
+            job = Job(
                 number=float(i),
-                prompt_id=f"perf-task-{i}",
+                prompt_id=f"perf-job-{i}",
                 prompt=RawJSON('{"val": 1}'),
                 extra_data=RawJSON(big_extra_data_str),
                 outputs_to_execute=[f"out-{i}"],
                 create_time=int(time.time()),
             )
-            self.queue.add_task(task)
+            self.queue.add(job)
 
-        # 1. 运行原有 get_tasks (检索包括巨大的 extra_data 字段以及 outputs 反序列化)
+        # 1. 运行原有 list (检索包括巨大的 extra_data 字段以及 outputs 反序列化)
         t_start = time.perf_counter()
-        tasks = self.queue.get_tasks(limit=200)
-        t_get_tasks = (time.perf_counter() - t_start) * 1000
+        job = self.queue.list(limit=200)
+        t_list = (time.perf_counter() - t_start) * 1000
 
-        # 2. 运行优化后的 get_task_summaries (完全舍弃了 extra_data，只返回已编好索引的元数据，不需反序列化)
+        # 2. 运行优化后的 get_summaries (完全舍弃了 extra_data，只返回已编好索引的元数据，不需反序列化)
         t_start = time.perf_counter()
-        summaries = self.queue.get_task_summaries(limit=200)
+        summaries = self.queue.get_summaries(limit=200)
         t_summaries = (time.perf_counter() - t_start) * 1000
 
         print(f"\n[Performance Benchmark with massive extra_data (500 tasks, limit 200)]")
-        print(f"Original get_tasks: {t_get_tasks:.2f} ms")
-        print(f"Optimized get_task_summaries (Zero loads): {t_summaries:.2f} ms")
+        print(f"Original list: {t_list:.2f} ms")
+        print(f"Optimized get_summaries (Zero loads): {t_summaries:.2f} ms")
 
-        self.assertEqual(len(tasks), 200)
+        self.assertEqual(len(job), 200)
         self.assertEqual(len(summaries), 200)
 
         # 耗时必须非常小 (远低于 500ms 且理论上由于去掉了 40MB extra_data 反序列化，应该低于 5ms)

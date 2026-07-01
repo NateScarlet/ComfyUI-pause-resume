@@ -2,10 +2,10 @@ import os
 import json
 import random
 import logging
-from typing import Tuple, Any, Callable
+from typing import Tuple, Callable
 
 from gateway.config import GatewayConfig, BASE_DIR
-from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
+from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from .sqlite.queue import SQLiteQueue
 from .file.json_queue import JSONFileQueue
 
@@ -14,15 +14,13 @@ logger = logging.getLogger(__name__)
 
 def init_queue(
     config: GatewayConfig,
-) -> Tuple[TaskQueueReader, TaskQueueWriter, Callable[[], None]]:
-    """根据配置初始化 TaskQueue，返回 (reader, writer, close_fn)。
+) -> Tuple[JobQueueReader, JobQueueWriter, Callable[[], None]]:
+    """根据配置初始化 JobQueue，返回 (reader, writer, close_fn)。
 
     close_fn 用于释放队列占用的底层资源，由构建方在关闭时调用。
     """
     os.makedirs(config.data_dir, exist_ok=True)
 
-    # 声明类型为同时实现读写接口的复合实例
-    queue_instance: Any
     if config.queue_type == "json":
         logger.info("💾 Using JSONFileQueue.")
         queue_instance = JSONFileQueue(os.path.join(config.data_dir, "queue.json"))
@@ -43,8 +41,8 @@ def init_queue(
         logger.info(f"📦 Found legacy queue file {old_json_path}. Migrating...")
         try:
             legacy_queue = JSONFileQueue(old_json_path)
-            for _, task in legacy_queue.get_tasks():
-                queue_instance.add_task(task)
+            for _, job in legacy_queue.list():
+                queue_instance.add(job)
             legacy_queue.close()
 
             suffix = "".join(random.choices("0123456789abcdef", k=8))

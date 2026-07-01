@@ -5,13 +5,13 @@ import time
 import json
 from typing import List, Optional, Tuple, Any
 
-from gateway.shared.interfaces import TaskQueueReader, TaskQueueWriter
-from gateway.shared.models import Task, RawJSON, TaskStatus, TaskFilters, TaskSummary
+from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
+from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
 
 logger = logging.getLogger(__name__)
 
 
-class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
+class SQLiteQueue(JobQueueReader, JobQueueWriter):
     """基于 SQLite3 数据库实现的任务队列，支持高并发读写，并集成了 WAL 日志模式。"""
 
     def __init__(self, db_path: str, history_retention_days: int = 90):
@@ -242,9 +242,9 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 db_version = 5
 
     @staticmethod
-    def _row_to_task(row: Any) -> Task:
+    def _row_to_job(row: Any) -> Job:
         """将 DB 查询出的行数据转化为不可变的 Task 实体。"""
-        return Task(
+        return Job(
             number=row[0],
             prompt_id=row[1],
             prompt=RawJSON(row[2]),
@@ -259,12 +259,12 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         )
 
     @staticmethod
-    def _row_to_task_summary(row: Any) -> TaskSummary:
+    def _row_to_task_summary(row: Any) -> JobSummary:
         """将 DB 查询出的行数据转化为不可变的 TaskSummary 实体。"""
-        return TaskSummary(
+        return JobSummary(
             number=row[0],
             prompt_id=row[1],
-            status=TaskStatus(row[2]),
+            status=JobStatus(row[2]),
             workflow_id=row[3],
             create_time=row[4],
             extra_data=RawJSON(row[5]) if row[5] else None,
@@ -275,13 +275,13 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             execution_error=RawJSON(row[10]) if row[10] else None,
         )
 
-    def get_tasks(
+    def list(
         self,
-        filter_by: Optional[TaskFilters] = None,
+        filter_by: Optional[JobFilters] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[Tuple[TaskStatus, Task]]:
+    ) -> List[Tuple[JobStatus, Job]]:
         """获取符合条件的任务列表，支持分页限制和排序方向。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -319,21 +319,21 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
-            result: List[Tuple[TaskStatus, Task]] = []
+            result: List[Tuple[JobStatus, Job]] = []
             for row in cursor.fetchall():
-                task = self._row_to_task(row)
-                task_status = TaskStatus(row[11])
-                result.append((task_status, task))
+                job = self._row_to_job(row)
+                job_status = JobStatus(row[11])
+                result.append((job_status, job))
 
             return result
 
-    def get_task_summaries(
+    def get_summaries(
         self,
-        filter_by: Optional[TaskFilters] = None,
+        filter_by: Optional[JobFilters] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[TaskSummary]:
+    ) -> List[JobSummary]:
         """获取符合条件的任务摘要列表，支持分页限制和排序方向。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -372,15 +372,15 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
-            result: List[TaskSummary] = []
+            result: List[JobSummary] = []
             for row in cursor.fetchall():
                 result.append(self._row_to_task_summary(row))
 
             return result
 
-    def get_task_count(
+    def count(
         self,
-        filter_by: Optional[TaskFilters] = None,
+        filter_by: Optional[JobFilters] = None,
         limit: Optional[int] = None,
     ) -> int:
         """获取符合条件的任务数量。"""
@@ -416,11 +416,11 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         t_total = (time.perf_counter() - t_start) * 1000
         if t_total > 10:
             logger.debug(
-                f"SQLite get_task_count(filter_by={filter_by}, limit={limit}) = {result} took {t_total:.1f}ms"
+                f"SQLite count(filter_by={filter_by}, limit={limit}) = {result} took {t_total:.1f}ms"
             )
         return result
 
-    def new_task_number(self) -> int:
+    def new_number(self) -> int:
         """分配生成一个新的唯一任务编号。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -434,15 +434,15 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             self._conn.commit()
             return number
 
-    def add_task(self, task: Task) -> None:
+    def add(self, job: Job) -> None:
         """添加新任务到待处理队列中。"""
         t_start = time.perf_counter()
 
         # 提取 workflow_id 以便写入数据库物理列
         w_id = None
-        if task.extra_data:
+        if job.extra_data:
             try:
-                extra_data = json.loads(task.extra_data)
+                extra_data = json.loads(job.extra_data)
                 w_id = extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id")
             except Exception:
                 pass
@@ -450,19 +450,19 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             cursor = self._conn.cursor()
             t_serialize_start = time.perf_counter()
-            outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
+            outputs_str = json.dumps(job.outputs_to_execute, ensure_ascii=False)
             t_serialize = (time.perf_counter() - t_serialize_start) * 1000
 
             cursor.execute(
                 "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, NULL, NULL)",
                 (
-                    task.prompt_id,
-                    task.number,
-                    task.prompt,
-                    task.extra_data,
+                    job.prompt_id,
+                    job.number,
+                    job.prompt,
+                    job.extra_data,
                     w_id,
                     outputs_str,
-                    task.create_time,
+                    job.create_time,
                 ),
             )
             t_commit_start = time.perf_counter()
@@ -470,43 +470,43 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             t_commit = (time.perf_counter() - t_commit_start) * 1000
         t_total = (time.perf_counter() - t_start) * 1000
         logger.debug(
-            f"SQLite add_task {task.prompt_id}: "
+            f"SQLite add_task {job.prompt_id}: "
             f"serialize={t_serialize:.1f}ms commit={t_commit:.1f}ms total={t_total:.1f}ms"
         )
 
-    def save_task(self, task: Task) -> bool:
+    def save(self, job: Job) -> bool:
         """保存任务数据实体（如果已存在则更新，不存在则插入）。"""
         w_id = None
-        if task.extra_data:
+        if job.extra_data:
             try:
-                extra_data = json.loads(task.extra_data)
+                extra_data = json.loads(job.extra_data)
                 w_id = extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id")
             except Exception:
                 pass
 
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute("SELECT 1 FROM jobs WHERE id = ?", (task.prompt_id,))
+            cursor.execute("SELECT 1 FROM jobs WHERE id = ?", (job.prompt_id,))
             exists = cursor.fetchone() is not None
 
-            outputs_str = json.dumps(task.outputs_to_execute, ensure_ascii=False)
+            outputs_str = json.dumps(job.outputs_to_execute, ensure_ascii=False)
 
             if exists:
                 cursor.execute(
                     "UPDATE jobs SET number = ?, prompt = ?, extra_data = ?, workflow_id = ?, outputs_to_execute = ?, create_time = ?, outputs = ?, preview_output = ?, execution_start_time = ?, execution_end_time = ?, execution_error = ? WHERE id = ?",
                     (
-                        task.number,
-                        task.prompt,
-                        task.extra_data,
+                        job.number,
+                        job.prompt,
+                        job.extra_data,
                         w_id,
                         outputs_str,
-                        task.create_time,
-                        str(task.outputs) if task.outputs else None,
-                        str(task.preview_output) if task.preview_output else None,
-                        task.execution_start_time,
-                        task.execution_end_time,
-                        str(task.execution_error) if task.execution_error else None,
-                        task.prompt_id,
+                        job.create_time,
+                        str(job.outputs) if job.outputs else None,
+                        str(job.preview_output) if job.preview_output else None,
+                        job.execution_start_time,
+                        job.execution_end_time,
+                        str(job.execution_error) if job.execution_error else None,
+                        job.prompt_id,
                     ),
                 )
                 changed = cursor.rowcount > 0
@@ -514,18 +514,18 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                 cursor.execute(
                     "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
                     (
-                        task.prompt_id,
-                        task.number,
-                        task.prompt,
-                        task.extra_data,
+                        job.prompt_id,
+                        job.number,
+                        job.prompt,
+                        job.extra_data,
                         w_id,
                         outputs_str,
-                        task.create_time,
-                        str(task.outputs) if task.outputs else None,
-                        str(task.preview_output) if task.preview_output else None,
-                        task.execution_start_time,
-                        task.execution_end_time,
-                        str(task.execution_error) if task.execution_error else None,
+                        job.create_time,
+                        str(job.outputs) if job.outputs else None,
+                        str(job.preview_output) if job.preview_output else None,
+                        job.execution_start_time,
+                        job.execution_end_time,
+                        str(job.execution_error) if job.execution_error else None,
                     ),
                 )
                 changed = True
@@ -533,7 +533,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             self._conn.commit()
             return changed
 
-    def pop_task(self, skip: int = 0) -> Optional[Task]:
+    def pop(self, skip: int = 0) -> Optional[Job]:
         """弹出指定偏移量的待处理任务，并将其更新标记为正在运行。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -548,7 +548,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
                     "UPDATE jobs SET status = 'running' WHERE id = ?", (target_id,)
                 )
                 self._conn.commit()
-                return self._row_to_task(row)
+                return self._row_to_job(row)
             return None
 
     def requeue_running(self) -> None:
@@ -598,11 +598,11 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             )
             self._conn.commit()
 
-    def update_task_status(
+    def update_status(
         self,
-        new_status: TaskStatus,
+        new_status: JobStatus,
         prompt_id: Optional[str] = None,
-        filter_status: Optional[TaskStatus] = None,
+        filter_status: Optional[JobStatus] = None,
     ) -> bool:
         """更新指定任务的状态。"""
         with self._lock:
@@ -625,9 +625,9 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             changed = cursor.rowcount > 0
             self._conn.commit()
             if changed and new_status in (
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
             ):
                 self._cleanup_expired_history()
             return changed
@@ -649,7 +649,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
         with self._lock:
             self._conn.close()
 
-    def get_task_by_id(self, prompt_id: str) -> Optional[Tuple[TaskStatus, Task]]:
+    def get(self, prompt_id: str) -> Optional[Tuple[JobStatus, Job]]:
         """根据 ID 获取任务及其当前状态。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -660,7 +660,7 @@ class SQLiteQueue(TaskQueueReader, TaskQueueWriter):
             )
             row = cursor.fetchone()
             if row:
-                task = self._row_to_task(row)
-                task_status = TaskStatus(row[11])
-                return task_status, task
+                job = self._row_to_job(row)
+                job_status = JobStatus(row[11])
+                return job_status, job
             return None

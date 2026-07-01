@@ -10,13 +10,13 @@ from typing import List, Set, Union, cast, Dict, Any
 
 from gateway.shared.utils import raw_json_dumps
 from gateway.shared.interfaces import (
-    TaskQueueReader,
+    JobQueueReader,
     DownstreamClient,
     EventBus,
 )
-from gateway.shared.models import TaskStatus, TaskFilters, TaskSummary
+from gateway.shared.models import JobStatus, JobFilters, JobSummary
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
-from gateway.shared.exceptions import GatewayError, TaskNotFoundError
+from gateway.shared.exceptions import GatewayError, JobNotFoundError
 from gateway.application.facade import AppFacade
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -71,7 +71,7 @@ class GatewayHandlers:
         self,
         app: AppFacade,
         downstream_service: DownstreamClient,
-        queue_reader: TaskQueueReader,
+        queue_reader: JobQueueReader,
         event_bus: EventBus,
     ):
         self._app = app
@@ -291,7 +291,7 @@ class GatewayHandlers:
 
                 front = bool(body_dict.get("front", False))
 
-                result = self._app.add_task.handle(
+                result = self._app.add_job.handle(
                     prompt=prompt,
                     extra_data=extra_data,
                     prompt_id=prompt_id,
@@ -319,13 +319,13 @@ class GatewayHandlers:
 
         # 2. 拦截队列状态查询：GET /queue
         if method == "GET" and path in ("/queue", "/api/queue"):
-            tasks = self._app.get_queue.handle()
+            jobs = self._app.get_queue.handle()
             res_data = {
                 "queue_running": [
-                    t.to_list() for status, t in tasks if status == TaskStatus.RUNNING
+                    t.to_list() for status, t in jobs if status == JobStatus.RUNNING
                 ],
                 "queue_pending": [
-                    t.to_list() for status, t in tasks if status == TaskStatus.PENDING
+                    t.to_list() for status, t in jobs if status == JobStatus.PENDING
                 ],
             }
             return web.json_response(res_data, dumps=raw_json_dumps)
@@ -348,19 +348,19 @@ class GatewayHandlers:
                     status_filter = [
                         s.strip().lower() for s in status_param.split(",") if s.strip()
                     ]
-                    statuses: List[TaskStatus] = []
+                    statuses: List[JobStatus] = []
                     invalid_statuses: List[str] = []
                     for sf in status_filter:
                         if sf == "pending":
-                            statuses.append(TaskStatus.PENDING)
+                            statuses.append(JobStatus.PENDING)
                         elif sf == "in_progress":
-                            statuses.append(TaskStatus.RUNNING)
+                            statuses.append(JobStatus.RUNNING)
                         elif sf == "completed":
-                            statuses.append(TaskStatus.COMPLETED)
+                            statuses.append(JobStatus.COMPLETED)
                         elif sf == "failed":
-                            statuses.append(TaskStatus.FAILED)
+                            statuses.append(JobStatus.FAILED)
                         elif sf == "cancelled":
-                            statuses.append(TaskStatus.CANCELLED)
+                            statuses.append(JobStatus.CANCELLED)
                         else:
                             invalid_statuses.append(sf)
                     if invalid_statuses:
@@ -370,11 +370,11 @@ class GatewayHandlers:
                         )
                 else:
                     statuses = [
-                        TaskStatus.PENDING,
-                        TaskStatus.RUNNING,
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
+                        JobStatus.PENDING,
+                        JobStatus.RUNNING,
+                        JobStatus.COMPLETED,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
                     ]
 
                 # 3.2. 解析并验证 limit / offset
@@ -396,14 +396,12 @@ class GatewayHandlers:
                 reverse = sort_order == "desc"
                 workflow_id_param = query_params.get("workflow_id")
 
-                # 3.4. 构造 TaskFilters 条件并调用应用层
-                filter_by = TaskFilters(
-                    statuses=statuses, workflow_id=workflow_id_param
-                )
+                # 3.4. 构造筛选条件并调用应用层
+                filter_by = JobFilters(statuses=statuses, workflow_id=workflow_id_param)
 
                 # 获取任务列表并计时
                 t_get_jobs_start = time.perf_counter()
-                tasks_page = await self._app.get_jobs.handle(
+                page = await self._app.get_jobs.handle(
                     filter_by=filter_by,
                     limit=limit_val,
                     offset=offset_val,
@@ -420,7 +418,7 @@ class GatewayHandlers:
                 t_format_start = time.perf_counter()
 
                 def make_job_dict(
-                    summary: TaskSummary, status_str: str
+                    summary: JobSummary, status_str: str
                 ) -> Dict[str, Any]:
                     outputs_count = 0
                     preview_output = None
@@ -455,10 +453,10 @@ class GatewayHandlers:
                     return res
 
                 jobs_json: List[Dict[str, Any]] = []
-                for summary in tasks_page:
+                for summary in page:
                     status_str = (
                         "in_progress"
-                        if summary.status == TaskStatus.RUNNING
+                        if summary.status == JobStatus.RUNNING
                         else summary.status.value
                     )
                     jobs_json.append(make_job_dict(summary, status_str))
@@ -502,7 +500,7 @@ class GatewayHandlers:
                 try:
                     cancelled = await self._app.cancel_job.handle(job_id)
                     return web.json_response({"cancelled": cancelled})
-                except TaskNotFoundError:
+                except JobNotFoundError:
                     return web.Response(status=404, text="Job not found")
 
         # 4. 拦截具体 job 详情查询：GET /api/jobs/{job_id}
@@ -512,14 +510,14 @@ class GatewayHandlers:
                 job_id = parts[2]
                 res_data = await self._app.get_job_detail.handle(job_id)
                 if res_data is not None:
-                    status, task = res_data
+                    status, jobs = res_data
                     status_str = (
-                        "in_progress" if status == TaskStatus.RUNNING else status.value
+                        "in_progress" if status == JobStatus.RUNNING else status.value
                     )
                     extra_data: Dict[str, Any] = {}
-                    if task.extra_data:
+                    if jobs.extra_data:
                         try:
-                            parsed = json.loads(task.extra_data)
+                            parsed = json.loads(jobs.extra_data)
                             if isinstance(parsed, dict):
                                 extra_data = cast(Dict[str, Any], parsed)
                         except Exception:
@@ -531,28 +529,28 @@ class GatewayHandlers:
                     workflow_id = workflow.get("id")
 
                     outputs_val = None
-                    if task.outputs:
-                        outputs_val = json.loads(task.outputs)
-                    outputs_count = self._parse_outputs_count(task.outputs)
+                    if jobs.outputs:
+                        outputs_val = json.loads(jobs.outputs)
+                    outputs_count = self._parse_outputs_count(jobs.outputs)
 
                     preview_output_val = None
-                    if task.preview_output:
-                        preview_output_val = json.loads(task.preview_output)
+                    if jobs.preview_output:
+                        preview_output_val = json.loads(jobs.preview_output)
 
                     execution_error_val = None
-                    if task.execution_error:
-                        execution_error_val = json.loads(task.execution_error)
+                    if jobs.execution_error:
+                        execution_error_val = json.loads(jobs.execution_error)
 
                     job_detail = {
-                        "id": task.prompt_id,
+                        "id": jobs.prompt_id,
                         "status": status_str,
-                        "priority": task.number,
-                        "create_time": task.create_time,
+                        "priority": jobs.number,
+                        "create_time": jobs.create_time,
                         "outputs_count": outputs_count,
                         "workflow_id": workflow_id,
                         "workflow": {
-                            "prompt": task.prompt,
-                            "extra_data": task.extra_data,
+                            "prompt": jobs.prompt,
+                            "extra_data": jobs.extra_data,
                         },
                     }
 
@@ -560,10 +558,10 @@ class GatewayHandlers:
                         job_detail["outputs"] = outputs_val
                     if preview_output_val is not None:
                         job_detail["preview_output"] = preview_output_val
-                    if task.execution_start_time is not None:
-                        job_detail["execution_start_time"] = task.execution_start_time
-                    if task.execution_end_time is not None:
-                        job_detail["execution_end_time"] = task.execution_end_time
+                    if jobs.execution_start_time is not None:
+                        job_detail["execution_start_time"] = jobs.execution_start_time
+                    if jobs.execution_end_time is not None:
+                        job_detail["execution_end_time"] = jobs.execution_end_time
                     if execution_error_val is not None:
                         job_detail["execution_error"] = execution_error_val
 
@@ -618,12 +616,14 @@ class GatewayHandlers:
                                                     Dict[str, Any], data_json
                                                 )
                                                 if data_dict.get("type") == "status":
-                                                    remaining = self._queue_reader.get_task_count(
-                                                        TaskFilters(
-                                                            [
-                                                                TaskStatus.PENDING,
-                                                                TaskStatus.RUNNING,
-                                                            ]
+                                                    remaining = (
+                                                        self._queue_reader.count(
+                                                            JobFilters(
+                                                                [
+                                                                    JobStatus.PENDING,
+                                                                    JobStatus.RUNNING,
+                                                                ]
+                                                            )
                                                         )
                                                     )
                                                     data_payload = data_dict.get("data")

@@ -1,12 +1,12 @@
 from typing import Optional, List
-from gateway.shared.interfaces import TaskQueueWriter, EventBus
+from gateway.shared.interfaces import JobQueueWriter, EventBus
 from gateway.shared.events import QueueModifiedEvent
 
 
 class ModifyQueueCommandHandler:
     """清空队列或删除特定待处理任务的 Command Handler。"""
 
-    def __init__(self, queue_writer: TaskQueueWriter, event_bus: EventBus):
+    def __init__(self, queue_writer: JobQueueWriter, event_bus: EventBus):
         self._queue_writer = queue_writer
         self._event_bus = event_bus
 

@@ -4,8 +4,8 @@ import logging
 from typing import Dict, Any, List, Tuple, Optional, Union, cast
 
 from gateway.shared.interfaces import (
-    TaskQueueWriter,
-    TaskQueueReader,
+    JobQueueWriter,
+    JobQueueReader,
     DownstreamClient,
     EventBus,
 )
@@ -18,7 +18,7 @@ PREVIEWABLE_MEDIA_TYPES = frozenset({"images", "video", "audio", "3d", "text"})
 THREE_D_EXTENSIONS = frozenset({".obj", ".fbx", ".gltf", ".glb", ".usdz"})
 
 
-class TaskDownstreamSyncer:
+class JobDownstreamSyncer:
     """从物理下游 ComfyUI 异步同步任务省略信息的同步器。
 
     订阅派发成功事件和执行状态变化事件，在任务状态变化时从下游拉取完整信息并同步到网关。
@@ -26,8 +26,8 @@ class TaskDownstreamSyncer:
 
     def __init__(
         self,
-        queue_reader: TaskQueueReader,
-        queue_writer: TaskQueueWriter,
+        queue_reader: JobQueueReader,
+        queue_writer: JobQueueWriter,
         downstream: DownstreamClient,
         event_bus: EventBus,
     ):
@@ -80,7 +80,7 @@ class TaskDownstreamSyncer:
                                     prompt_id = str(item_list[1])
                                     outputs_to_execute = cast(List[Any], item_list[4])
                                     ds_job = self._normalize_queue_item(item_list)
-                                    await self._sync_single_task_data(
+                                    await self._sync_single_job_data(
                                         prompt_id,
                                         [str(x) for x in outputs_to_execute],
                                         ds_job,
@@ -103,7 +103,7 @@ class TaskDownstreamSyncer:
                                 ds_job = self._normalize_history_item(
                                     prompt_id, history_item_dict
                                 )
-                                await self._sync_single_task_data(
+                                await self._sync_single_job_data(
                                     prompt_id,
                                     [str(x) for x in outputs_to_execute],
                                     ds_job,
@@ -112,12 +112,12 @@ class TaskDownstreamSyncer:
         except Exception as e:
             logger.error(f"❌ Error during bulk sync: {e}", exc_info=True)
 
-    async def _sync_single_task_data(
+    async def _sync_single_job_data(
         self, prompt_id: str, outputs_to_execute: List[str], ds_job: Dict[str, Any]
     ) -> None:
         """同步并更新本地数据库里的单条任务记录。"""
         try:
-            res = self._queue_reader.get_task_by_id(prompt_id)
+            res = self._queue_reader.get(prompt_id)
             if not res:
                 return
             _, task = res
@@ -173,7 +173,7 @@ class TaskDownstreamSyncer:
                 execution_end_time=ds_job.get("execution_end_time"),
                 execution_error=error_json,
             )
-            self._queue_writer.save_task(updated_task)
+            self._queue_writer.save(updated_task)
             logger.info(
                 f"✅ Synced and saved task {prompt_id} details from downstream."
             )
