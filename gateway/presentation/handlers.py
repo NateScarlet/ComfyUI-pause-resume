@@ -301,15 +301,15 @@ class GatewayHandlers:
 
                 t_total = (time.perf_counter() - t_start) * 1000
                 logger.info(
-                    f"📥 Intercepted workflow {result['prompt_id']} "
-                    f"number={result['number']} "
+                    f"📥 Intercepted workflow {result.prompt_id} "
+                    f"number={result.number} "
                     f"(json={t_json:.1f}ms total={t_total:.1f}ms)"
                 )
 
                 return web.json_response(
                     {
-                        "prompt_id": result["prompt_id"],
-                        "number": result["number"],
+                        "prompt_id": result.prompt_id,
+                        "number": result.number,
                         "node_errors": {},
                     }
                 )
@@ -499,8 +499,8 @@ class GatewayHandlers:
             if len(parts) == 4 and parts[3] == "cancel":
                 job_id = parts[2]
                 try:
-                    cancelled = await self._app.cancel_job.handle(job_id)
-                    return web.json_response({"cancelled": cancelled})
+                    cancel_result = await self._app.cancel_job.handle(job_id)
+                    return web.json_response({"cancelled": cancel_result.cancelled})
                 except JobNotFoundError:
                     return web.Response(status=404, text="Job not found")
 

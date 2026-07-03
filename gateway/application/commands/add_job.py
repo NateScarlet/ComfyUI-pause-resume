@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 from gateway.shared.models import Job, RawJSON
 from gateway.shared.interfaces import JobQueueWriter, EventBus
 from gateway.shared.events import QueueModifiedEvent
+from gateway.shared.responses import AddJobResponse
 
 
 class AddJobCommandHandler:
@@ -21,7 +22,7 @@ class AddJobCommandHandler:
         prompt_id: Optional[str] = None,
         number: Optional[float] = None,
         front: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> AddJobResponse:
         """将任务保存至物理队列，并触发下游调度尝试。"""
         if extra_data is None:
             extra_data = {}
@@ -49,4 +50,4 @@ class AddJobCommandHandler:
         # 发布事件，由网关自行订阅处理
         self._event_bus.publish(QueueModifiedEvent())
 
-        return {"prompt_id": prompt_id, "number": job_number}
+        return AddJobResponse(prompt_id=prompt_id, number=job_number)

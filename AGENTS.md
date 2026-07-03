@@ -4,7 +4,7 @@
 - **快速失败：**　逻辑不能正常进行应直接报错中止流程而不是尝试容错继续流程，**禁止**出错只记录日志然后告诉调用者正常完成，**禁止**添加未要求的错误处理，忽略错误数据或跳过操作**必须**先获得用户明确允许。
 - **调试友好：**　错误捕获禁止直接忽略任何错误，要么进行有意义的处理，要么只忽略具体的错误类型，禁止简单拦截 Exeception 然后直接忽略。
 - **directory_structure:** 网关核心代码已拆分至 `gateway/` 包目录下，数据默认存储于 `gateway_data/` 目录下（可通过 `COMFYUI_GATEWAY_DATA_DIR` 环境变量进行自定义设置）。禁止向仓库根目录随意添加新的网关业务 python 文件。此外，保存提交失败任务信息的 `failed_workflows` 目录也必须保存在由 `COMFYUI_GATEWAY_DATA_DIR` 定义的网关数据存储目录下（即 `os.path.join(self.config.data_dir, "failed_workflows")`），禁止直接放置在项目根目录下。
-- 
+-
 - **clean_architecture_ddd:** 所有网关业务状态机的流转、休眠决策和任务派发计算逻辑，必须定义在领域层（`gateway/domain/`）的聚合根（如 `Gateway`）中。应用层（`gateway/application/`）作为轻量级编排层，仅负责胶水装配和执行副作用，禁止编写具体的业务状态转移判定（防止贫血模型）。
 - **clean_architecture_ddd:** 领域层与应用层不得直接依赖任何具体技术细节（如 `aiohttp`, `sqlite3`）。所有底层技术实现均需在 `gateway/infrastructure/` 下开发，并通过依赖注入注入到应用层所声明的抽象接口（在 `gateway/shared/interfaces.py` 中定义）上。
 - **cqrs_isp:** 物理队列读写划分为 `JobQueueReader` 与 `JobQueueWriter`。对于所有的查询（Queries），只允许注入 `JobQueueReader`，禁止获取写入接口，遵循最小接口原则与读写分离契约。
@@ -12,3 +12,5 @@
 - **facade_injection:** 表示层的 `GatewayHandlers` 只允许注入聚合后的 `AppFacade` 门面及 `DownstreamAppService` 服务。禁止在控制器中单独注入多个散装的 Command/Query Handler，控制器调用均需经过 `self._app.xxx.handle()` 执行，以保证开闭原则。
 - **resource_lifecycle:** 抽象接口（`gateway/shared/interfaces.py`）禁止定义 `close()`、`cleanup()` 等资源释放方法——资源生命周期是基础设施实现细节，不属于业务契约。资源释放由组合根（`main.py`）负责，遵循"谁创建谁释放"原则。当工厂函数创建了需要释放的资源时，必须将清理回调作为返回值显式交还给调用方（如 `init_queue` 返回 `(reader, writer, close_fn)` 三元组），禁止依赖 `hasattr` 或方法名约定。
 - **术语：**　接口层就是表现层，不要和 shared/interfaces 语言层面的接口混淆
+- **依赖倒置**：应用层不应依赖表现层的格式约定，而是表现层自己适配应用层返回格式
+- **类型安全**：用 dataclass 代替 Dict[str, Any]。
