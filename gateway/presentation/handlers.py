@@ -302,6 +302,7 @@ class GatewayHandlers:
                 t_total = (time.perf_counter() - t_start) * 1000
                 logger.info(
                     f"📥 Intercepted workflow {result['prompt_id']} "
+                    f"number={result['number']} "
                     f"(json={t_json:.1f}ms total={t_total:.1f}ms)"
                 )
 
