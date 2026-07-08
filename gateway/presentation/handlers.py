@@ -323,10 +323,10 @@ class GatewayHandlers:
             jobs = self._app.get_queue.handle()
             res_data = {
                 "queue_running": [
-                    t.to_list() for status, t in jobs if status == JobStatus.RUNNING
+                    t.to_list() for t in jobs if t.status == JobStatus.RUNNING
                 ],
                 "queue_pending": [
-                    t.to_list() for status, t in jobs if status == JobStatus.PENDING
+                    t.to_list() for t in jobs if t.status == JobStatus.PENDING
                 ],
             }
             return web.json_response(res_data, dumps=raw_json_dumps)
@@ -511,14 +511,16 @@ class GatewayHandlers:
                 job_id = parts[2]
                 res_data = await self._app.get_job_detail.handle(job_id)
                 if res_data is not None:
-                    status, jobs = res_data
+                    job = res_data
                     status_str = (
-                        "in_progress" if status == JobStatus.RUNNING else status.value
+                        "in_progress"
+                        if job.status == JobStatus.RUNNING
+                        else job.status.value
                     )
                     extra_data: Dict[str, Any] = {}
-                    if jobs.extra_data:
+                    if job.extra_data:
                         try:
-                            parsed = json.loads(jobs.extra_data)
+                            parsed = json.loads(job.extra_data)
                             if isinstance(parsed, dict):
                                 extra_data = cast(Dict[str, Any], parsed)
                         except Exception:
@@ -530,28 +532,28 @@ class GatewayHandlers:
                     workflow_id = workflow.get("id")
 
                     outputs_val = None
-                    if jobs.outputs:
-                        outputs_val = json.loads(jobs.outputs)
-                    outputs_count = self._parse_outputs_count(jobs.outputs)
+                    if job.outputs:
+                        outputs_val = json.loads(job.outputs)
+                    outputs_count = self._parse_outputs_count(job.outputs)
 
                     preview_output_val = None
-                    if jobs.preview_output:
-                        preview_output_val = json.loads(jobs.preview_output)
+                    if job.preview_output:
+                        preview_output_val = json.loads(job.preview_output)
 
                     execution_error_val = None
-                    if jobs.execution_error:
-                        execution_error_val = json.loads(jobs.execution_error)
+                    if job.execution_error:
+                        execution_error_val = json.loads(job.execution_error)
 
                     job_detail = {
-                        "id": jobs.prompt_id,
+                        "id": job.prompt_id,
                         "status": status_str,
-                        "priority": jobs.number,
-                        "create_time": jobs.create_time,
+                        "priority": job.number,
+                        "create_time": job.create_time,
                         "outputs_count": outputs_count,
                         "workflow_id": workflow_id,
                         "workflow": {
-                            "prompt": jobs.prompt,
-                            "extra_data": jobs.extra_data,
+                            "prompt": job.prompt,
+                            "extra_data": job.extra_data,
                         },
                     }
 
@@ -559,10 +561,10 @@ class GatewayHandlers:
                         job_detail["outputs"] = outputs_val
                     if preview_output_val is not None:
                         job_detail["preview_output"] = preview_output_val
-                    if jobs.execution_start_time is not None:
-                        job_detail["execution_start_time"] = jobs.execution_start_time
-                    if jobs.execution_end_time is not None:
-                        job_detail["execution_end_time"] = jobs.execution_end_time
+                    if job.execution_start_time is not None:
+                        job_detail["execution_start_time"] = job.execution_start_time
+                    if job.execution_end_time is not None:
+                        job_detail["execution_end_time"] = job.execution_end_time
                     if execution_error_val is not None:
                         job_detail["execution_error"] = execution_error_val
 

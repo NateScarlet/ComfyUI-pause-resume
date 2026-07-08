@@ -33,11 +33,11 @@ class CancelJobCommandHandler:
         如果未找到此作业，则抛出 JobNotFoundError。
         """
         # 1. 查找任务及其状态
-        res = self._queue_reader.get(job_id)
-        if res is None:
+        job = self._queue_reader.get(job_id)
+        if job is None:
             raise JobNotFoundError(f"Job {job_id} not found.")
 
-        target_status, _ = res
+        target_status = job.status
 
         # 2. 如果任务已经是终态，则返回 cancelled=False 表示未做更改
         if target_status in (

@@ -3,7 +3,7 @@ import threading
 import logging
 import time
 import json
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Any
 
 from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
@@ -251,6 +251,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
             extra_data=RawJSON(row[3]),
             outputs_to_execute=json.loads(row[4]),
             create_time=row[5],
+            status=JobStatus(row[11]),
             outputs=RawJSON(row[6]) if row[6] else None,
             preview_output=RawJSON(row[7]) if row[7] else None,
             execution_start_time=row[8],
@@ -281,7 +282,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[Tuple[JobStatus, Job]]:
+    ) -> List[Job]:
         """获取符合条件的任务列表，支持分页限制和排序方向。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -319,11 +320,9 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
-            result: List[Tuple[JobStatus, Job]] = []
+            result: List[Job] = []
             for row in cursor.fetchall():
-                job = self._row_to_job(row)
-                job_status = JobStatus(row[11])
-                result.append((job_status, job))
+                result.append(self._row_to_job(row))
 
             return result
 
@@ -454,7 +453,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
             t_serialize = (time.perf_counter() - t_serialize_start) * 1000
 
             cursor.execute(
-                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, NULL, NULL)",
+                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
                 (
                     job.prompt_id,
                     job.number,
@@ -462,6 +461,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                     job.extra_data,
                     w_id,
                     outputs_str,
+                    job.status.value,
                     job.create_time,
                 ),
             )
@@ -493,13 +493,14 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
 
             if exists:
                 cursor.execute(
-                    "UPDATE jobs SET number = ?, prompt = ?, extra_data = ?, workflow_id = ?, outputs_to_execute = ?, create_time = ?, outputs = ?, preview_output = ?, execution_start_time = ?, execution_end_time = ?, execution_error = ? WHERE id = ?",
+                    "UPDATE jobs SET number = ?, prompt = ?, extra_data = ?, workflow_id = ?, outputs_to_execute = ?, status = ?, create_time = ?, outputs = ?, preview_output = ?, execution_start_time = ?, execution_end_time = ?, execution_error = ? WHERE id = ?",
                     (
                         job.number,
                         job.prompt,
                         job.extra_data,
                         w_id,
                         outputs_str,
+                        job.status.value,
                         job.create_time,
                         str(job.outputs) if job.outputs else None,
                         str(job.preview_output) if job.preview_output else None,
@@ -512,7 +513,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 changed = cursor.rowcount > 0
             else:
                 cursor.execute(
-                    "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job.prompt_id,
                         job.number,
@@ -520,6 +521,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                         job.extra_data,
                         w_id,
                         outputs_str,
+                        job.status.value,
                         job.create_time,
                         str(job.outputs) if job.outputs else None,
                         str(job.preview_output) if job.preview_output else None,
@@ -538,7 +540,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error FROM jobs WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error, status FROM jobs WHERE status = 'pending' ORDER BY number ASC LIMIT 1 OFFSET ?",
                 (skip,),
             )
             row = cursor.fetchone()
@@ -649,7 +651,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
         with self._lock:
             self._conn.close()
 
-    def get(self, prompt_id: str) -> Optional[Tuple[JobStatus, Job]]:
+    def get(self, prompt_id: str) -> Optional[Job]:
         """根据 ID 获取任务及其当前状态。"""
         with self._lock:
             cursor = self._conn.cursor()
@@ -660,7 +662,5 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
             )
             row = cursor.fetchone()
             if row:
-                job = self._row_to_job(row)
-                job_status = JobStatus(row[11])
-                return job_status, job
+                return self._row_to_job(row)
             return None

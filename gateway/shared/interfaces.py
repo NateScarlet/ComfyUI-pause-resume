@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Callable, Dict, Any, TypeVar, Type
+from typing import List, Optional, Callable, Dict, Any, TypeVar, Type
 from .models import Job, JobStatus, EstimationState, JobFilters, JobSummary
 
 T = TypeVar("T")
@@ -31,7 +31,7 @@ class JobQueueReader(ABC):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[Tuple[JobStatus, Job]]:
+    ) -> List[Job]:
         """获取符合筛选条件的任务列表，支持分页限制和排序方向。"""
         pass
 
@@ -56,7 +56,7 @@ class JobQueueReader(ABC):
         pass
 
     @abstractmethod
-    def get(self, prompt_id: str) -> Optional[Tuple[JobStatus, Job]]:
+    def get(self, prompt_id: str) -> Optional[Job]:
         """根据 ID 获取任务及其当前状态。如果不存在返回 None。"""
         pass
 

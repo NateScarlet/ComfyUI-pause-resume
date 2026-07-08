@@ -117,10 +117,9 @@ class JobDownstreamSyncer:
     ) -> None:
         """同步并更新本地数据库里的单条任务记录。"""
         try:
-            res = self._queue_reader.get(prompt_id)
-            if not res:
+            task = self._queue_reader.get(prompt_id)
+            if not task:
                 return
-            _, task = res
 
             # 判断是否有新数据需要同步，减少重复存盘 I/O
             has_changes = False

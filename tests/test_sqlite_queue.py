@@ -73,7 +73,7 @@ class TestSQLiteQueue(unittest.TestCase):
         # 验证默认的 list，确认字段检索依然完整
         jobs = self.queue.list()
         self.assertEqual(len(jobs), 2)
-        self.assertEqual(jobs[0][1].prompt_id, "prompt-1")
+        self.assertEqual(jobs[0].prompt_id, "prompt-1")
 
         # 验证专用的 get_summaries
         summaries = self.queue.get_summaries()

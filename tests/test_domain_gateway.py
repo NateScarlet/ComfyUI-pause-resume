@@ -76,13 +76,13 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
         statuses = filter_by.statuses if filter_by is not None else None
         result = []
         if not statuses:
-            result.extend((JobStatus.RUNNING, t) for t in running)
-            result.extend((JobStatus.PENDING, t) for t in pending)
+            result.extend(running)
+            result.extend(pending)
         else:
             if JobStatus.RUNNING in statuses:
-                result.extend((JobStatus.RUNNING, t) for t in running)
+                result.extend(running)
             if JobStatus.PENDING in statuses:
-                result.extend((JobStatus.PENDING, t) for t in pending)
+                result.extend(pending)
         return result
 
     reader.list.side_effect = _default_list
@@ -600,7 +600,7 @@ class TestDomainGateway(unittest.TestCase):
         # 模拟 dispatch 成功后下游再次开始执行（got prompt）
         g._mock_dispatcher.dispatch.reset_mock()
         g._mock_writer.update_status.reset_mock()
-        g._mock_reader.list.side_effect = lambda statuses=None: [(JobStatus.RUNNING, t2)]
+        g._mock_reader.list.side_effect = lambda statuses=None: [t2]
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
         self.assertTrue(g._downstream_executing)
 

@@ -41,7 +41,7 @@ def init_queue(
         logger.info(f"📦 Found legacy queue file {old_json_path}. Migrating...")
         try:
             legacy_queue = JSONFileQueue(old_json_path)
-            for _, job in legacy_queue.list():
+            for job in legacy_queue.list():
                 queue_instance.add(job)
             legacy_queue.close()
 

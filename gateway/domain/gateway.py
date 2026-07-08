@@ -160,12 +160,9 @@ class Gateway:
                         self._cancel_dispatch_retry = None
                 elif self._last_failed_job_id is not None:
                     # 检查先前失败的任务是否已经不在队列中（例如被用户手动删除）
-                    all_jobs = [
-                        t
-                        for _, t in self._queue_reader.list(
-                            JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
-                        )
-                    ]
+                    all_jobs = self._queue_reader.list(
+                        JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
+                    )
                     active_ids = {t.prompt_id for t in all_jobs}
                     if self._last_failed_job_id not in active_ids:
                         self._crash_count = 0
@@ -365,9 +362,9 @@ class Gateway:
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
-        running_jobs: List[Job] = [
-            t for _, t in self._queue_reader.list(JobFilters([JobStatus.RUNNING]))
-        ]
+        running_jobs: List[Job] = self._queue_reader.list(
+            JobFilters([JobStatus.RUNNING])
+        )
         self._ever_active = False
 
         if running_jobs:

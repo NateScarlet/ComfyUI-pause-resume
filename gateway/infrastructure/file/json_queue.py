@@ -1,7 +1,8 @@
 import os
 import json
 import threading
-from typing import List, Optional, Tuple, Set, Any
+from dataclasses import replace
+from typing import List, Optional, Set, Any
 
 from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
@@ -77,20 +78,18 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         desc: bool = False,
-    ) -> List[Tuple[JobStatus, Job]]:
+    ) -> List[Job]:
         """获取符合条件的任务列表，支持分页限制和排序方向。"""
         with self._lock:
-            result: List[Tuple[JobStatus, Job]] = []
+            result: List[Job] = []
             statuses = filter_by.statuses if filter_by is not None else None
             if statuses is None or JobStatus.RUNNING in statuses:
-                result.extend((JobStatus.RUNNING, t) for t in self._queue_running)
+                result.extend(self._queue_running)
             if statuses is None or JobStatus.PENDING in statuses:
-                result.extend((JobStatus.PENDING, t) for t in self._pending_queue)
+                result.extend(self._pending_queue)
 
             if filter_by is not None:
-                result = [
-                    item for item in result if filter_by.matches(item[0], item[1])
-                ]
+                result = [item for item in result if filter_by.matches(item)]
 
             if desc:
                 result.reverse()
@@ -118,7 +117,7 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
             desc=desc,
         )
         result: List[JobSummary] = []
-        for status, t in jobs:
+        for t in jobs:
             w_id = None
             if t.extra_data:
                 try:
@@ -134,7 +133,7 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
                 JobSummary(
                     number=t.number,
                     prompt_id=t.prompt_id,
-                    status=status,
+                    status=t.status,
                     workflow_id=w_id,
                     create_time=t.create_time,
                     extra_data=t.extra_data,
@@ -195,6 +194,8 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
         with self._lock:
             if 0 <= skip < len(self._pending_queue):
                 job = self._pending_queue.pop(skip)
+
+                job = replace(job, status=JobStatus.RUNNING)
                 self._queue_running = [job]
                 self._save()
                 return job
@@ -204,7 +205,8 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
         """将正在运行的任务放回待处理队列（恢复其原序号位置），并清空运行状态。"""
         with self._lock:
             if self._queue_running:
-                job = self._queue_running[0]
+
+                job = replace(self._queue_running[0], status=JobStatus.PENDING)
                 self._pending_queue.append(job)
                 self._queue_running.clear()
                 self._pending_queue.sort(key=lambda t: t.number)
@@ -215,7 +217,8 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
         with self._lock:
             if not self._queue_running:
                 return False
-            job = self._queue_running[0]
+
+            job = replace(self._queue_running[0], status=JobStatus.PENDING)
             self._pending_queue.append(job)
             self._queue_running.clear()
             self._pending_queue.sort(key=lambda t: t.number)
@@ -288,13 +291,14 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
                 if changed:
                     self._save()
             elif new_status == JobStatus.RUNNING:
+
                 matched: List[Job] = []
                 new_pending: List[Job] = []
                 for t in self._pending_queue:
                     if (prompt_id is None or t.prompt_id == prompt_id) and (
                         filter_status is None or filter_status == JobStatus.PENDING
                     ):
-                        matched.append(t)
+                        matched.append(replace(t, status=JobStatus.RUNNING))
                     else:
                         new_pending.append(t)
                 if matched:
@@ -303,13 +307,14 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
                     self._save()
                     changed = True
             elif new_status == JobStatus.PENDING:
+
                 matched: List[Job] = []
                 new_running: List[Job] = []
                 for t in self._queue_running:
                     if (prompt_id is None or t.prompt_id == prompt_id) and (
                         filter_status is None or filter_status == JobStatus.RUNNING
                     ):
-                        matched.append(t)
+                        matched.append(replace(t, status=JobStatus.PENDING))
                     else:
                         new_running.append(t)
                 if matched:
@@ -320,15 +325,15 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
                     changed = True
             return changed
 
-    def get(self, prompt_id: str) -> Optional[Tuple[JobStatus, Job]]:
+    def get(self, prompt_id: str) -> Optional[Job]:
         """根据 ID 获取任务及其当前状态。"""
         with self._lock:
             for t in self._queue_running:
                 if t.prompt_id == prompt_id:
-                    return JobStatus.RUNNING, t
+                    return t
             for t in self._pending_queue:
                 if t.prompt_id == prompt_id:
-                    return JobStatus.PENDING, t
+                    return t
             return None
 
     def close(self) -> None:

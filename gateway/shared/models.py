@@ -75,6 +75,7 @@ class Job:
     extra_data: RawJSON
     outputs_to_execute: Sequence[str]
     create_time: int
+    status: JobStatus = JobStatus.PENDING
 
     # 物理下游执行反馈字段 (解耦各自独立)
     outputs: Optional[RawJSON] = None
@@ -101,9 +102,9 @@ class JobFilters:
     statuses: Optional[List[JobStatus]] = None
     workflow_id: Optional[str] = None
 
-    def matches(self, status: JobStatus, job: Job) -> bool:
+    def matches(self, job: Job) -> bool:
         """内存细筛：判断一个任务是否真正匹配此过滤器。"""
-        if self.statuses is not None and status not in self.statuses:
+        if self.statuses is not None and job.status not in self.statuses:
             return False
         if self.workflow_id is not None:
             import json
