@@ -38,10 +38,11 @@ class CrashSkipPolicy:
         return self._crashed_executing
 
     def reset(self) -> None:
-        """全部计数器归零，清除失败任务记录。"""
+        """全部计数器归零，清除失败任务记录与崩溃执行状态。"""
         self._crash_count = 0
         self._dispatch_skip_offset = 0
         self._last_failed_job_id = None
+        self._crashed_executing = False
 
     def clear_if_job_gone(self, active_job_ids: Set[str]) -> None:
         """如果先前失败的任务已不在活跃队列中，清除崩溃状态。"""
