@@ -14,3 +14,17 @@
 - **术语：**　接口层就是表现层，不要和 shared/interfaces 语言层面的接口混淆
 - **依赖倒置**：应用层不应依赖表现层的格式约定，而是表现层自己适配应用层返回格式
 - **类型安全**：用 dataclass 代替 Dict[str, Any]。
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues; external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+All five canonical triage labels use their default names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout. See `docs/agents/domain.md`.
