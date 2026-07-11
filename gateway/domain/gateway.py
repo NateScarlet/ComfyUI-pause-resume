@@ -25,6 +25,7 @@ from gateway.shared.events import (
     ScriptStateChangedEvent,
 )
 from gateway.domain.estimation_service import EstimationService
+from gateway.domain.crash_skip_policy import CrashSkipPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +54,7 @@ class Gateway:
         downstream_executing: bool = False,
         downstream_ready: bool = False,
         ever_active: bool = False,
-        crash_count: int = 0,
-        dispatch_skip_offset: int = 0,
+        crash_skip_policy: Optional[CrashSkipPolicy] = None,
     ):
         self._state_repo = state_repo
         self._queue_reader = queue_reader
@@ -74,18 +74,13 @@ class Gateway:
         # 此时该标志必须被重置为 False，直到下游下一次真正开始执行任务时才置为 True。
         self._ever_active = ever_active
 
-        # 崩溃计数：当前任务连续崩溃的次数，仅用于崩溃跳过阈值判断
-        self._crash_count = crash_count
-        # 派发跳过偏移：派发失败后跳过已失败任务的偏移量，用于 get_dispatch_skip
-        self._dispatch_skip_offset = dispatch_skip_offset
+        self._crash_skip = crash_skip_policy or CrashSkipPolicy()
 
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
         self._cancel_dispatch_retry: Optional[Callable[[], None]] = None
-        self._last_failed_job_id: Optional[str] = None
         self._refreshing = False
         self._refresh_needed = False
-        self._crashed_executing = False
         self._job_start_time: Optional[int] = None  # 当前任务开始执行时间（毫秒）
 
         self._downstream = downstream
@@ -152,22 +147,17 @@ class Gateway:
 
                 # 如果没有任何任务，重置所有计数
                 if not has_jobs:
-                    self._crash_count = 0
-                    self._dispatch_skip_offset = 0
-                    self._last_failed_job_id = None
+                    self._crash_skip.reset()
                     if self._cancel_dispatch_retry:
                         self._cancel_dispatch_retry()
                         self._cancel_dispatch_retry = None
-                elif self._last_failed_job_id is not None:
+                elif self._crash_skip.last_failed_job_id is not None:
                     # 检查先前失败的任务是否已经不在队列中（例如被用户手动删除）
                     all_jobs = self._queue_reader.list(
                         JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
                     )
                     active_ids = {t.prompt_id for t in all_jobs}
-                    if self._last_failed_job_id not in active_ids:
-                        self._crash_count = 0
-                        self._dispatch_skip_offset = 0
-                        self._last_failed_job_id = None
+                    self._crash_skip.clear_if_job_gone(active_ids)
 
                 is_busy = self._is_busy(has_jobs)
 
@@ -285,7 +275,7 @@ class Gateway:
             logger.debug(
                 "DownstreamExecutingChanged ignored: already %s (crashed=%s paused=%s ready=%s)",
                 executing,
-                self._crashed_executing,
+                self._crash_skip.crashed_executing,
                 self._paused,
                 self._downstream_ready,
             )
@@ -295,7 +285,7 @@ class Gateway:
             "DownstreamExecutingChanged: %s → %s (crashed=%s paused=%s ready=%s ever_active=%s)",
             self._downstream_executing,
             executing,
-            self._crashed_executing,
+            self._crash_skip.crashed_executing,
             self._paused,
             self._downstream_ready,
             self._ever_active,
@@ -308,25 +298,21 @@ class Gateway:
             self._refresh()
         else:
             # 任务完成时记录执行时长（崩溃时不记录，避免污染预估数据）
-            if not self._crashed_executing and self._job_start_time is not None:
+            if (
+                not self._crash_skip.crashed_executing
+                and self._job_start_time is not None
+            ):
                 duration_ms = int(time.time() * 1000) - self._job_start_time
                 self._estimation_service.record_completion(duration_ms)
             self._job_start_time = None
 
-            # 如果是因为崩溃导致的执行结束，不能清零失败计数，否则无法完成崩溃跳过逻辑
-            if self._crashed_executing:
-                self._crashed_executing = False
-                # 如果崩溃 requeue 的任务已经重新执行并完成（_ever_active 为 True），
-                # 说明任务成功完成，应重置崩溃计数并清理运行队列
-                if self._ever_active:
-                    self._crash_count = 0
-                    self._last_failed_job_id = None
-                    self._queue_writer.update_status(
-                        JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
-                    )
-            else:
-                self._crash_count = 0
-                self._last_failed_job_id = None
+            completion_result = self._crash_skip.record_completion(self._ever_active)
+
+            if completion_result == "requeue_complete":
+                self._queue_writer.update_status(
+                    JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+                )
+            elif completion_result == "complete":
                 self._queue_writer.update_status(
                     JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
                 )
@@ -337,7 +323,7 @@ class Gateway:
                 "(pending=%s crashed=%s paused=%s ready=%s)",
                 skip,
                 self._queue_reader.count(JobFilters([JobStatus.PENDING])),
-                self._crashed_executing,
+                self._crash_skip.crashed_executing,
                 self._paused,
                 self._downstream_ready,
             )
@@ -357,8 +343,7 @@ class Gateway:
             if self._cancel_dispatch_retry:
                 self._cancel_dispatch_retry()
                 self._cancel_dispatch_retry = None
-            self._dispatch_skip_offset = 0
-            self._last_failed_job_id = None
+            self._crash_skip.reset()
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
         """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
@@ -369,28 +354,17 @@ class Gateway:
 
         if running_jobs:
             job = running_jobs[0]
-            # 如果崩溃的任务与上次失败的任务不同，重置崩溃计数（按任务隔离）
-            if (
-                self._last_failed_job_id is not None
-                and self._last_failed_job_id != job.prompt_id
-            ):
-                self._crash_count = 0
-            self._last_failed_job_id = job.prompt_id
-            # 崩溃超过阈值直接标记为永久失败，避免阻塞整个队列
-            if self._crash_count >= 2:
+            action = self._crash_skip.record_crash(job.prompt_id)
+
+            if action == "permanent_fail":
                 self._queue_writer.update_status(
                     JobStatus.FAILED, prompt_id=job.prompt_id
                 )
-                self._crash_count = 0
-                self._last_failed_job_id = None
                 self._dispatcher.handle_failed_job(
                     job, "Downstream crashed 3 times during execution."
                 )
-                self._crashed_executing = False
-            else:
-                if self._queue_writer.requeue_running_if_exists():
-                    self._crash_count += 1
-                    self._crashed_executing = True
+            elif action == "skip":
+                self._queue_writer.requeue_running_if_exists()
 
         self._publish_status_changed()
         self._refresh()
@@ -408,7 +382,7 @@ class Gateway:
 
     def _handle_dispatch_success(self, ev: DispatchSuccessEvent) -> None:
         """当派发任务成功时的业务反馈。"""
-        self._dispatch_skip_offset = 0
+        self._crash_skip.record_dispatch_success()
         if self._cancel_dispatch_retry:
             self._cancel_dispatch_retry()
             self._cancel_dispatch_retry = None
@@ -418,8 +392,7 @@ class Gateway:
         """当派发任务失败时的处理决策。"""
         self._publish_status_changed()
         if not ev.is_permanent:
-            self._dispatch_skip_offset += 1
-            self._last_failed_job_id = ev.prompt_id
+            self._crash_skip.record_dispatch_failed(ev.prompt_id)
 
             # 启动延迟重试驱动，避免瞬时网络异常引起高频无效空转
             if self._cancel_dispatch_retry:
@@ -439,10 +412,7 @@ class Gateway:
             return None
 
         pending_count = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
-        if pending_count <= 0:
-            return None
-
-        return self._dispatch_skip_offset % pending_count
+        return self._crash_skip.get_skip(pending_count)
 
     def _is_busy(self, has_jobs: bool) -> bool:
         """根据网关当前的状态和是否有任务，判定是否处于繁忙业务状态。"""
