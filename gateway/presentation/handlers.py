@@ -14,11 +14,11 @@ from gateway.shared.interfaces import (
     DownstreamClient,
     EventBus,
 )
-from gateway.shared.models import JobStatus, JobFilters, JobSummary
+from gateway.shared.models import JobStatus, JobFilters
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
 from gateway.shared.exceptions import GatewayError, JobNotFoundError
-from gateway.shared.outputs_parser import parse_outputs_count
 from gateway.application.facade import AppFacade
+from gateway.presentation.formatters import format_job_summary, format_job_detail
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _LOADING_HTML = (_STATIC_DIR / "loading.html").read_text(encoding="utf-8")
@@ -29,17 +29,6 @@ logger = logging.getLogger(__name__)
 
 class GatewayHandlers:
     """HTTP/SSE/WebSocket 反向代理请求处理器，承载了表示层与 web 框架的具体交互。"""
-
-    @staticmethod
-    def _parse_outputs_count(outputs_json_str: Union[str, None]) -> int:
-        if not outputs_json_str:
-            return 0
-        ds_outputs = json.loads(outputs_json_str)
-        if not isinstance(ds_outputs, dict):
-            raise ValueError(
-                f"Failed parsing outputs count: root of JSON outputs is not a dict, got {type(ds_outputs)}"
-            )
-        return parse_outputs_count(cast(Dict[str, Any], ds_outputs))
 
     def __init__(
         self,
@@ -392,49 +381,9 @@ class GatewayHandlers:
                 # 3.5. 在表现层将 Domain Model 转换为符合 API 规范的格式并计时
                 t_format_start = time.perf_counter()
 
-                def make_job_dict(
-                    summary: JobSummary, status_str: str
-                ) -> Dict[str, Any]:
-                    outputs_count = 0
-                    preview_output = None
-                    execution_error = None
-
-                    outputs_count = self._parse_outputs_count(summary.outputs)
-
-                    if summary.preview_output:
-                        preview_output = json.loads(summary.preview_output)
-
-                    if summary.execution_error:
-                        execution_error = json.loads(summary.execution_error)
-
-                    # 移除不需要返回的 None 属性，降低传输开销，同时保持接口健壮性
-                    res = {
-                        "id": summary.prompt_id,
-                        "status": status_str,
-                        "priority": summary.number,
-                        "create_time": summary.create_time,
-                        "outputs_count": outputs_count,
-                        "workflow_id": summary.workflow_id,
-                    }
-                    if preview_output is not None:
-                        res["preview_output"] = preview_output
-                    if summary.execution_start_time is not None:
-                        res["execution_start_time"] = summary.execution_start_time
-                    if summary.execution_end_time is not None:
-                        res["execution_end_time"] = summary.execution_end_time
-                    if execution_error is not None:
-                        res["execution_error"] = execution_error
-
-                    return res
-
-                jobs_json: List[Dict[str, Any]] = []
-                for summary in page:
-                    status_str = (
-                        "in_progress"
-                        if summary.status == JobStatus.RUNNING
-                        else summary.status.value
-                    )
-                    jobs_json.append(make_job_dict(summary, status_str))
+                jobs_json: List[Dict[str, Any]] = [
+                    format_job_summary(summary) for summary in page
+                ]
 
                 has_more = (offset_val + len(jobs_json)) < total
 
@@ -485,63 +434,7 @@ class GatewayHandlers:
                 job_id = parts[2]
                 res_data = await self._app.get_job_detail.handle(job_id)
                 if res_data is not None:
-                    job = res_data
-                    status_str = (
-                        "in_progress"
-                        if job.status == JobStatus.RUNNING
-                        else job.status.value
-                    )
-                    extra_data: Dict[str, Any] = {}
-                    if job.extra_data:
-                        try:
-                            parsed = json.loads(job.extra_data)
-                            if isinstance(parsed, dict):
-                                extra_data = cast(Dict[str, Any], parsed)
-                        except Exception:
-                            pass
-                    extra_pnginfo = cast(
-                        Dict[str, Any], extra_data.get("extra_pnginfo", {})
-                    )
-                    workflow = cast(Dict[str, Any], extra_pnginfo.get("workflow", {}))
-                    workflow_id = workflow.get("id")
-
-                    outputs_val = None
-                    if job.outputs:
-                        outputs_val = json.loads(job.outputs)
-                    outputs_count = self._parse_outputs_count(job.outputs)
-
-                    preview_output_val = None
-                    if job.preview_output:
-                        preview_output_val = json.loads(job.preview_output)
-
-                    execution_error_val = None
-                    if job.execution_error:
-                        execution_error_val = json.loads(job.execution_error)
-
-                    job_detail = {
-                        "id": job.prompt_id,
-                        "status": status_str,
-                        "priority": job.number,
-                        "create_time": job.create_time,
-                        "outputs_count": outputs_count,
-                        "workflow_id": workflow_id,
-                        "workflow": {
-                            "prompt": job.prompt,
-                            "extra_data": job.extra_data,
-                        },
-                    }
-
-                    if outputs_val is not None:
-                        job_detail["outputs"] = outputs_val
-                    if preview_output_val is not None:
-                        job_detail["preview_output"] = preview_output_val
-                    if job.execution_start_time is not None:
-                        job_detail["execution_start_time"] = job.execution_start_time
-                    if job.execution_end_time is not None:
-                        job_detail["execution_end_time"] = job.execution_end_time
-                    if execution_error_val is not None:
-                        job_detail["execution_error"] = execution_error_val
-
+                    job_detail = format_job_detail(res_data)
                     return web.json_response(job_detail, dumps=raw_json_dumps)
 
         # 5. 拦截清空/删除操作：POST /queue (带 clear 或 delete)
