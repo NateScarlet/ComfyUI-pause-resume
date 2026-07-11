@@ -2,7 +2,7 @@ import json
 from typing import Dict, Any, cast
 
 from gateway.shared.models import Job, JobStatus, JobSummary
-from gateway.shared.outputs_parser import parse_outputs_count
+from gateway.shared.outputs_parser import parse_outputs_count, extract_workflow_id
 
 
 def format_job_status(status: JobStatus) -> str:
@@ -47,17 +47,7 @@ def format_job_summary(summary: JobSummary) -> Dict[str, Any]:
 
 def format_job_detail(job: Job) -> Dict[str, Any]:
     """将 Job 转换为 API 规范的 job_detail 字典。"""
-    extra_data: Dict[str, Any] = {}
-    if job.extra_data:
-        try:
-            parsed = json.loads(job.extra_data)
-            if isinstance(parsed, dict):
-                extra_data = cast(Dict[str, Any], parsed)
-        except Exception:
-            pass
-    extra_pnginfo = cast(Dict[str, Any], extra_data.get("extra_pnginfo", {}))
-    workflow = cast(Dict[str, Any], extra_pnginfo.get("workflow", {}))
-    workflow_id = workflow.get("id")
+    workflow_id = extract_workflow_id(job.extra_data) if job.extra_data else None
 
     outputs_val = None
     outputs_count = 0

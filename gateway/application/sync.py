@@ -309,11 +309,6 @@ class JobDownstreamSyncer:
         fallback_preview = None
 
         for node_id, node_outputs in outputs.items():
-            if not isinstance(node_outputs, dict):
-                raise ValueError(
-                    f"Unexpected node outputs format for node '{node_id}': expected dict, got {type(node_outputs)}"
-                )
-
             node_outputs_dict = cast(Dict[str, Any], node_outputs)
             for media_type, items in node_outputs_dict.items():
                 if media_type == "animated" or not isinstance(items, list):

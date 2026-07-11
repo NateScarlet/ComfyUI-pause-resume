@@ -65,9 +65,8 @@ class CrashSkipPolicy:
         """记录下游崩溃事件，返回下一步动作。
 
         Returns:
-            'skip': 递增崩溃计数，任务应被重新入队（requeue）并跳过。
+            'skip': 崩溃次数未超阈值，任务应被重新入队（requeue）并跳过。
             'permanent_fail': 崩溃次数超过阈值，任务应标记为永久失败。
-            'reset': 崩溃任务与上次不同，先重置再重新计数。
         """
         if self._last_failed_job_id is not None and self._last_failed_job_id != job_id:
             self.reset()
@@ -78,9 +77,12 @@ class CrashSkipPolicy:
             self.reset()
             return "permanent_fail"
 
+        return "skip"
+
+    def increment_crash(self) -> None:
+        """递增崩溃计数并标记下游崩溃执行状态（仅在 requeue 成功后调用）。"""
         self._crash_count += 1
         self._crashed_executing = True
-        return "skip"
 
     def record_completion(self, ever_active: bool) -> str:
         """任务执行结束（非崩溃），返回完成类型。

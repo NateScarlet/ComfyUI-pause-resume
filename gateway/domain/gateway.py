@@ -364,7 +364,8 @@ class Gateway:
                     job, "Downstream crashed 3 times during execution."
                 )
             elif action == "skip":
-                self._queue_writer.requeue_running_if_exists()
+                if self._queue_writer.requeue_running_if_exists():
+                    self._crash_skip.increment_crash()
 
         self._publish_status_changed()
         self._refresh()
