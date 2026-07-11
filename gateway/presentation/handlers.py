@@ -184,7 +184,7 @@ class GatewayHandlers:
     async def proxy_handler(
         self, request: web.Request
     ) -> Union[web.Response, web.StreamResponse]:
-        """核心反向代理和拦截器，转发网关与下游进程通信并拦截核心 API。"""
+        """核心反向代理路由，将请求分发到对应的拦截处理器。"""
         path = request.path
         if path == "/io.github.natescarlet.pause-resume" or path.startswith(
             "/io.github.natescarlet.pause-resume/"
@@ -221,381 +221,412 @@ class GatewayHandlers:
                 status=503, text="Service Unavailable: Downstream is booting up"
             )
 
-        method = request.method
-        headers = dict(request.headers)
-        downstream_url = f"http://127.0.0.1:{self._downstream_service.downstream_port}{request.path_qs}"
-
         # 1. 拦截任务提交：POST /prompt
         if method == "POST" and path in ("/prompt", "/api/prompt"):
-            t_start = time.perf_counter()
-            try:
-                t_json_start = time.perf_counter()
-                body = await request.json()
-                body_dict = cast(Dict[str, Any], body)
-                t_json = (time.perf_counter() - t_json_start) * 1000
-
-                prompt = cast(Dict[str, Any], body_dict.get("prompt", {}))
-                extra_data_raw = body_dict.get("extra_data", {})
-                extra_data = (
-                    dict(cast(Dict[str, Any], extra_data_raw))
-                    if isinstance(extra_data_raw, dict)
-                    else {}
-                )
-                prompt_id = body_dict.get("prompt_id")
-                if prompt_id is not None:
-                    prompt_id = str(prompt_id)
-
-                number = None
-                if "number" in body_dict:
-                    try:
-                        number = float(body_dict["number"])
-                    except (ValueError, TypeError):
-                        pass
-
-                front = bool(body_dict.get("front", False))
-
-                result = self._app.add_job.handle(
-                    prompt=prompt,
-                    extra_data=extra_data,
-                    prompt_id=prompt_id,
-                    number=number,
-                    front=front,
-                )
-
-                t_total = (time.perf_counter() - t_start) * 1000
-                logger.info(
-                    f"📥 Intercepted workflow {result.prompt_id} "
-                    f"number={result.number} "
-                    f"(json={t_json:.1f}ms total={t_total:.1f}ms)"
-                )
-
-                return web.json_response(
-                    {
-                        "prompt_id": result.prompt_id,
-                        "number": result.number,
-                        "node_errors": {},
-                    }
-                )
-            except (GatewayError, ValueError, TypeError) as e:
-                logger.error(f"Error processing {path}: {e}")
-                traceback.print_exc()
-                return web.Response(status=400, text=str(e))
+            return await self._handle_prompt_submission(request)
 
         # 2. 拦截队列状态查询：GET /queue
         if method == "GET" and path in ("/queue", "/api/queue"):
-            jobs = self._app.get_queue.handle()
-            res_data = {
-                "queue_running": [
-                    t.to_list() for t in jobs if t.status == JobStatus.RUNNING
-                ],
-                "queue_pending": [
-                    t.to_list() for t in jobs if t.status == JobStatus.PENDING
-                ],
-            }
-            return web.json_response(res_data, dumps=raw_json_dumps)
+            return await self._handle_queue_status()
 
         # 3. 拦截合并 jobs 查询：GET /api/jobs
         if method == "GET" and path in ("/api/jobs", "/api/jobs/"):
-            t_total_start = time.perf_counter()
-            query_params = {k: v for k, v in request.rel_url.query.items()}
-            try:
-                # 3.1. 解析并验证 status 参数
-                valid_statuses = {
-                    "pending",
-                    "in_progress",
-                    "completed",
-                    "failed",
-                    "cancelled",
-                }
-                status_param = query_params.get("status")
-                if status_param:
-                    status_filter = [
-                        s.strip().lower() for s in status_param.split(",") if s.strip()
-                    ]
-                    statuses: List[JobStatus] = []
-                    invalid_statuses: List[str] = []
-                    for sf in status_filter:
-                        if sf == "pending":
-                            statuses.append(JobStatus.PENDING)
-                        elif sf == "in_progress":
-                            statuses.append(JobStatus.RUNNING)
-                        elif sf == "completed":
-                            statuses.append(JobStatus.COMPLETED)
-                        elif sf == "failed":
-                            statuses.append(JobStatus.FAILED)
-                        elif sf == "cancelled":
-                            statuses.append(JobStatus.CANCELLED)
-                        else:
-                            invalid_statuses.append(sf)
-                    if invalid_statuses:
-                        raise ValueError(
-                            f"Invalid status value(s): {', '.join(invalid_statuses)}. "
-                            f"Valid values: {', '.join(sorted(valid_statuses))}"
-                        )
-                else:
-                    statuses = [
-                        JobStatus.PENDING,
-                        JobStatus.RUNNING,
-                        JobStatus.COMPLETED,
-                        JobStatus.FAILED,
-                        JobStatus.CANCELLED,
-                    ]
+            return await self._handle_jobs_list(request)
 
-                # 3.2. 解析并验证 limit / offset
-                limit_val = None
-                if query_params.get("limit"):
-                    try:
-                        limit_val = int(query_params["limit"])
-                    except ValueError:
-                        pass
-                offset_val = 0
-                if query_params.get("offset"):
-                    try:
-                        offset_val = int(query_params["offset"])
-                    except ValueError:
-                        pass
-
-                # 3.3. 解析排序与 workflow_id
-                sort_order = query_params.get("sort_order", "desc").lower()
-                reverse = sort_order == "desc"
-                workflow_id_param = query_params.get("workflow_id")
-
-                # 3.4. 构造筛选条件并调用应用层
-                filter_by = JobFilters(statuses=statuses, workflow_id=workflow_id_param)
-
-                # 获取任务列表并计时
-                t_get_jobs_start = time.perf_counter()
-                page = await self._app.get_jobs.handle(
-                    filter_by=filter_by,
-                    limit=limit_val,
-                    offset=offset_val,
-                    desc=reverse,
-                )
-                t_get_jobs = (time.perf_counter() - t_get_jobs_start) * 1000
-
-                # 获取任务总数并计时
-                t_get_job_count_start = time.perf_counter()
-                total = await self._app.get_job_count.handle(filter_by=filter_by)
-                t_get_job_count = (time.perf_counter() - t_get_job_count_start) * 1000
-
-                # 3.5. 在表现层将 Domain Model 转换为符合 API 规范的格式并计时
-                t_format_start = time.perf_counter()
-
-                jobs_json: List[Dict[str, Any]] = [
-                    format_job_summary(summary) for summary in page
-                ]
-
-                has_more = (offset_val + len(jobs_json)) < total
-
-                res_data = {
-                    "jobs": jobs_json,
-                    "pagination": {
-                        "offset": offset_val,
-                        "limit": limit_val,
-                        "total": total,
-                        "has_more": has_more,
-                    },
-                }
-                t_format_data = (time.perf_counter() - t_format_start) * 1000
-
-                # 3.6. 计算总响应耗时并组装 Server-Timing 头部
-                t_total = (time.perf_counter() - t_total_start) * 1000
-                server_timing = (
-                    f"get_jobs;dur={t_get_jobs:.2f}, "
-                    f"get_job_count;dur={t_get_job_count:.2f}, "
-                    f"format_data;dur={t_format_data:.2f}, "
-                    f"total;dur={t_total:.2f}"
-                )
-                headers = {"Server-Timing": server_timing}
-
-                return web.json_response(res_data, headers=headers)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
-
-        # 3.5. 拦截具体 job 取消：POST /api/jobs/{job_id}/cancel
+        # 4. 拦截具体 job 取消：POST /api/jobs/{job_id}/cancel
         if (
             method == "POST"
             and path.startswith("/api/jobs/")
             and path.endswith("/cancel")
         ):
-            parts = path.strip("/").split("/")
-            if len(parts) == 4 and parts[3] == "cancel":
-                job_id = parts[2]
-                try:
-                    cancel_result = await self._app.cancel_job.handle(job_id)
-                    return web.json_response({"cancelled": cancel_result.cancelled})
-                except JobNotFoundError:
-                    return web.Response(status=404, text="Job not found")
+            return await self._handle_job_cancel(path)
 
-        # 4. 拦截具体 job 详情查询：GET /api/jobs/{job_id}
+        # 5. 拦截具体 job 详情查询：GET /api/jobs/{job_id}
         if method == "GET" and path.startswith("/api/jobs/"):
-            parts = path.strip("/").split("/")
-            if len(parts) == 3:
-                job_id = parts[2]
-                res_data = await self._app.get_job_detail.handle(job_id)
-                if res_data is not None:
-                    job_detail = format_job_detail(res_data)
-                    return web.json_response(job_detail, dumps=raw_json_dumps)
+            return await self._handle_job_detail(path)
 
-        # 5. 拦截清空/删除操作：POST /queue (带 clear 或 delete)
+        # 6. 拦截清空/删除操作：POST /queue
         if method == "POST" and path in ("/queue", "/api/queue"):
-            try:
-                raw_body = await request.json()
-            except (json.JSONDecodeError, TypeError):
-                return web.Response(status=400, text="Bad Request: Invalid JSON body")
-            body_json: Dict[str, Any] = {}
-            if isinstance(raw_body, dict):
-                body_json = cast(Dict[str, Any], raw_body)
+            return await self._handle_queue_modify(request)
 
-            clear = bool(body_json.get("clear"))
-            raw_delete = body_json.get("delete")
-            delete_ids = None
-            if isinstance(raw_delete, list):
-                delete_ids = [str(item) for item in cast(List[Any], raw_delete)]
-
-            self._app.modify_queue.handle(clear=clear, delete_ids=delete_ids)
-            return web.Response(status=200)
-
-        # 6. WebSocket 代理连接并拦截 status 推送
+        # 7. WebSocket 代理连接并拦截 status 推送
         if request.headers.get("Upgrade", "").lower() == "websocket":
-            ws_server = web.WebSocketResponse()
-            await ws_server.prepare(request)
+            downstream_url = self._build_downstream_url(request)
+            return await self._handle_ws_proxy(request, downstream_url)
 
-            self.ws_clients.add(ws_server)
-
-            async with aiohttp.ClientSession() as session:
-                try:
-                    async with session.ws_connect(downstream_url) as ws_client:
-
-                        async def ws_forward(
-                            ws_from: Union[
-                                web.WebSocketResponse, aiohttp.ClientWebSocketResponse
-                            ],
-                            ws_to: Union[
-                                web.WebSocketResponse, aiohttp.ClientWebSocketResponse
-                            ],
-                        ) -> None:
-                            async for msg in ws_from:
-                                if msg.type == aiohttp.WSMsgType.TEXT:
-                                    data_str = msg.data
-                                    if ws_from == ws_client:
-                                        try:
-                                            data_json = json.loads(data_str)
-                                            if isinstance(data_json, dict):
-                                                data_dict = cast(
-                                                    Dict[str, Any], data_json
-                                                )
-                                                if data_dict.get("type") == "status":
-                                                    remaining = (
-                                                        self._queue_reader.count(
-                                                            JobFilters(
-                                                                [
-                                                                    JobStatus.PENDING,
-                                                                    JobStatus.RUNNING,
-                                                                ]
-                                                            )
-                                                        )
-                                                    )
-                                                    data_payload = data_dict.get("data")
-                                                    if isinstance(data_payload, dict):
-                                                        data_payload_dict = cast(
-                                                            Dict[str, Any], data_payload
-                                                        )
-                                                        status_info = (
-                                                            data_payload_dict.get(
-                                                                "status"
-                                                            )
-                                                        )
-                                                        if isinstance(
-                                                            status_info, dict
-                                                        ):
-                                                            status_info_dict = cast(
-                                                                Dict[str, Any],
-                                                                status_info,
-                                                            )
-                                                            exec_info = (
-                                                                status_info_dict.get(
-                                                                    "exec_info"
-                                                                )
-                                                            )
-                                                            if isinstance(
-                                                                exec_info, dict
-                                                            ):
-                                                                exec_info_dict = cast(
-                                                                    Dict[str, Any],
-                                                                    exec_info,
-                                                                )
-                                                                exec_info_dict[
-                                                                    "queue_remaining"
-                                                                ] = remaining
-                                                                data_str = json.dumps(
-                                                                    data_dict
-                                                                )
-                                        except (json.JSONDecodeError, TypeError):
-                                            pass
-                                    await ws_to.send_str(data_str)
-                                elif msg.type == aiohttp.WSMsgType.BINARY:
-                                    await ws_to.send_bytes(msg.data)
-                                elif msg.type == aiohttp.WSMsgType.PING:
-                                    await ws_to.ping()
-                                elif msg.type == aiohttp.WSMsgType.PONG:
-                                    await ws_to.pong()
-                                elif msg.type == aiohttp.WSMsgType.CLOSE:
-                                    await ws_to.close()
-                                    break
-
-                        t1 = asyncio.create_task(ws_forward(ws_server, ws_client))
-                        t2 = asyncio.create_task(ws_forward(ws_client, ws_server))
-                        await asyncio.gather(t1, t2)
-                except ConnectionResetError:
-                    # 客户端正常关闭页面时，传输层已关闭，写入失败属于正常行为
-                    pass
-                except (
-                    aiohttp.ClientError,
-                    ConnectionResetError,
-                    asyncio.TimeoutError,
-                ) as e:
-                    logger.error(f"WebSocket Error: {e}")
-                finally:
-                    self.ws_clients.discard(ws_server)
-            return ws_server
-
-        # 7. 拦截主页加载以动态注入 JS 扩展按钮
+        # 8. 拦截主页加载以动态注入 JS 扩展按钮
         if method == "GET" and (path == "/" or path == "/index.html"):
-            async with aiohttp.ClientSession() as session:
+            downstream_url = self._build_downstream_url(request)
+            return await self._handle_html_injection(request, downstream_url)
+
+        # 9. 默认普通代理
+        downstream_url = self._build_downstream_url(request)
+        return await self._handle_default_proxy(request, method, downstream_url)
+
+    def _build_downstream_url(self, request: web.Request) -> str:
+        """构建下游 URL（仅用于代理转发，不含业务逻辑）。"""
+        return f"http://127.0.0.1:{self._downstream_service.downstream_port}{request.path_qs}"
+
+    async def _handle_prompt_submission(self, request: web.Request) -> web.Response:
+        """拦截 POST /prompt，将任务加入网关队列。"""
+        path = request.path
+        t_start = time.perf_counter()
+        try:
+            t_json_start = time.perf_counter()
+            body = await request.json()
+            body_dict = cast(Dict[str, Any], body)
+            t_json = (time.perf_counter() - t_json_start) * 1000
+
+            prompt = cast(Dict[str, Any], body_dict.get("prompt", {}))
+            extra_data_raw = body_dict.get("extra_data", {})
+            extra_data = (
+                dict(cast(Dict[str, Any], extra_data_raw))
+                if isinstance(extra_data_raw, dict)
+                else {}
+            )
+            prompt_id = body_dict.get("prompt_id")
+            if prompt_id is not None:
+                prompt_id = str(prompt_id)
+
+            number = None
+            if "number" in body_dict:
                 try:
-                    async with session.get(downstream_url, headers=headers) as resp:
-                        body = await resp.read()
-                        html = body.decode("utf-8", errors="replace")
+                    number = float(body_dict["number"])
+                except (ValueError, TypeError):
+                    pass
 
-                        injection = (
-                            '\n<script type="module">\n' + _INJECT_JS + "\n</script>\n"
+            front = bool(body_dict.get("front", False))
+
+            result = self._app.add_job.handle(
+                prompt=prompt,
+                extra_data=extra_data,
+                prompt_id=prompt_id,
+                number=number,
+                front=front,
+            )
+
+            t_total = (time.perf_counter() - t_start) * 1000
+            logger.info(
+                f"📥 Intercepted workflow {result.prompt_id} "
+                f"number={result.number} "
+                f"(json={t_json:.1f}ms total={t_total:.1f}ms)"
+            )
+
+            return web.json_response(
+                {
+                    "prompt_id": result.prompt_id,
+                    "number": result.number,
+                    "node_errors": {},
+                }
+            )
+        except (GatewayError, ValueError, TypeError) as e:
+            logger.error(f"Error processing {path}: {e}")
+            traceback.print_exc()
+            return web.Response(status=400, text=str(e))
+
+    async def _handle_queue_status(self) -> web.Response:
+        """返回网关队列状态（GET /queue）。"""
+        jobs = self._app.get_queue.handle()
+        res_data = {
+            "queue_running": [
+                t.to_list() for t in jobs if t.status == JobStatus.RUNNING
+            ],
+            "queue_pending": [
+                t.to_list() for t in jobs if t.status == JobStatus.PENDING
+            ],
+        }
+        return web.json_response(res_data, dumps=raw_json_dumps)
+
+    async def _handle_jobs_list(self, request: web.Request) -> web.Response:
+        """拦截 GET /api/jobs，返回分页的任务列表。"""
+        t_total_start = time.perf_counter()
+        query_params = {k: v for k, v in request.rel_url.query.items()}
+        try:
+            valid_statuses = {
+                "pending",
+                "in_progress",
+                "completed",
+                "failed",
+                "cancelled",
+            }
+            status_param = query_params.get("status")
+            if status_param:
+                status_filter = [
+                    s.strip().lower() for s in status_param.split(",") if s.strip()
+                ]
+                statuses: List[JobStatus] = []
+                invalid_statuses: List[str] = []
+                for sf in status_filter:
+                    if sf == "pending":
+                        statuses.append(JobStatus.PENDING)
+                    elif sf == "in_progress":
+                        statuses.append(JobStatus.RUNNING)
+                    elif sf == "completed":
+                        statuses.append(JobStatus.COMPLETED)
+                    elif sf == "failed":
+                        statuses.append(JobStatus.FAILED)
+                    elif sf == "cancelled":
+                        statuses.append(JobStatus.CANCELLED)
+                    else:
+                        invalid_statuses.append(sf)
+                if invalid_statuses:
+                    raise ValueError(
+                        f"Invalid status value(s): {', '.join(invalid_statuses)}. "
+                        f"Valid values: {', '.join(sorted(valid_statuses))}"
+                    )
+            else:
+                statuses = [
+                    JobStatus.PENDING,
+                    JobStatus.RUNNING,
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                ]
+
+            limit_val = None
+            if query_params.get("limit"):
+                try:
+                    limit_val = int(query_params["limit"])
+                except ValueError:
+                    pass
+            offset_val = 0
+            if query_params.get("offset"):
+                try:
+                    offset_val = int(query_params["offset"])
+                except ValueError:
+                    pass
+
+            sort_order = query_params.get("sort_order", "desc").lower()
+            reverse = sort_order == "desc"
+            workflow_id_param = query_params.get("workflow_id")
+
+            filter_by = JobFilters(statuses=statuses, workflow_id=workflow_id_param)
+
+            t_get_jobs_start = time.perf_counter()
+            page = await self._app.get_jobs.handle(
+                filter_by=filter_by,
+                limit=limit_val,
+                offset=offset_val,
+                desc=reverse,
+            )
+            t_get_jobs = (time.perf_counter() - t_get_jobs_start) * 1000
+
+            t_get_job_count_start = time.perf_counter()
+            total = await self._app.get_job_count.handle(filter_by=filter_by)
+            t_get_job_count = (time.perf_counter() - t_get_job_count_start) * 1000
+
+            t_format_start = time.perf_counter()
+
+            jobs_json: List[Dict[str, Any]] = [
+                format_job_summary(summary) for summary in page
+            ]
+
+            has_more = (offset_val + len(jobs_json)) < total
+
+            res_data = {
+                "jobs": jobs_json,
+                "pagination": {
+                    "offset": offset_val,
+                    "limit": limit_val,
+                    "total": total,
+                    "has_more": has_more,
+                },
+            }
+            t_format_data = (time.perf_counter() - t_format_start) * 1000
+
+            t_total = (time.perf_counter() - t_total_start) * 1000
+            server_timing = (
+                f"get_jobs;dur={t_get_jobs:.2f}, "
+                f"get_job_count;dur={t_get_job_count:.2f}, "
+                f"format_data;dur={t_format_data:.2f}, "
+                f"total;dur={t_total:.2f}"
+            )
+            headers = {"Server-Timing": server_timing}
+
+            return web.json_response(res_data, headers=headers)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def _handle_job_cancel(self, path: str) -> web.Response:
+        """拦截 POST /api/jobs/{job_id}/cancel，取消指定任务。"""
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[3] == "cancel":
+            job_id = parts[2]
+            try:
+                cancel_result = await self._app.cancel_job.handle(job_id)
+                return web.json_response({"cancelled": cancel_result.cancelled})
+            except JobNotFoundError:
+                return web.Response(status=404, text="Job not found")
+        return web.Response(status=404, text="Not found")
+
+    async def _handle_job_detail(self, path: str) -> web.Response:
+        """拦截 GET /api/jobs/{job_id}，返回任务详情。"""
+        parts = path.strip("/").split("/")
+        if len(parts) == 3:
+            job_id = parts[2]
+            res_data = await self._app.get_job_detail.handle(job_id)
+            if res_data is not None:
+                job_detail = format_job_detail(res_data)
+                return web.json_response(job_detail, dumps=raw_json_dumps)
+        return web.Response(status=404, text="Not found")
+
+    async def _handle_queue_modify(self, request: web.Request) -> web.Response:
+        """拦截 POST /queue，处理清空/删除操作。"""
+        try:
+            raw_body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.Response(status=400, text="Bad Request: Invalid JSON body")
+        body_json: Dict[str, Any] = {}
+        if isinstance(raw_body, dict):
+            body_json = cast(Dict[str, Any], raw_body)
+
+        clear = bool(body_json.get("clear"))
+        raw_delete = body_json.get("delete")
+        delete_ids = None
+        if isinstance(raw_delete, list):
+            delete_ids = [str(item) for item in cast(List[Any], raw_delete)]
+
+        self._app.modify_queue.handle(clear=clear, delete_ids=delete_ids)
+        return web.Response(status=200)
+
+    async def _handle_ws_proxy(
+        self, request: web.Request, downstream_url: str
+    ) -> web.WebSocketResponse:
+        """WebSocket 代理，拦截 status 消息注入 queue_remaining。"""
+        ws_server = web.WebSocketResponse()
+        await ws_server.prepare(request)
+
+        self.ws_clients.add(ws_server)
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.ws_connect(downstream_url) as ws_client:
+
+                    async def ws_forward(
+                        ws_from: Union[
+                            web.WebSocketResponse, aiohttp.ClientWebSocketResponse
+                        ],
+                        ws_to: Union[
+                            web.WebSocketResponse, aiohttp.ClientWebSocketResponse
+                        ],
+                    ) -> None:
+                        async for msg in ws_from:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data_str = msg.data
+                                if ws_from == ws_client:
+                                    try:
+                                        data_json = json.loads(data_str)
+                                        if isinstance(data_json, dict):
+                                            data_dict = cast(Dict[str, Any], data_json)
+                                            if data_dict.get("type") == "status":
+                                                remaining = self._queue_reader.count(
+                                                    JobFilters(
+                                                        [
+                                                            JobStatus.PENDING,
+                                                            JobStatus.RUNNING,
+                                                        ]
+                                                    )
+                                                )
+                                                data_payload = data_dict.get("data")
+                                                if isinstance(data_payload, dict):
+                                                    data_payload_dict = cast(
+                                                        Dict[str, Any], data_payload
+                                                    )
+                                                    status_info = data_payload_dict.get(
+                                                        "status"
+                                                    )
+                                                    if isinstance(status_info, dict):
+                                                        status_info_dict = cast(
+                                                            Dict[str, Any],
+                                                            status_info,
+                                                        )
+                                                        exec_info = (
+                                                            status_info_dict.get(
+                                                                "exec_info"
+                                                            )
+                                                        )
+                                                        if isinstance(exec_info, dict):
+                                                            exec_info_dict = cast(
+                                                                Dict[str, Any],
+                                                                exec_info,
+                                                            )
+                                                            exec_info_dict[
+                                                                "queue_remaining"
+                                                            ] = remaining
+                                                            data_str = json.dumps(
+                                                                data_dict
+                                                            )
+                                    except (json.JSONDecodeError, TypeError):
+                                        pass
+                                await ws_to.send_str(data_str)
+                            elif msg.type == aiohttp.WSMsgType.BINARY:
+                                await ws_to.send_bytes(msg.data)
+                            elif msg.type == aiohttp.WSMsgType.PING:
+                                await ws_to.ping()
+                            elif msg.type == aiohttp.WSMsgType.PONG:
+                                await ws_to.pong()
+                            elif msg.type == aiohttp.WSMsgType.CLOSE:
+                                await ws_to.close()
+                                break
+
+                    t1 = asyncio.create_task(ws_forward(ws_server, ws_client))
+                    t2 = asyncio.create_task(ws_forward(ws_client, ws_server))
+                    await asyncio.gather(t1, t2)
+            except ConnectionResetError:
+                pass
+            except (
+                aiohttp.ClientError,
+                ConnectionResetError,
+                asyncio.TimeoutError,
+            ) as e:
+                logger.error(f"WebSocket Error: {e}")
+            finally:
+                self.ws_clients.discard(ws_server)
+        return ws_server
+
+    async def _handle_html_injection(
+        self, request: web.Request, downstream_url: str
+    ) -> web.Response:
+        """拦截主页 GET /，注入 JS 扩展按钮。"""
+        headers = dict(request.headers)
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(downstream_url, headers=headers) as resp:
+                    body = await resp.read()
+                    html = body.decode("utf-8", errors="replace")
+
+                    injection = (
+                        '\n<script type="module">\n' + _INJECT_JS + "\n</script>\n"
+                    )
+                    if "</body>" in html:
+                        html = html.replace("</body>", injection + "</body>")
+                    else:
+                        html += injection
+
+                    resp_headers = {
+                        k: v
+                        for k, v in resp.headers.items()
+                        if k.lower()
+                        not in (
+                            "content-type",
+                            "content-length",
+                            "content-encoding",
                         )
-                        if "</body>" in html:
-                            html = html.replace("</body>", injection + "</body>")
-                        else:
-                            html += injection
+                    }
+                    return web.Response(
+                        body=html,
+                        status=resp.status,
+                        headers=resp_headers,
+                        content_type=resp.content_type,
+                    )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                return web.Response(status=502, text=f"Bad Gateway: {e}")
 
-                        resp_headers = {
-                            k: v
-                            for k, v in resp.headers.items()
-                            if k.lower()
-                            not in (
-                                "content-type",
-                                "content-length",
-                                "content-encoding",
-                            )
-                        }
-                        return web.Response(
-                            body=html,
-                            status=resp.status,
-                            headers=resp_headers,
-                            content_type=resp.content_type,
-                        )
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    return web.Response(status=502, text=f"Bad Gateway: {e}")
-
-        # 8. 默认普通代理
+    async def _handle_default_proxy(
+        self, request: web.Request, method: str, downstream_url: str
+    ) -> Union[web.Response, web.StreamResponse]:
+        """默认代理转发，将请求原样转发到下游。"""
+        headers = dict(request.headers)
         try:
             if request.body_exists:
                 body = await request.read()
