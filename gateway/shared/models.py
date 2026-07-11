@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence, List, Any, Optional
 
+from gateway.shared.outputs_parser import extract_workflow_id
+
 
 class JobStatus(str, Enum):
     """任务在队列中的状态。"""
@@ -107,15 +109,7 @@ class JobFilters:
         if self.statuses is not None and job.status not in self.statuses:
             return False
         if self.workflow_id is not None:
-            import json
-
-            try:
-                extra_data = json.loads(job.extra_data)
-                extra_pnginfo = extra_data.get("extra_pnginfo", {})
-                workflow = extra_pnginfo.get("workflow", {})
-                w_id = workflow.get("id")
-                if w_id != self.workflow_id:
-                    return False
-            except (json.JSONDecodeError, TypeError, KeyError):
+            w_id = extract_workflow_id(job.extra_data)
+            if w_id != self.workflow_id:
                 return False
         return True

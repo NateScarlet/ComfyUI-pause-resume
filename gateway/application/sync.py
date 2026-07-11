@@ -11,11 +11,11 @@ from gateway.shared.interfaces import (
 )
 from gateway.shared.events import DispatchSuccessEvent, DownstreamExecutingChangedEvent
 from gateway.shared.models import RawJSON
+from gateway.shared.outputs_parser import parse_outputs_count, THREE_D_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
 PREVIEWABLE_MEDIA_TYPES = frozenset({"images", "video", "audio", "3d", "text"})
-THREE_D_EXTENSIONS = frozenset({".obj", ".fbx", ".gltf", ".glb", ".usdz"})
 
 
 class JobDownstreamSyncer:
@@ -303,8 +303,8 @@ class JobDownstreamSyncer:
     def _parse_outputs_assets(
         self, outputs: Dict[str, Any]
     ) -> Tuple[int, Optional[Dict[str, Any]]]:
-        """从 outputs 字典中提取生成文件数量和预览项（严格类型契约，完美对齐官方逻辑）。"""
-        count = 0
+        """从 outputs 字典中提取生成文件数量和预览项。"""
+        count = parse_outputs_count(outputs)
         preview_output = None
         fallback_preview = None
 
@@ -316,40 +316,33 @@ class JobDownstreamSyncer:
 
             node_outputs_dict = cast(Dict[str, Any], node_outputs)
             for media_type, items in node_outputs_dict.items():
-                # 'animated' is a boolean flag, not actual output items in official ComfyUI
                 if media_type == "animated" or not isinstance(items, list):
                     continue
 
                 for item in cast(List[Any], items):
-                    item_dict: Optional[Dict[str, Any]] = None
                     if not isinstance(item, dict):
                         item_dict = self._normalize_output_item(item)
                         if item_dict is None:
-                            if media_type == "text":
-                                count += 1
-                                if preview_output is None:
-                                    if isinstance(item, (list, tuple)):
-                                        item_seq = cast(
-                                            Union[List[Any], Tuple[Any, ...]], item
-                                        )
-                                        text_value = (
-                                            str(item_seq[0]) if item_seq else ""
-                                        )
-                                    else:
-                                        text_value = str(item)
-                                    text_preview = self._create_text_preview(text_value)
-                                    enriched = {
-                                        **text_preview,
-                                        "nodeId": str(node_id),
-                                        "mediaType": media_type,
-                                    }
-                                    if fallback_preview is None:
-                                        fallback_preview = enriched
+                            if media_type == "text" and preview_output is None:
+                                if isinstance(item, (list, tuple)):
+                                    item_seq = cast(
+                                        Union[List[Any], Tuple[Any, ...]], item
+                                    )
+                                    text_value = str(item_seq[0]) if item_seq else ""
+                                else:
+                                    text_value = str(item)
+                                text_preview = self._create_text_preview(text_value)
+                                enriched = {
+                                    **text_preview,
+                                    "nodeId": str(node_id),
+                                    "mediaType": media_type,
+                                }
+                                if fallback_preview is None:
+                                    fallback_preview = enriched
                             continue
                     else:
                         item_dict = cast(Dict[str, Any], item)
 
-                    count += 1
                     if preview_output is not None:
                         continue
 

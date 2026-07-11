@@ -7,6 +7,7 @@ from typing import List, Optional, Any
 
 from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
+from gateway.shared.outputs_parser import extract_workflow_id
 
 logger = logging.getLogger(__name__)
 
@@ -438,13 +439,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
         t_start = time.perf_counter()
 
         # 提取 workflow_id 以便写入数据库物理列
-        w_id = None
-        if job.extra_data:
-            try:
-                extra_data = json.loads(job.extra_data)
-                w_id = extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id")
-            except Exception:
-                pass
+        w_id = extract_workflow_id(job.extra_data)
 
         with self._lock:
             cursor = self._conn.cursor()
@@ -476,13 +471,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
 
     def save(self, job: Job) -> bool:
         """保存任务数据实体（如果已存在则更新，不存在则插入）。"""
-        w_id = None
-        if job.extra_data:
-            try:
-                extra_data = json.loads(job.extra_data)
-                w_id = extra_data.get("extra_pnginfo", {}).get("workflow", {}).get("id")
-            except Exception:
-                pass
+        w_id = extract_workflow_id(job.extra_data)
 
         with self._lock:
             cursor = self._conn.cursor()

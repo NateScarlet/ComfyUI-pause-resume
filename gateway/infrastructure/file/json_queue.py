@@ -6,6 +6,7 @@ from typing import List, Optional, Set, Any
 
 from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
+from gateway.shared.outputs_parser import extract_workflow_id
 from gateway.shared.utils import RawJSONEncoder
 
 
@@ -118,17 +119,7 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
         )
         result: List[JobSummary] = []
         for t in jobs:
-            w_id = None
-            if t.extra_data:
-                try:
-                    extra_data = json.loads(t.extra_data)
-                    w_id = (
-                        extra_data.get("extra_pnginfo", {})
-                        .get("workflow", {})
-                        .get("id")
-                    )
-                except Exception:
-                    pass
+            w_id = extract_workflow_id(t.extra_data)
             result.append(
                 JobSummary(
                     number=t.number,

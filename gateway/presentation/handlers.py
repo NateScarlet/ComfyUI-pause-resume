@@ -17,6 +17,7 @@ from gateway.shared.interfaces import (
 from gateway.shared.models import JobStatus, JobFilters, JobSummary
 from gateway.shared.events import StatusChangedEvent, StateChangedEvent
 from gateway.shared.exceptions import GatewayError, JobNotFoundError
+from gateway.shared.outputs_parser import parse_outputs_count
 from gateway.application.facade import AppFacade
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -31,41 +32,14 @@ class GatewayHandlers:
 
     @staticmethod
     def _parse_outputs_count(outputs_json_str: Union[str, None]) -> int:
-        """解析 outputs 字典的 JSON 字符串并扁平化计算生成资产文件数量。"""
         if not outputs_json_str:
             return 0
-
         ds_outputs = json.loads(outputs_json_str)
         if not isinstance(ds_outputs, dict):
             raise ValueError(
                 f"Failed parsing outputs count: root of JSON outputs is not a dict, got {type(ds_outputs)}"
             )
-
-        count = 0
-        ds_outputs_dict = cast(Dict[str, Any], ds_outputs)
-        for node_id, node_outputs in ds_outputs_dict.items():
-            if not isinstance(node_outputs, dict):
-                raise ValueError(
-                    f"Unexpected node outputs format for node '{node_id}' in presentation: expected dict, got {type(node_outputs)}"
-                )
-
-            node_outputs_dict = cast(Dict[str, Any], node_outputs)
-            for media_type, items in node_outputs_dict.items():
-                if media_type == "animated" or not isinstance(items, list):
-                    continue
-
-                for item in cast(List[Any], items):
-                    if not isinstance(item, dict):
-                        lower_filename = str(item).lower()
-                        is_3d = any(
-                            lower_filename.endswith(ext)
-                            for ext in {".obj", ".fbx", ".gltf", ".glb", ".usdz"}
-                        )
-                        if is_3d or media_type == "text":
-                            count += 1
-                        continue
-                    count += 1
-        return count
+        return parse_outputs_count(cast(Dict[str, Any], ds_outputs))
 
     def __init__(
         self,
