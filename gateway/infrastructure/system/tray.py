@@ -21,30 +21,48 @@ except ImportError:
     ImageDraw = None  # type: ignore[assignment]
 
 
-def _create_icon(color: str) -> Any:
-    """创建指定颜色的圆形托盘图标。"""
+def _create_icon(color: str, filled: bool = True) -> Any:
+    """创建指定颜色的圆形托盘图标。
+
+    Args:
+        color: 圆形颜色。
+        filled: True 为实心圆，False 为空心圆（仅描边）。
+    """
     if Image is None or ImageDraw is None:
         raise RuntimeError("Pillow 未安装")
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.ellipse([4, 4, 60, 60], fill=color)
+    if filled:
+        draw.ellipse([4, 4, 60, 60], fill=color)
+    else:
+        draw.ellipse([4, 4, 60, 60], outline=color, width=3)
     return img
 
 
 _icon_running: Optional[Any] = None
 _icon_stopping: Optional[Any] = None
 _icon_paused: Optional[Any] = None
+_icon_running_empty: Optional[Any] = None
+_icon_stopping_empty: Optional[Any] = None
+_icon_paused_empty: Optional[Any] = None
 
 
 def _ensure_icons() -> None:
     """延迟创建图标单例，避免模块导入时即依赖 Pillow。"""
     global _icon_running, _icon_stopping, _icon_paused
+    global _icon_running_empty, _icon_stopping_empty, _icon_paused_empty
     if _icon_running is None:
         _icon_running = _create_icon("#4CAF50")
     if _icon_stopping is None:
         _icon_stopping = _create_icon("#FFC107")
     if _icon_paused is None:
         _icon_paused = _create_icon("#F44336")
+    if _icon_running_empty is None:
+        _icon_running_empty = _create_icon("#4CAF50", filled=False)
+    if _icon_stopping_empty is None:
+        _icon_stopping_empty = _create_icon("#FFC107", filled=False)
+    if _icon_paused_empty is None:
+        _icon_paused_empty = _create_icon("#F44336", filled=False)
 
 
 def _create_pystray_icon(icon: Any, title: str, menu: Any) -> Any:
@@ -231,9 +249,12 @@ class SystemTrayController:
         return self._queue_reader.count(JobFilters([JobStatus.RUNNING]), limit=1) > 0
 
     def _get_current_icon(self) -> Any:
+        empty = self._queue_count == 0
         if self._is_stopping():
-            return _icon_stopping
-        return _icon_paused if self._paused else _icon_running
+            return _icon_stopping_empty if empty else _icon_stopping
+        if self._paused:
+            return _icon_paused_empty if empty else _icon_paused
+        return _icon_running_empty if empty else _icon_running
 
     @staticmethod
     def _format_duration(ms: int) -> str:
