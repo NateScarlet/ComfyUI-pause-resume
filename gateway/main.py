@@ -196,12 +196,20 @@ async def main() -> None:
     tray_unsub_state = None
     tray_unsub_status = None
     try:
+        from PIL import ImageFont
+
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 20)
+        except IOError:
+            font = ImageFont.load_default()
+
         tray_controller = SystemTrayController(
             app_facade=app_facade,
             queue_reader=queue_reader,
             downstream_service=downstream_service,
             loop=loop,
             exit_event=exit_event,
+            font=font,
         )
         # 订阅事件以更新托盘状态
         tray_unsub_state = event_bus.subscribe(
