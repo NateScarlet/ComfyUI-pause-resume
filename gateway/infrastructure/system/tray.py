@@ -51,7 +51,7 @@ class SystemTrayController:
         downstream_service: DownstreamClient,
         loop: Any,
         exit_event: Any,
-        font: Any,
+        fonts: dict[int, Any],
     ):
         if not _tray_available:
             raise ImportError("系统托盘需要安装额外依赖：pip install .[tray]")
@@ -61,7 +61,7 @@ class SystemTrayController:
         self._downstream_service = downstream_service
         self._loop = loop
         self._exit_event = exit_event
-        self._font = font
+        self._fonts = fonts
 
         self._paused = app_facade.get_state.handle()
         self._queue_count = self._queue_reader.count(
@@ -251,10 +251,10 @@ class SystemTrayController:
 
         # 有任务且剩余时间占比大于 0 时，绘制背景扇形图
         if count > 0 and ratio > 0.0:
-            draw.pieslice([4, 4, 60, 60], start=-90, end=-90 + ratio * 360, fill=color)
+            draw.pieslice([1, 1, 62, 62], start=-90, end=-90 + ratio * 360, fill=color)
 
         # 始终绘制圆边框
-        draw.ellipse([4, 4, 60, 60], outline=color, width=3)
+        draw.ellipse([1, 1, 62, 62], outline=color, width=3)
 
         # 居中绘制白色文本（带黑色描边，防透明/混色背景下不可见）
         if count > 0:
@@ -270,11 +270,15 @@ class SystemTrayController:
             else:
                 text = ">9k"
 
+            # 根据文本长度选择合适的字体大小（1个字符用_fonts[1]，2个用_fonts[2]，3个或以上用_fonts[3]）
+            font_len = len(text)
+            font = self._fonts.get(font_len, self._fonts.get(3))
+
             draw.text(
                 (32, 32),
                 text,
                 fill="#FFFFFF",
-                font=self._font,
+                font=font,
                 anchor="mm",
                 stroke_width=1,
                 stroke_fill="#000000",

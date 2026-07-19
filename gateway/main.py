@@ -199,9 +199,17 @@ async def main() -> None:
         from PIL import ImageFont
 
         try:
-            font = ImageFont.truetype("arialbd.ttf", 20)
+            fonts = {
+                1: ImageFont.truetype("arialbd.ttf", 40),
+                2: ImageFont.truetype("arialbd.ttf", 34),
+                3: ImageFont.truetype("arialbd.ttf", 26),
+            }
         except IOError:
-            font = ImageFont.load_default()
+            fonts = {
+                1: ImageFont.load_default(size=40),
+                2: ImageFont.load_default(size=34),
+                3: ImageFont.load_default(size=26),
+            }
 
         tray_controller = SystemTrayController(
             app_facade=app_facade,
@@ -209,7 +217,7 @@ async def main() -> None:
             downstream_service=downstream_service,
             loop=loop,
             exit_event=exit_event,
-            font=font,
+            fonts=fonts,
         )
         # 订阅事件以更新托盘状态
         tray_unsub_state = event_bus.subscribe(
