@@ -200,15 +200,15 @@ async def main() -> None:
 
         try:
             fonts = {
-                1: ImageFont.truetype("arialbd.ttf", 40),
-                2: ImageFont.truetype("arialbd.ttf", 34),
-                3: ImageFont.truetype("arialbd.ttf", 26),
+                1: ImageFont.truetype("arialbd.ttf", 52),
+                2: ImageFont.truetype("arialbd.ttf", 44),
+                3: ImageFont.truetype("arialbd.ttf", 38),
             }
         except IOError:
             fonts = {
-                1: ImageFont.load_default(size=40),
-                2: ImageFont.load_default(size=34),
-                3: ImageFont.load_default(size=26),
+                1: ImageFont.load_default(size=52),
+                2: ImageFont.load_default(size=44),
+                3: ImageFont.load_default(size=38),
             }
 
         tray_controller = SystemTrayController(
