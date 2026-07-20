@@ -76,6 +76,9 @@ class SystemTrayController:
         self._thread: Optional[threading.Thread] = None
         self._refresh_timer: Optional[threading.Timer] = None  # 自动恢复定时器
         self._refresh_lock = threading.Lock()  # 防抖锁
+        self._last_visual_state: Optional[tuple[str, Optional[str], float]] = (
+            None  # 上次渲染的视觉状态，用于跳过无变化更新
+        )
 
     def start(self) -> None:
         """在独立后台线程中启动系统托盘图标，并启动定时更新线程。"""
@@ -232,6 +235,49 @@ class SystemTrayController:
             return _COLOR_PAUSED
         return _COLOR_RUNNING
 
+    @staticmethod
+    def _format_count_text(count: int) -> Optional[str]:
+        """将队列数量格式化为托盘图标上显示的文本，返回 None 表示无需显示。"""
+        if count <= 0:
+            return None
+        elif count <= 999:
+            return str(count)
+        elif count <= 9999:
+            k_val = int(count / 1000 + 0.5)
+            if k_val >= 10:
+                return ">9k"
+            return f"{k_val}k"
+        return ">9k"
+
+    def _compute_ratio(self) -> float:
+        """计算剩余时间占比（0.0-1.0），基于 _estimated_time_ms 和一天的总毫秒数。"""
+        est_time_ms = (
+            self._estimated_time_ms if self._estimated_time_ms is not None else 0
+        )
+        if est_time_ms <= 0:
+            return 0.0
+        return min(1.0, float(est_time_ms) / _MS_PER_DAY)
+
+    def _compute_visual_state(self) -> tuple[str, Optional[str], float]:
+        """计算当前图标视觉状态，返回可哈希元组用于比较跳过无变化更新。
+
+        视觉状态由三个元素组成：颜色、队列计数文本、离散化饼图比例。
+        饼图比例按 1/360（约 0.28%）粒度离散化，在 64px 图标上人眼无法区分更小变化。
+        """
+        color = self._get_state_color()
+        count = self._queue_count
+        count_text = self._format_count_text(count)
+        ratio = self._compute_ratio()
+
+        if count > 0 and ratio > 0.0:
+            # 离散化到最近整数度（1/360 圆 ≈ 0.28%）
+            degrees = ratio * 360.0
+            discretized_ratio = round(degrees) / 360.0
+        else:
+            discretized_ratio = 0.0
+
+        return (color, count_text, discretized_ratio)
+
     def _get_current_icon(self) -> Any:
         """动态生成托盘图标，包含剩余时间的扇形进度图与队列计数的白色描边文字。"""
         if Image is None or ImageDraw is None or ImageFont is None:
@@ -239,12 +285,7 @@ class SystemTrayController:
 
         color = self._get_state_color()
         count = self._queue_count
-
-        # 计算剩余时间占比扇形
-        est_time_ms = (
-            self._estimated_time_ms if self._estimated_time_ms is not None else 0
-        )
-        ratio = min(1.0, float(est_time_ms) / _MS_PER_DAY) if est_time_ms > 0 else 0.0
+        ratio = self._compute_ratio()
 
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
@@ -257,19 +298,8 @@ class SystemTrayController:
         draw.ellipse([1, 1, 62, 62], outline=color, width=3)
 
         # 居中绘制白色文本（带黑色描边，防透明/混色背景下不可见）
-        if count > 0:
-            if count <= 999:
-                text = str(count)
-            elif count <= 9999:
-                k_val = int(count / 1000 + 0.5)
-                # 解决四舍五入到 10k 时与 5位数以上的 >9k 逻辑冲突
-                if k_val >= 10:
-                    text = ">9k"
-                else:
-                    text = f"{k_val}k"
-            else:
-                text = ">9k"
-
+        text = self._format_count_text(count)
+        if text is not None:
             # 根据文本长度选择合适的字体大小（1个字符用_fonts[1]，2个用_fonts[2]，3个或以上用_fonts[3]）
             font_len = len(text)
             font = self._fonts.get(font_len, self._fonts.get(3))
@@ -337,11 +367,25 @@ class SystemTrayController:
             if self._icon is not None and self._icon.visible:
                 self._refresh_icon_and_tooltip()
 
-    def _refresh_icon_and_tooltip(self) -> None:
-        """更新托盘图标和 Tooltip 属性。"""
-        if self._icon is not None:
+    def _refresh_icon_and_tooltip(self, force: bool = False) -> None:
+        """更新托盘图标和 Tooltip 属性。
+
+        Tooltip 文本始终更新。图标仅在 force=True 或视觉状态发生变化时才更新，
+        避免无变化时重绘导致图标闪烁。
+        """
+        if self._icon is None:
+            return
+
+        current_state = self._compute_visual_state()
+        if (
+            force
+            or self._last_visual_state is None
+            or current_state != self._last_visual_state
+        ):
             self._icon.icon = self._get_current_icon()
-            self._icon.title = self._get_tooltip()
+            self._last_visual_state = current_state
+
+        self._icon.title = self._get_tooltip()
 
     # ── 事件回调（可能从非主线程调用，需线程安全） ──
 
@@ -353,7 +397,7 @@ class SystemTrayController:
             self._restart_pending = False
         self._last_tick_time = time.time()
         if self._icon is not None:
-            self._refresh_icon_and_tooltip()
+            self._refresh_icon_and_tooltip(force=True)
             self._icon.update_menu()
 
     def on_status_changed(self, event: StatusChangedEvent) -> None:
@@ -362,7 +406,7 @@ class SystemTrayController:
         self._estimated_time_ms = event.estimated_time_ms
         self._last_tick_time = time.time()
         if self._icon is not None:
-            self._refresh_icon_and_tooltip()
+            self._refresh_icon_and_tooltip(force=True)
             self._icon.update_menu()
 
     # ── 菜单动作回调（pystray 线程 → 主事件循环） ──
@@ -379,8 +423,7 @@ class SystemTrayController:
             logger.info("⏸️ Queue Paused via tray")
         self._last_tick_time = time.time()
         if self._icon is not None:
-            self._icon.icon = self._get_current_icon()
-            self._icon.title = self._get_tooltip()
+            self._refresh_icon_and_tooltip(force=True)
             self._icon.update_menu()
 
     def _on_restart(self) -> None:
