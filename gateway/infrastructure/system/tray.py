@@ -174,6 +174,10 @@ class SystemTrayController:
                     # 刷新提示文字与菜单内容
                     icon._update_title()
                     icon.update_menu()
+
+                    # 强制重新生成图标图像，解决显示变化后图标变为透明的问题
+                    self._refresh_icon_and_tooltip(force=True)
+
                     logger.info(
                         "Successfully restored system tray icon after display change."
                     )
