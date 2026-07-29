@@ -1,60 +1,62 @@
-# ComfyUI 可暂停队列代理网关
+[**中文**](README.zh.md)
 
-将仓库代码放置在便携版 ComfyUI 的根目录中，使用 `start.cmd` 代替原本的启动脚本启动，界面上会多出暂停恢复按钮
+# ComfyUI Pause/Resume Proxy Gateway
 
-启动配置可以在 `.env` 文件或环境变量中调整。
+Place this repository in the root of your ComfyUI portable installation. Use `start.cmd` instead of the original startup script — the UI will show pause/resume buttons.
 
-## 功能特点
+Startup configuration can be adjusted in `.env` file or environment variables.
 
-- **自动恢复**：启动时自动恢复上次暂停时保存的队列
-- **队列备份**：运行过程中自动备份队列，防止意外中断导致任务丢失
-- **进程管理**：完善的进程启动、停止和监控机制
-- **灵活配置**：支持 `.env` 文件和环境变量配置（如 `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`）
+## Features
 
-## 使用说明
+- **Auto Recovery**: Automatically restores the saved queue on startup
+- **Queue Backup**: Periodically backs up the queue during operation to prevent task loss from unexpected interruptions
+- **Process Management**: Complete process startup, stop and monitoring
+- **Flexible Configuration**: Supports `.env` file and environment variables (e.g. `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`)
 
-### 启动 ComfyUI
+## Usage
+
+### Start ComfyUI
 
 ```cmd
 start.cmd
 ```
 
-## 文件说明
+## File Structure
 
-- `start.cmd` - 启动脚本，直接运行 `gateway/__main__.py` 启动代理网关和 ComfyUI 本身，支持直接 UI 上控制队列暂停
-- `gateway/` - 代理网关的核心业务包目录
-- `gateway_data/` - 默认的数据存储目录（自动生成，可通过环境变量修改），其中包含：
-  - `queue.db` - SQLite 队列数据库文件（启用 WAL 模式）
-  - `state.db` - SQLite 网关状态数据库文件，用于持久化暂停/恢复等运行状态和任务预估时间数据
-  - `queue.json` - 传统 JSON 格式的保存队列文件（禁用 SQLite 队列时自动生成）
-  - `queue.json.tmp` - 队列保存时产生的临时文件
-  - `failed_workflows/` - 保存提交失败（如 400-500 错误）的任务信息的目录
-- `queue.json~<随机后缀>` - 旧版本 JSON 队列数据自动迁移到新数据目录后的备份文件（生成于根目录）
+- `start.cmd` - Entry script that runs `gateway/__main__.py` to start both the proxy gateway and ComfyUI, with pause/resume controls in the UI
+- `gateway/` - Core gateway package
+- `gateway_data/` - Default data storage directory (auto-created, configurable via environment variable), containing:
+  - `queue.db` - SQLite queue database (WAL mode)
+  - `state.db` - SQLite gateway state database for persisting pause/resume state and estimated completion times
+  - `queue.json` - Legacy JSON-format queue file (auto-generated when SQLite queue is disabled)
+  - `queue.json.tmp` - Temporary file during queue save
+  - `failed_workflows/` - Directory for storing failed task info (e.g. 400-500 errors)
+- `queue.json~<random_suffix>` - Backup file after automatic migration of legacy JSON queue data to the new data directory (generated in root)
 
-## 配置选项
+## Configuration
 
-### 环境变量与 .env
+### Environment Variables & .env
 
-支持在脚本同目录下创建 `.env` 文件或直接设置环境变量：
+Create a `.env` file in the same directory as the script, or set environment variables directly:
 
-- `COMFYUI_PORT`: 服务端口（默认 `8188`）
-- `COMFYUI_EXTRA_ARGS`: 传递给 ComfyUI 的额外参数（例如 `--preview-method auto`）
-- `COMFYUI_RESTART_DELAY_SEC`: 进程异常退出后重启延迟（秒，默认 `10`）
-- `COMFYUI_IDLE_RESTART_SEC`: 队列空闲后强制重启服务的超时时间（秒，默认 `600`，设置为 0 则禁用）
-- `COMFYUI_IDLE_PROGRAM`: 闲置时启动的程序路径（例如矿工程序，在有任务时会自动停止）
-- `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在闲置时会自动停止）
-- `COMFYUI_QUEUE_TYPE`: 队列实现类型，支持 `sqlite`（默认值，启用 WAL 模式，推荐）或 `json`（传统 JSONFile 队列实现）
-- `COMFYUI_GATEWAY_DATA_DIR`: 网关数据存储目录（默认值 `gateway_data`，支持绝对路径或相对路径，相对路径会相对于启动脚本所在根目录解析）
-- `COMFYUI_ESTIMATION_BUCKET_CAPACITY`: 预估时间桶容量（默认 `100`），控制双桶轮换算法中每个桶的任务记录数量上限
+- `COMFYUI_PORT`: Service port (default `8188`)
+- `COMFYUI_EXTRA_ARGS`: Extra arguments passed to ComfyUI (e.g. `--preview-method auto`)
+- `COMFYUI_RESTART_DELAY_SEC`: Delay before restarting after abnormal process exit (seconds, default `10`)
+- `COMFYUI_IDLE_RESTART_SEC`: Timeout to force restart after queue becomes idle (seconds, default `600`, set to `0` to disable)
+- `COMFYUI_IDLE_PROGRAM`: Path to a program to launch when idle (e.g. miner, auto-stopped when tasks arrive)
+- `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle)
+- `COMFYUI_QUEUE_TYPE`: Queue implementation type, supports `sqlite` (default, WAL mode, recommended) or `json` (legacy JSON file queue)
+- `COMFYUI_GATEWAY_DATA_DIR`: Gateway data storage directory (default `gateway_data`, supports absolute or relative paths — relative paths are resolved from the script root)
+- `COMFYUI_ESTIMATION_BUCKET_CAPACITY`: Estimation time bucket capacity (default `100`), controls the per-bucket task record limit in the dual-bucket rotation algorithm
 
-## 技术说明
+## Technical Notes
 
-此实现使用 HTTP API 进行队列的保存和恢复，相比 [yara](https://github.com/Satellile/yara) 的方案，能够完整保存工作流的 `extra_data` 信息，确保队列恢复的准确性。
+This implementation uses the HTTP API for queue save and restore. Compared to [yara](https://github.com/Satellile/yara), it fully preserves the workflow's `extra_data`, ensuring accurate queue restoration.
 
-## 注意事项
+## Caveats
 
-1. 脚本需要放置在 ComfyUI 便携版的根目录
-2. 暂停操作会等待当前任务完成，如果需要立即中断可使用原生的中断当前工作流操作
-3. 如果进程异常退出，脚本会自动尝试重启
-4. 提交新任务时会跳过校验总是返回成功，实际校验将延迟到执行前，有错误的工作流（例如遇到 400-500 错误时）会被保存至数据存储目录下的 `failed_workflows/` 目录下（包括错误信息、原始请求数据以及工作流 JSON）供排查，并从队列中丢弃。
-5. GET /queue 会总是返回空的 outputs_to_execute， 因为现在收到任务时没有立即解析
+1. The script must be placed in the ComfyUI portable edition root directory
+2. Pause waits for the current task to finish; use ComfyUI's native interrupt workflow action for immediate interruption
+3. If the process exits abnormally, the script will automatically attempt a restart
+4. New task submissions always return success immediately (skipping validation); actual validation is deferred until execution. Workflows that encounter errors (e.g. 400-500 responses) are saved to the `failed_workflows/` directory under the data directory (including error details, original request data, and workflow JSON) for inspection and removed from the queue.
+5. GET /queue always returns an empty `outputs_to_execute` since tasks are not parsed immediately on submission.

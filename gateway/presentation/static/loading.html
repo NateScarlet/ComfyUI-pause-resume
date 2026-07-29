@@ -39,15 +39,24 @@
         }
     </style>
     <script>
-        // 每隔两秒自动刷新以监测下游服务是否已就绪
-        setTimeout(() => {
+        var lang = navigator.language || navigator.userLanguage;
+        var isZh = lang.startsWith("zh");
+        document.addEventListener("DOMContentLoaded", function () {
+            document.getElementById("title-h2").textContent = isZh
+                ? "ComfyUI 正在启动中..."
+                : "ComfyUI is starting...";
+            document.getElementById("desc-p").textContent = isZh
+                ? "代理网关已就绪。您可以照常提交任务，本页面将在服务就绪后自动载入。"
+                : "Gateway proxy is ready. You can submit tasks as usual. This page will auto-reload when the service is ready.";
+        });
+        setTimeout(function () {
             window.location.reload();
         }, 2000);
     </script>
 </head>
 <body>
     <div class="loader"></div>
-    <h2>ComfyUI 正在启动中...</h2>
-    <p>代理网关已就绪。您可以照常提交任务，本页面将在服务就绪后自动载入。</p>
+    <h2 id="title-h2">ComfyUI is starting...</h2>
+    <p id="desc-p">Gateway proxy is ready. You can submit tasks as usual. This page will auto-reload when the service is ready.</p>
 </body>
 </html>

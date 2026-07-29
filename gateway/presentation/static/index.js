@@ -1,5 +1,28 @@
 const EXT_NAMESPACE = "io.github.natescarlet.pause-resume";
 
+const _locale = (function () {
+  var lang = navigator.language || navigator.userLanguage || "";
+  return lang.startsWith("zh") ? "zh" : "en";
+})();
+
+const _str = (function () {
+  var t = {
+    pauseBtn: _locale === "zh" ? "⏸️ 暂停" : "⏸️ Pause",
+    resumeBtn: _locale === "zh" ? "▶️ 恢复" : "▶️ Resume",
+    btnTitle:
+      _locale === "zh"
+        ? "Ctrl+点击：暂停并在闲置时重启"
+        : "Ctrl+Click: Pause and restart when idle",
+    cmdPause: _locale === "zh" ? "暂停队列" : "Pause Queue",
+    cmdResume: _locale === "zh" ? "恢复队列" : "Resume Queue",
+    cmdPauseRestart:
+      _locale === "zh" ? "暂停并重启" : "Pause and Restart",
+  };
+  return function (key) {
+    return t[key] || key;
+  };
+})();
+
 const api = {
   baseUrl: `/${EXT_NAMESPACE}`,
 
@@ -37,12 +60,12 @@ function setButtonState(btn) {
     (paused
       ? "bg-destructive-background text-base-foreground hover:bg-destructive-background-hover"
       : "bg-secondary-background text-secondary-foreground hover:bg-secondary-background-hover");
-  btn.innerText = paused ? "▶️ Resume" : "⏸️ Pause";
+  btn.innerText = paused ? _str("resumeBtn") : _str("pauseBtn");
 }
 
 function createPauseButton() {
   const btn = document.createElement("button");
-  btn.title = "Ctrl+Click: Pause and restart when idle";
+  btn.title = _str("btnTitle");
   btn.onclick = async (e) => {
     let data;
     if (paused) {
@@ -63,17 +86,17 @@ comfyApp.registerExtension({
   commands: [
     {
       id: `${EXT_NAMESPACE}.pause`,
-      label: "Pause Queue",
+      label: _str("cmdPause"),
       function: () => api.pause(),
     },
     {
       id: `${EXT_NAMESPACE}.resume`,
-      label: "Resume Queue",
+      label: _str("cmdResume"),
       function: () => api.resume(),
     },
     {
       id: `${EXT_NAMESPACE}.pause_and_restart`,
-      label: "Pause and Restart",
+      label: _str("cmdPauseRestart"),
       function: () => api.pause(true),
     },
   ],
