@@ -8,6 +8,12 @@ A proxy/gateway that wraps ComfyUI to add pause/resume queue controls with persi
 
 - **Auto Recovery**: Automatically restores the saved queue on startup
 - **Queue Backup**: Backs up the queue in real-time to prevent task loss from unexpected interruptions
+- **Instant Queueing**: Tasks are queued instantly without validation — validation is deferred until execution, so submissions complete in milliseconds
+- **Crash Recovery**: Automatically retries dispatch on transient errors; re-queues running tasks after a crash (up to 3 attempts per task before permanent failure)
+- **Idle Restart**: Optionally restarts the downstream ComfyUI process after a configurable idle timeout to free resources
+- **System Tray** (requires `pip install .[tray]`): Dynamic tray icon with queue count and estimated-time progress ring; right-click menu for pause/resume/restart/exit; auto-restores icon after display changes
+- **Power Management**: Automatically prevents system sleep while tasks are running or external scripts are active
+- **External Program Hooks**: Launches user-defined programs when the queue becomes busy or idle (e.g. GPU monitor, fan control, miner); programs are stopped when the opposite state triggers
 - **Process Management**: Complete process startup, stop and monitoring
 - **Flexible Configuration**: Supports `.env` file and environment variables (e.g. `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`)
 
@@ -59,6 +65,10 @@ Create a `.env` file in the same directory as the script, or set environment var
 - `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle)
 - `COMFYUI_QUEUE_TYPE`: Queue implementation type, supports `sqlite` (default, WAL mode, recommended) or `json` (legacy JSON file queue)
 - `COMFYUI_GATEWAY_DATA_DIR`: Gateway data storage directory (default `gateway_data`, supports absolute or relative paths — relative paths are resolved from the script root)
+- `COMFYUI_HOST`: Gateway listening address (default `127.0.0.1`)
+- `COMFYUI_HISTORY_RETENTION_DAYS`: History retention for completed/failed/cancelled jobs in days (default `90`)
+- `COMFYUI_LANG`: Force UI language (`zh` or `en`); auto-detected from system locale by default
+- `GATEWAY_DEBUG`: Set to `true` to enable detailed debug logging
 - `COMFYUI_ESTIMATION_BUCKET_CAPACITY`: Estimation time bucket capacity (default `100`), controls the per-bucket task record limit in the dual-bucket rotation algorithm
 
 ## Technical Notes
