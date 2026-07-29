@@ -68,7 +68,7 @@ This implementation uses the HTTP API for queue save and restore. Compared to [y
 ## Caveats
 
 1. `start.cmd` and `gateway/` must be deployed to the ComfyUI portable root directory (use `scripts\deploy.ps1` or manual copy)
-2. Pause waits for the current task to finish; use ComfyUI's native interrupt workflow action for immediate interruption
+2. Pause waits for the current task to finish. To abandon current progress: use ComfyUI's native interrupt (the running task is discarded and won't re-execute on restart), or Ctrl+C / tray Exit (the running task will re-execute on next start)
 3. If the process exits abnormally, the script will automatically attempt a restart
 4. New task submissions always return success immediately (skipping validation); actual validation is deferred until execution. Workflows that encounter errors (e.g. 400-500 responses) are saved to the `failed_workflows/` directory under the data directory (including error details, original request data, and workflow JSON) for inspection and removed from the queue.
 5. GET /queue always returns an empty `outputs_to_execute` since tasks are not parsed immediately on submission.
