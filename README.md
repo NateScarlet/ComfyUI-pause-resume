@@ -4,6 +4,13 @@
 
 A proxy/gateway that wraps ComfyUI to add pause/resume queue controls with persistent state across restarts.
 
+## Features
+
+- **Auto Recovery**: Automatically restores the saved queue on startup
+- **Queue Backup**: Periodically backs up the queue during operation to prevent task loss from unexpected interruptions
+- **Process Management**: Complete process startup, stop and monitoring
+- **Flexible Configuration**: Supports `.env` file and environment variables (e.g. `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`)
+
 ## Installation
 
 ### Option 1: Deploy script
@@ -25,13 +32,6 @@ start.cmd
 ```
 
 The UI will show pause/resume buttons. Startup configuration can be adjusted in `.env` file or environment variables.
-
-## Features
-
-- **Auto Recovery**: Automatically restores the saved queue on startup
-- **Queue Backup**: Periodically backs up the queue during operation to prevent task loss from unexpected interruptions
-- **Process Management**: Complete process startup, stop and monitoring
-- **Flexible Configuration**: Supports `.env` file and environment variables (e.g. `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`)
 
 ## File Structure
 
