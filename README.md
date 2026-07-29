@@ -2,9 +2,29 @@
 
 # ComfyUI Pause/Resume Proxy Gateway
 
-Place this repository in the root of your ComfyUI portable installation. Use `start.cmd` instead of the original startup script — the UI will show pause/resume buttons.
+A proxy/gateway that wraps ComfyUI to add pause/resume queue controls with persistent state across restarts.
 
-Startup configuration can be adjusted in `.env` file or environment variables.
+## Installation
+
+### Option 1: Deploy script
+
+```powershell
+.\scripts\deploy.ps1 -TargetDir "C:\ComfyUI"
+```
+
+This copies `start.cmd` and `gateway/` to the target directory and validates that a Python runtime exists.
+
+### Option 2: Manual copy
+
+Copy `start.cmd` and the `gateway/` folder into your ComfyUI portable root directory, next to `python_embeded/`.
+
+## Usage
+
+```cmd
+start.cmd
+```
+
+The UI will show pause/resume buttons. Startup configuration can be adjusted in `.env` file or environment variables.
 
 ## Features
 
@@ -12,14 +32,6 @@ Startup configuration can be adjusted in `.env` file or environment variables.
 - **Queue Backup**: Periodically backs up the queue during operation to prevent task loss from unexpected interruptions
 - **Process Management**: Complete process startup, stop and monitoring
 - **Flexible Configuration**: Supports `.env` file and environment variables (e.g. `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`)
-
-## Usage
-
-### Start ComfyUI
-
-```cmd
-start.cmd
-```
 
 ## File Structure
 
@@ -55,7 +67,7 @@ This implementation uses the HTTP API for queue save and restore. Compared to [y
 
 ## Caveats
 
-1. The script must be placed in the ComfyUI portable edition root directory
+1. `start.cmd` and `gateway/` must be deployed to the ComfyUI portable root directory (use `scripts\deploy.ps1` or manual copy)
 2. Pause waits for the current task to finish; use ComfyUI's native interrupt workflow action for immediate interruption
 3. If the process exits abnormally, the script will automatically attempt a restart
 4. New task submissions always return success immediately (skipping validation); actual validation is deferred until execution. Workflows that encounter errors (e.g. 400-500 responses) are saved to the `failed_workflows/` directory under the data directory (including error details, original request data, and workflow JSON) for inspection and removed from the queue.
