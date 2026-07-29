@@ -7,7 +7,7 @@ A proxy/gateway that wraps ComfyUI to add pause/resume queue controls with persi
 ## Features
 
 - **Auto Recovery**: Automatically restores the saved queue on startup
-- **Queue Backup**: Periodically backs up the queue during operation to prevent task loss from unexpected interruptions
+- **Queue Backup**: Backs up the queue in real-time to prevent task loss from unexpected interruptions
 - **Process Management**: Complete process startup, stop and monitoring
 - **Flexible Configuration**: Supports `.env` file and environment variables (e.g. `COMFYUI_PORT`, `COMFYUI_EXTRA_ARGS`)
 
