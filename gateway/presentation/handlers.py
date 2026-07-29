@@ -22,7 +22,8 @@ from gateway.presentation.formatters import format_job_summary, format_job_detai
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _LOADING_HTML = (_STATIC_DIR / "loading.html").read_text(encoding="utf-8")
-_INJECT_JS = (_STATIC_DIR / "inject.js").read_text(encoding="utf-8")
+_EXT_EXTENSION_JS = (_STATIC_DIR / "index.js").read_text(encoding="utf-8")
+_EXT_JS_URL = "/extensions/io.github.natescarlet.pause-resume/index.js"
 
 logger = logging.getLogger(__name__)
 
@@ -254,12 +255,19 @@ class GatewayHandlers:
             downstream_url = self._build_downstream_url(request)
             return await self._handle_ws_proxy(request, downstream_url)
 
-        # 8. 拦截主页加载以动态注入 JS 扩展按钮
-        if method == "GET" and (path == "/" or path == "/index.html"):
+        # 8. 扩展加载管道：向扩展列表追加我们的扩展 URL
+        if method == "GET" and (path == "/api/extensions" or path == "/extensions"):
             downstream_url = self._build_downstream_url(request)
-            return await self._handle_html_injection(request, downstream_url)
+            return await self._handle_extensions_proxy(downstream_url)
 
-        # 9. 默认普通代理
+        # 9. 扩展加载管道：返回我们的扩展 JS 文件
+        if method == "GET" and path == _EXT_JS_URL:
+            return web.Response(
+                content_type="application/javascript",
+                text=_EXT_EXTENSION_JS,
+            )
+
+        # 10. 默认普通代理
         downstream_url = self._build_downstream_url(request)
         return await self._handle_default_proxy(request, method, downstream_url)
 
@@ -584,43 +592,15 @@ class GatewayHandlers:
                 self.ws_clients.discard(ws_server)
         return ws_server
 
-    async def _handle_html_injection(
-        self, request: web.Request, downstream_url: str
-    ) -> web.Response:
-        """拦截主页 GET /，注入 JS 扩展按钮。"""
-        headers = dict(request.headers)
+    async def _handle_extensions_proxy(self, downstream_url: str) -> web.Response:
+        """拦截 /api/extensions 响应，追加我们的扩展 URL。"""
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(downstream_url, headers=headers) as resp:
-                    body = await resp.read()
-                    html = body.decode("utf-8", errors="replace")
-
-                    injection = (
-                        '\n<script type="module">\n' + _INJECT_JS + "\n</script>\n"
-                    )
-                    if "</body>" in html:
-                        html = html.replace("</body>", injection + "</body>")
-                    else:
-                        html += injection
-
-                    resp_headers = {
-                        k: v
-                        for k, v in resp.headers.items()
-                        if k.lower()
-                        not in (
-                            "content-type",
-                            "content-length",
-                            "content-encoding",
-                        )
-                    }
-                    return web.Response(
-                        body=html,
-                        status=resp.status,
-                        headers=resp_headers,
-                        content_type=resp.content_type,
-                    )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                return web.Response(status=502, text=f"Bad Gateway: {e}")
+            async with session.get(downstream_url) as resp:
+                if resp.status != 200:
+                    return web.Response(status=resp.status, text=await resp.text())
+                data = await resp.json()
+                data.append(_EXT_JS_URL)
+                return web.json_response(data)
 
     async def _handle_default_proxy(
         self, request: web.Request, method: str, downstream_url: str
