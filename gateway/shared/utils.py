@@ -1,6 +1,25 @@
 import json
+import locale
+import os
 from typing import Any, Dict, List, Generator, cast
 from .models import RawJSON
+
+
+def get_locale() -> str:
+    """检测当前语言环境，返回 'zh' 或 'en'。
+
+    优先级: COMFYUI_LANG 环境变量 > 系统 locale。
+    """
+    env_lang = os.environ.get("COMFYUI_LANG", "").strip().lower()
+    if env_lang:
+        return env_lang if env_lang in ("zh", "en") else "en"
+    try:
+        sys_locale, _ = locale.getdefaultlocale()
+        if sys_locale and sys_locale.startswith("zh"):
+            return "zh"
+    except (ValueError, RuntimeError):
+        pass
+    return "en"
 
 
 class RawJSONEncoder(json.JSONEncoder):

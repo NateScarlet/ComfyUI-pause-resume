@@ -7,6 +7,14 @@ from gateway.application.facade import AppFacade
 from gateway.shared.interfaces import DownstreamClient, JobQueueReader
 from gateway.shared.models import JobStatus, JobFilters
 from gateway.shared.events import StateChangedEvent, StatusChangedEvent
+from gateway.shared.utils import get_locale
+
+_LC = get_locale()
+
+
+def _tr(zh: str, en: str) -> str:
+    return zh if _LC == "zh" else en
+
 
 logger = logging.getLogger(__name__)
 
@@ -322,27 +330,32 @@ class SystemTrayController:
 
     @staticmethod
     def _format_duration(ms: int) -> str:
-        """将毫秒时间戳转换为可读格式（如 "5分30秒"）。"""
         seconds = ms // 1000
         minutes, secs = divmod(seconds, 60)
         hours, mins = divmod(minutes, 60)
         if hours > 0:
-            return f"{hours}时{mins}分{secs}秒"
+            return _tr(f"{hours}时{mins}分{secs}秒", f"{hours}h{mins}m{secs}s")
         elif minutes > 0:
-            return f"{minutes}分{secs}秒"
-        return f"{secs}秒"
+            return _tr(f"{minutes}分{secs}秒", f"{minutes}m{secs}s")
+        return _tr(f"{secs}秒", f"{secs}s")
 
     def _get_tooltip(self) -> str:
         if self._is_stopping():
-            state = "正在停止"
+            state = _tr("正在停止", "Stopping")
         elif self._paused:
-            state = "已暂停"
+            state = _tr("已暂停", "Paused")
         else:
-            state = "运行中"
-        tooltip = f"ComfyUI Gateway - {state} (队列: {self._queue_count})"
+            state = _tr("运行中", "Running")
+        tooltip = _tr(
+            f"ComfyUI Gateway - {state} (队列: {self._queue_count})",
+            f"ComfyUI Gateway - {state} (Queue: {self._queue_count})",
+        )
         est_time = self._estimated_time_ms if self._estimated_time_ms is not None else 0
         if est_time > 0:
-            tooltip += f" 预计: {self._format_duration(est_time)}"
+            tooltip += _tr(
+                f" 预计: {self._format_duration(est_time)}",
+                f" Est: {self._format_duration(est_time)}",
+            )
         return tooltip
 
     def _update_loop(self) -> None:
@@ -462,20 +475,28 @@ class SystemTrayController:
         """构建托盘右键上下文菜单，使用动态文本以反映最新状态。"""
         assert pystray is not None
 
-        # pystray 会在每次打开菜单时调用 callable，并传入 MenuItem 实例
         def pause_text(_: Any) -> str:
-            return "恢复任务" if self._paused else "暂停任务"
+            return (
+                _tr("恢复任务", "Resume") if self._paused else _tr("暂停任务", "Pause")
+            )
 
         def restart_text(_: Any) -> str:
-            return "立即重启" if self._restart_pending else "暂停后重启"
+            return (
+                _tr("立即重启", "Restart Now")
+                if self._restart_pending
+                else _tr("暂停后重启", "Pause then Restart")
+            )
 
         def queue_text(_: Any) -> str:
-            text = f"队列: {self._queue_count}"
+            text = _tr(f"队列: {self._queue_count}", f"Queue: {self._queue_count}")
             est_time = (
                 self._estimated_time_ms if self._estimated_time_ms is not None else 0
             )
             if est_time > 0:
-                text += f" 预计: {self._format_duration(est_time)}"
+                text += _tr(
+                    f" 预计: {self._format_duration(est_time)}",
+                    f" Est: {self._format_duration(est_time)}",
+                )
             return text
 
         return pystray.Menu(
@@ -484,5 +505,5 @@ class SystemTrayController:
             pystray.MenuItem(pause_text, self._on_pause_resume),
             pystray.MenuItem(restart_text, self._on_restart),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出", self._on_exit),
+            pystray.MenuItem(_tr("退出", "Exit"), self._on_exit),
         )
