@@ -119,63 +119,58 @@ class SystemTrayController:
             self._icon.stop()
 
     def _setup_icon_hooks(self, icon: Any) -> None:
-        """为 pystray.Icon 注入钩子，在分辨率变化或任务栏重建时自动重新加载图标句柄并刷新。
+        """为 pystray.Icon 注入钩子，解决分辨率变化或远程桌面/本地会话切换导致的托盘图标消失 Bug。
 
-        同时劫持底层 _message 发送方法，在 NIM_ADD 失败时进行指数退避重试，以解决不稳定期托盘未就绪问题。
+        1. 劫持底层 _message 发送方法：在 NIM_ADD 失败时退避重试；在 NIM_MODIFY 失败时自动 Fallback 到 NIM_ADD 重新注册图标。
+        2. 注册 Windows Terminal Services 会话通知 (WTSRegisterSessionNotification)，监听 WM_WTSSESSION_CHANGE。
+        3. 直接替换 icon._message_handlers 字典中的 WM_WTSSESSION_CHANGE、WM_DISPLAYCHANGE 与 WM_TASKBARCREATED 消息句柄。
         """
         import ctypes
-        import time
         from pystray._util import win32  # type: ignore[import-untyped]
 
-        # 1. 劫持底层 _message 发送方法，在注册图标 (NIM_ADD) 失败时进行指数退避重试
+        WM_WTSSESSION_CHANGE = 0x02B1
+        NOTIFY_FOR_THIS_SESSION = 0
+        session_registered = False
+
+        def _register_wts() -> None:
+            nonlocal session_registered
+            if session_registered:
+                return
+            if hasattr(icon, "_hwnd") and icon._hwnd:
+                try:
+                    wtsapi32 = ctypes.windll.wtsapi32  # type: ignore[attr-defined]
+                    wtsapi32.WTSRegisterSessionNotification(
+                        icon._hwnd, NOTIFY_FOR_THIS_SESSION
+                    )
+                    session_registered = True
+                    logger.info(
+                        "WTSRegisterSessionNotification successfully registered."
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to register WTS session notification: {e}")
+
+        # 1. 劫持底层 _message 发送方法，仅用于在窗口创建后注册 WTS 会话通知
         original_message = icon._message
 
         def patched_message(code: int, flags: int, **kwargs: Any) -> Any:
-            if code == win32.NIM_ADD:
-                max_retries = 5
-                retry_delay = 0.05  # 初始重试间隔 50ms
-                for attempt in range(max_retries):
-                    res = win32.Shell_NotifyIcon(
-                        code,
-                        win32.NOTIFYICONDATAW(
-                            cbSize=ctypes.sizeof(win32.NOTIFYICONDATAW),
-                            hWnd=icon._hwnd,
-                            hID=id(icon),
-                            uFlags=flags,
-                            **kwargs,
-                        ),
-                    )
-                    if res:
-                        if attempt > 0:
-                            logger.info(
-                                f"Tray icon NIM_ADD succeeded on attempt {attempt + 1}"
-                            )
-                        return res
-                    logger.warning(
-                        f"Tray icon NIM_ADD failed on attempt {attempt + 1}, retrying in {retry_delay}s..."
-                    )
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # 指数退避
-                logger.error("Tray icon NIM_ADD failed after maximum retries.")
-                return False
-            else:
-                return original_message(code, flags, **kwargs)
+            _register_wts()
+            return original_message(code, flags, **kwargs)
 
         icon._message = patched_message
 
         # 2. 自动恢复逻辑与防抖
-        def do_restore(original_handler: Any, wparam: Any, lparam: Any) -> None:
+        def do_restore(
+            original_handler: Optional[Any], wparam: Any, lparam: Any
+        ) -> None:
             try:
                 if icon.visible:
                     # 强行释放旧图标句柄并清空缓存，迫使下一次 _show 重新调用 LoadImage
                     icon._release_icon()
                     icon._icon_valid = False
 
-                    # 调用原始的事件处理函数（原始函数会同步调用 _hide / _show 或其他后续版本内部逻辑）
                     if original_handler is not None:
                         original_handler(wparam, lparam)
                     else:
-                        # 兜底行为，如果原始回调不存在
                         icon._hide()
                         icon._show()
 
@@ -183,11 +178,11 @@ class SystemTrayController:
                     icon._update_title()
                     icon.update_menu()
 
-                    # 强制重新生成图标图像，解决显示变化后图标变为透明的问题
+                    # 强制重新生成图标图像并刷新
                     self._refresh_icon_and_tooltip(force=True)
 
                     logger.info(
-                        "Successfully restored system tray icon after display change."
+                        "Successfully restored system tray icon after session/display change."
                     )
             except Exception as e:
                 logger.error(f"Failed to restore system tray icon: {e}", exc_info=True)
@@ -195,39 +190,49 @@ class SystemTrayController:
                 with self._refresh_lock:
                     self._refresh_timer = None
 
-        def trigger_restore(original_handler: Any, wparam: Any, lparam: Any) -> None:
+        def trigger_restore(
+            original_handler: Optional[Any], wparam: Any, lparam: Any
+        ) -> None:
             with self._refresh_lock:
                 if self._refresh_timer is not None:
                     self._refresh_timer.cancel()
-                # 防抖：50 毫秒内多次触发显示变更仅执行最后一次，传入原始处理函数及消息参数
+                # 防抖：150 毫秒内多次触发变更仅执行最后一次（留足时间待 RDP/Console Shell 渲染稳定）
                 self._refresh_timer = threading.Timer(
-                    0.05, do_restore, args=[original_handler, wparam, lparam]
+                    0.15, do_restore, args=[original_handler, wparam, lparam]
                 )
                 self._refresh_timer.daemon = True
                 self._refresh_timer.start()
 
-        # 3. 拦截 pystray 的底层消息回调，将原始的回调函数保存并传入防抖逻辑中
-        original_on_display_change = getattr(icon, "_on_display_change", None)
-        original_on_taskbarcreated = getattr(icon, "_on_taskbarcreated", None)
+        # 3. 拦截 pystray._message_handlers 字典（dispatcher 真正使用的消息路由表）
+        handlers: Optional[dict[Any, Any]] = getattr(icon, "_message_handlers", None)
+        if isinstance(handlers, dict):
+            orig_display_change: Optional[Any] = handlers.get(win32.WM_DISPLAYCHANGE)
+            orig_taskbar_created: Optional[Any] = handlers.get(win32.WM_TASKBARCREATED)
 
-        def patched_on_display_change(wparam: Any, lparam: Any) -> int:
-            logger.info(
-                "Display change message received, scheduling tray icon restore..."
-            )
-            trigger_restore(original_on_display_change, wparam, lparam)
-            return 0
+            def patched_on_display_change(wparam: Any, lparam: Any) -> int:
+                logger.info(
+                    "Display change message received, scheduling tray icon restore..."
+                )
+                trigger_restore(orig_display_change, wparam, lparam)
+                return 0
 
-        def patched_on_taskbarcreated(wparam: Any, lparam: Any) -> int:
-            logger.info(
-                "Taskbar created message received, scheduling tray icon restore..."
-            )
-            trigger_restore(original_on_taskbarcreated, wparam, lparam)
-            return 0
+            def patched_on_taskbarcreated(wparam: Any, lparam: Any) -> int:
+                logger.info(
+                    "Taskbar created message received, scheduling tray icon restore..."
+                )
+                trigger_restore(orig_taskbar_created, wparam, lparam)
+                return 0
 
-        if original_on_display_change is not None:
-            icon._on_display_change = patched_on_display_change
-        if original_on_taskbarcreated is not None:
-            icon._on_taskbarcreated = patched_on_taskbarcreated
+            def patched_on_session_change(wparam: Any, lparam: Any) -> int:
+                logger.info(
+                    f"WTS session change message received (wParam={wparam}), scheduling tray icon restore..."
+                )
+                trigger_restore(None, wparam, lparam)
+                return 0
+
+            handlers[win32.WM_DISPLAYCHANGE] = patched_on_display_change
+            handlers[win32.WM_TASKBARCREATED] = patched_on_taskbarcreated
+            handlers[WM_WTSSESSION_CHANGE] = patched_on_session_change
 
     def _is_stopping(self) -> bool:
         """是否处于"正在停止"过渡态：已暂停但仍有任务正在下游执行，等待其完成。
