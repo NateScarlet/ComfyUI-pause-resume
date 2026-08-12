@@ -60,6 +60,7 @@ Create a `.env` file in the same directory as the script, or set environment var
 - `COMFYUI_PORT`: Service port (default `8188`)
 - `COMFYUI_EXTRA_ARGS`: Extra arguments passed to ComfyUI (e.g. `--preview-method auto`)
 - `COMFYUI_RESTART_DELAY_SEC`: Delay before restarting after abnormal process exit (seconds, default `10`)
+- `COMFYUI_STARTUP_WAIT_SEC`: When the downstream is starting/restarting, API requests wait up to this many seconds for it to become ready before returning an error (default `600`)
 - `COMFYUI_IDLE_RESTART_SEC`: Timeout to force restart after queue becomes idle (seconds, default `600`, set to `0` to disable)
 - `COMFYUI_IDLE_PROGRAM`: Path to a program to launch when idle (e.g. miner, auto-stopped when tasks arrive)
 - `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle)

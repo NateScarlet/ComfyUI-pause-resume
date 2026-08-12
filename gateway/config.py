@@ -44,6 +44,8 @@ class GatewayConfig:
         self.busy_program = os.environ.get("COMFYUI_BUSY_PROGRAM", "")
         self.idle_restart_timeout = int(os.environ.get("COMFYUI_IDLE_RESTART_SEC", 600))
         self.restart_delay_sec = int(os.environ.get("COMFYUI_RESTART_DELAY_SEC", 10))
+        # 下游未就绪（首次启动/重启中）时，代理 API 请求最长等待其就绪的时间（秒）
+        self.startup_wait_sec = int(os.environ.get("COMFYUI_STARTUP_WAIT_SEC", "600"))
         self.comfyui_extra_args = os.environ.get("COMFYUI_EXTRA_ARGS", "")
         self.proxy_host = os.environ.get("COMFYUI_HOST", "127.0.0.1")
         self.queue_type = os.environ.get("COMFYUI_QUEUE_TYPE", "sqlite").lower()

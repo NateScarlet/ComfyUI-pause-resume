@@ -60,6 +60,7 @@ start.cmd
 - `COMFYUI_PORT`: 服务端口（默认 `8188`）
 - `COMFYUI_EXTRA_ARGS`: 传递给 ComfyUI 的额外参数（例如 `--preview-method auto`）
 - `COMFYUI_RESTART_DELAY_SEC`: 进程异常退出后重启延迟（秒，默认 `10`）
+- `COMFYUI_STARTUP_WAIT_SEC`: 下游启动/重启期间，API 请求最多等待其就绪的秒数，超时才返回错误（默认 `600`）
 - `COMFYUI_IDLE_RESTART_SEC`: 队列空闲后强制重启服务的超时时间（秒，默认 `600`，设置为 0 则禁用）
 - `COMFYUI_IDLE_PROGRAM`: 闲置时启动的程序路径（例如矿工程序，在有任务时会自动停止）
 - `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在闲置时会自动停止）

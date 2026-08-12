@@ -15,7 +15,11 @@ from gateway.shared.interfaces import (
     EventBus,
 )
 from gateway.shared.models import JobStatus, JobFilters
-from gateway.shared.events import StatusChangedEvent, StateChangedEvent
+from gateway.shared.events import (
+    StatusChangedEvent,
+    StateChangedEvent,
+    DownstreamReadyChangedEvent,
+)
 from gateway.shared.exceptions import GatewayError, JobNotFoundError
 from gateway.application.facade import AppFacade
 from gateway.presentation.formatters import format_job_summary, format_job_detail
@@ -37,11 +41,14 @@ class GatewayHandlers:
         downstream_service: DownstreamClient,
         queue_reader: JobQueueReader,
         event_bus: EventBus,
+        startup_wait_sec: float,
     ):
         self._app = app
         self._downstream_service = downstream_service
         self._queue_reader = queue_reader
         self._event_bus = event_bus
+        # 下游未就绪时，代理 API 请求等待其就绪的最长秒数
+        self._startup_wait_sec = startup_wait_sec
 
         # 维护活跃的连接句柄
         self.sse_clients: Set[asyncio.Queue[str]] = set()
@@ -218,9 +225,11 @@ class GatewayHandlers:
                     content_type="text/html",
                     text=_LOADING_HTML,
                 )
-            return web.Response(
-                status=503, text="Service Unavailable: Downstream is booting up"
-            )
+            # API 调用通常不便重发，改为持续等待下游就绪，超时才返回错误
+            if not await self._wait_for_downstream_ready():
+                return web.Response(
+                    status=503, text="Service Unavailable: Downstream is booting up"
+                )
 
         # 1. 拦截任务提交：POST /prompt
         if method == "POST" and path in ("/prompt", "/api/prompt"):
@@ -270,6 +279,39 @@ class GatewayHandlers:
         # 10. 默认普通代理
         downstream_url = self._build_downstream_url(request)
         return await self._handle_default_proxy(request, method, downstream_url)
+
+    async def _wait_for_downstream_ready(self) -> bool:
+        """等待下游服务就绪，最多等待 _startup_wait_sec 秒。
+
+        通过事件总线订阅 DownstreamReadyChangedEvent；就绪事件唤醒后仍需复核
+        downstream_ready，避免下游就绪后立即再次重启导致误判就绪。
+        超过 _startup_wait_sec 秒仍未就绪则返回 False。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._startup_wait_sec
+        while True:
+            if self._downstream_service.downstream_ready:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+
+            ready_event = asyncio.Event()
+
+            def _on_ready_changed(ev: DownstreamReadyChangedEvent) -> None:
+                if ev.ready:
+                    ready_event.set()
+
+            unsubscribe = self._event_bus.subscribe(
+                DownstreamReadyChangedEvent, _on_ready_changed
+            )
+            try:
+                try:
+                    await asyncio.wait_for(ready_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return False
+            finally:
+                unsubscribe()
 
     def _build_downstream_url(self, request: web.Request) -> str:
         """构建下游 URL（仅用于代理转发，不含业务逻辑）。"""

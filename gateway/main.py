@@ -177,6 +177,7 @@ async def main() -> None:
         downstream_service=downstream_service,
         queue_reader=queue_reader,
         event_bus=event_bus,
+        startup_wait_sec=config.startup_wait_sec,
     )
     setup_routes(app, handlers)
 
