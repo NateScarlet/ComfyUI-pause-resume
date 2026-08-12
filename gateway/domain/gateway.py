@@ -189,13 +189,21 @@ class Gateway:
         finally:
             self._refreshing = False
 
+    def _request_downstream_restart(self) -> None:
+        """发起下游重启并同步将就绪标志置为未就绪。
+
+        必须在 _refresh 之前同步翻转就绪标志，否则重启期间 _refresh 仍按旧的就绪状态
+        允许系统休眠，可能被系统闲置休眠打断重启流程。后续下游就绪事件到达时会再次更新该标志。
+        """
+        self._ever_active = False
+        self._downstream_ready = False
+        self._downstream.restart()
+
     def _on_idle_entered(self) -> None:
         """进入业务空闲状态时的决策逻辑。"""
         if self._restart_after_idle_on_pause:
             self._restart_after_idle_on_pause = False
-            # 重启下游代表重启到干净状态，重置 _ever_active
-            self._ever_active = False
-            self._downstream.restart()
+            self._request_downstream_restart()
             self._event_bus.publish(StateChangedEvent(paused=self._paused))
             self._refresh()
             return
@@ -218,9 +226,7 @@ class Gateway:
             self._cancel_idle_timeout = None
             return
         self._cancel_idle_timeout = None
-        # 重启下游代表重启到干净状态，重置 _ever_active
-        self._ever_active = False
-        self._downstream.restart()
+        self._request_downstream_restart()
         self._refresh()
 
     def pause(self, restart_after_idle: bool) -> None:
@@ -241,9 +247,7 @@ class Gateway:
         # 因此需要在此处直接处理空闲立即重启逻辑
         if restart_after_idle and self._is_idle and self._restart_after_idle_on_pause:
             self._restart_after_idle_on_pause = False
-            # 重启下游代表重启到干净状态，重置 _ever_active
-            self._ever_active = False
-            self._downstream.restart()
+            self._request_downstream_restart()
             self._refresh()
 
     def resume(self) -> None:
@@ -351,6 +355,8 @@ class Gateway:
             JobFilters([JobStatus.RUNNING])
         )
         self._ever_active = False
+        # 崩溃即视为下游未就绪，立即阻止休眠，覆盖崩溃检测到重启开始之间的空窗期
+        self._downstream_ready = False
 
         if running_jobs:
             job = running_jobs[0]
@@ -420,9 +426,13 @@ class Gateway:
         return self._downstream_executing or (not self._paused and has_jobs)
 
     def _should_prevent_sleep(self, has_jobs: bool, scripts_running: bool) -> bool:
-        """决策当前网关是否应当阻止操作系统进入休眠。"""
+        """决策当前网关是否应当阻止操作系统进入休眠。
+
+        下游未就绪（启动或重启中）时必须阻止休眠，否则系统休眠会打断下游的启动/重启流程，
+        导致唤醒后下游迟迟未就绪而返回 503。
+        """
         is_busy = self._is_busy(has_jobs)
-        return is_busy or scripts_running
+        return is_busy or scripts_running or not self._downstream_ready
 
     def _publish_status_changed(self) -> None:
         """发布状态变更事件，并输出包含队列长度和预估时间的 INFO 日志。"""

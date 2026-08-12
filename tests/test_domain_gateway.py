@@ -182,7 +182,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_downstream.restart.assert_not_called()
 
         # 情况 2：暂停且当时已闲置，应触发立即重启
-        g = _make_gateway(paused=False, downstream_executing=False)
+        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True)
         g.pause(restart_after_idle=True)
         self.assertTrue(g.paused)
         self.assertFalse(g._restart_after_idle_on_pause)
@@ -210,7 +210,7 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_set_downstream_executing_decision(self):
         """测试下游繁忙程度变化触发的决策。"""
-        g = _make_gateway(paused=False)
+        g = _make_gateway(paused=False, downstream_ready=True)
 
         # 下游开始执行
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
@@ -292,7 +292,7 @@ class TestDomainGateway(unittest.TestCase):
         timer = MagicMock(spec=Timer)
         timer.start_timeout.side_effect = mock_start_timeout
 
-        g = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer)
+        g = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer, downstream_ready=True)
 
         # 1. 一出生就是空闲状态，应该已经调用了定时器
         self.assertTrue(g._is_idle)
@@ -305,7 +305,7 @@ class TestDomainGateway(unittest.TestCase):
         # 3. 测试离开空闲时能够正常取消定时器
         timer2 = MagicMock(spec=Timer)
         timer2.start_timeout.side_effect = mock_start_timeout
-        g2 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer2)
+        g2 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer2, downstream_ready=True)
 
         # 离开空闲 (如因为有排队任务)
         g2._mock_reader.count.side_effect = lambda status=None, limit=None: 1
@@ -356,7 +356,7 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_determine_sleep_prevention(self):
         """测试是否阻止系统休眠决策。"""
-        g = _make_gateway(paused=False)
+        g = _make_gateway(paused=False, downstream_ready=True)
 
         # 繁忙 且 无脚本在跑 -> 阻止休眠
         self.assertTrue(g._should_prevent_sleep(has_jobs=True, scripts_running=False))
@@ -366,6 +366,56 @@ class TestDomainGateway(unittest.TestCase):
 
         # 空闲 且 无脚本在跑 -> 允许休眠
         self.assertFalse(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
+
+    def test_downstream_not_ready_prevents_sleep(self):
+        """测试下游未就绪（启动/重启中）时，即使空闲也应阻止系统休眠，防止休眠打断下游启动。"""
+        g = _make_gateway(paused=False, downstream_ready=False)
+
+        # 空闲 且 无脚本在跑，但下游未就绪 -> 阻止休眠
+        self.assertTrue(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
+
+        # 下游就绪后恢复允许休眠
+        g._downstream_ready = True
+        self.assertFalse(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
+
+    def test_downstream_ready_change_drives_sleep_prevention(self):
+        """测试下游就绪状态变化驱动阻止/允许系统休眠（重启期间阻止休眠）。"""
+        # 下游就绪且空闲：允许休眠
+        g = _make_gateway(paused=False, downstream_ready=True)
+        g._mock_power.allow_sleep.assert_called()
+
+        # 下游进入重启（未就绪）：阻止休眠
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=False))
+        g._mock_power.prevent_sleep.assert_called()
+
+        # 重启完成（重新就绪）：恢复允许休眠
+        g._mock_power.allow_sleep.reset_mock()
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+        g._mock_power.allow_sleep.assert_called()
+
+    def test_idle_timeout_restart_prevents_sleep_immediately(self):
+        """测试空闲超时发起重启时立即阻止休眠，而非等待异步就绪事件，防止系统休眠打断重启。"""
+        g = _make_gateway(
+            paused=False, ever_active=True, idle_restart_timeout=10, downstream_ready=True
+        )
+        g._mock_power.prevent_sleep.reset_mock()
+        g._mock_power.allow_sleep.reset_mock()
+
+        g._on_idle_timeout()
+
+        self.assertFalse(g._downstream_ready)
+        g._mock_downstream.restart.assert_called_once()
+        g._mock_power.prevent_sleep.assert_called()
+
+    def test_downstream_crashed_sets_not_ready_for_sleep_prevention(self):
+        """测试下游崩溃时立即置为未就绪，避免崩溃检测到重启开始之间的空窗期允许休眠。"""
+        g = _make_gateway(paused=False, downstream_ready=True)
+        g._mock_power.prevent_sleep.reset_mock()
+
+        g._mock_event_bus.publish(DownstreamCrashedEvent())
+
+        self.assertFalse(g._downstream_ready)
+        g._mock_power.prevent_sleep.assert_called()
 
     def test_script_state_changed_decision(self):
         """测试外挂辅助程序状态发生变化时的刷新决策。"""
@@ -434,13 +484,13 @@ class TestDomainGateway(unittest.TestCase):
     def test_ever_active_reset_on_restarts_and_crashes(self):
         """测试在下游重启与崩溃时，_ever_active 会正确复位为 False（干净状态）。"""
         # 情况 1：从空闲超时重启
-        g1 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10)
+        g1 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, downstream_ready=True)
         g1._on_idle_timeout()
         self.assertFalse(g1._ever_active)
         g1._mock_downstream.restart.assert_called_once()
 
         # 情况 2：从 pause 带有重启参数且已空闲的立即重启
-        g2 = _make_gateway(paused=False, ever_active=True)
+        g2 = _make_gateway(paused=False, ever_active=True, downstream_ready=True)
         g2._is_idle = True
         g2.pause(restart_after_idle=True)
         self.assertFalse(g2._ever_active)
@@ -650,7 +700,7 @@ class TestDomainGateway(unittest.TestCase):
         timer.start_timeout.side_effect = mock_start_timeout
 
         # 1. 处于暂停状态，且 ever_active，会启动空闲超时定时器
-        g = _make_gateway(paused=True, ever_active=True, idle_restart_timeout=10, timer=timer)
+        g = _make_gateway(paused=True, ever_active=True, idle_restart_timeout=10, timer=timer, downstream_ready=True)
         self.assertTrue(g._is_idle)
         self.assertIsNotNone(timer_callback)
         self.assertFalse(cancelled)
