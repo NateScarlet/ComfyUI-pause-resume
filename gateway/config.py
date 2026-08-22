@@ -42,6 +42,7 @@ class GatewayConfig:
         self.proxy_port = self.comfyui_port
         self.idle_program = os.environ.get("COMFYUI_IDLE_PROGRAM", "")
         self.busy_program = os.environ.get("COMFYUI_BUSY_PROGRAM", "")
+        self.pause_program = os.environ.get("COMFYUI_PAUSE_PROGRAM", "")
         self.idle_restart_timeout = int(os.environ.get("COMFYUI_IDLE_RESTART_SEC", 600))
         self.restart_delay_sec = int(os.environ.get("COMFYUI_RESTART_DELAY_SEC", 10))
         # 下游未就绪（首次启动/重启中）时，代理 API 请求最长等待其就绪的时间（秒）

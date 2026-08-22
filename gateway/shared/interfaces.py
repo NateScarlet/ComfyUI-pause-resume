@@ -1,6 +1,13 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Callable, Dict, Any, TypeVar, Type
-from .models import Job, JobStatus, EstimationState, JobFilters, JobSummary
+from .models import (
+    Job,
+    JobStatus,
+    EstimationState,
+    JobFilters,
+    JobSummary,
+    QueueState,
+)
 
 T = TypeVar("T")
 
@@ -148,11 +155,11 @@ class StateRepository(ABC):
 
 
 class ProcessManager(ABC):
-    """负责调度和管理网关在繁忙与空闲状态下需执行的外挂辅助程序（例如监控或挖矿进程）。"""
+    """根据网关队列的运行状态，调度和管理对应的外挂辅助程序（例如监控或挖矿进程）。"""
 
     @abstractmethod
-    def update_state(self, is_busy: bool, ever_active: bool) -> None:
-        """根据网关当前的业务状态，自动调度启停对应的外部进程。"""
+    def update_state(self, state: QueueState, ever_active: bool) -> None:
+        """接收领域层上报的队列状态，自动调度启停对应的外部进程。"""
         pass
 
     @abstractmethod

@@ -62,8 +62,9 @@ start.cmd
 - `COMFYUI_RESTART_DELAY_SEC`: 进程异常退出后重启延迟（秒，默认 `10`）
 - `COMFYUI_STARTUP_WAIT_SEC`: 下游启动/重启期间，API 请求最多等待其就绪的秒数，超时才返回错误（默认 `600`）
 - `COMFYUI_IDLE_RESTART_SEC`: 队列空闲后强制重启服务的超时时间（秒，默认 `600`，设置为 0 则禁用）
-- `COMFYUI_IDLE_PROGRAM`: 闲置时启动的程序路径（例如矿工程序，在有任务时会自动停止）
-- `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在闲置时会自动停止）
+- `COMFYUI_IDLE_PROGRAM`: 空闲时启动的程序路径（例如矿工程序；仅在队列自然排空且未暂停时启动，有新任务或手动暂停时会自动停止）
+- `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在空闲或暂停时会自动停止）
+- `COMFYUI_PAUSE_PROGRAM`: 手动暂停期间启动的程序路径（例如把资源让给游戏或其他占用 GPU 的程序，恢复队列后自动停止）。设置为与 `COMFYUI_IDLE_PROGRAM` 相同的命令即可让闲置程序在暂停期间继续运行
 - `COMFYUI_QUEUE_TYPE`: 队列实现类型，支持 `sqlite`（默认值，启用 WAL 模式，推荐）或 `json`（传统 JSONFile 队列实现）
 - `COMFYUI_GATEWAY_DATA_DIR`: 网关数据存储目录（默认值 `gateway_data`，支持绝对路径或相对路径，相对路径会相对于启动脚本所在根目录解析）
 - `COMFYUI_HOST`: 网关监听地址（默认 `127.0.0.1`）
@@ -83,3 +84,5 @@ start.cmd
 3. 如果进程异常退出，脚本会自动尝试重启
 4. 提交新任务时会跳过校验总是返回成功，实际校验将延迟到执行前，有错误的工作流（例如遇到 400-500 错误时）会被保存至数据存储目录下的 `failed_workflows/` 目录下（包括错误信息、原始请求数据以及工作流 JSON）供排查，并从队列中丢弃。
 5. GET /queue 会总是返回空的 outputs_to_execute， 因为现在收到任务时没有立即解析
+6. 外挂辅助程序的运行不影响下游自动重启：即使 `COMFYUI_IDLE_PROGRAM` 等外挂程序正在运行，空闲超时重启（`COMFYUI_IDLE_RESTART_SEC`）与"暂停等待重启"仍会正常触发下游重启以释放显存
+7. 手动暂停期间仅运行 `COMFYUI_PAUSE_PROGRAM` 指定的程序（未配置则不运行任何外挂程序）；将其配置成与 `COMFYUI_IDLE_PROGRAM` 相同的命令时，同一程序进程会在暂停/恢复等模式切换中原样保留继续运行，不会被重启

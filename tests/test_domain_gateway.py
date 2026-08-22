@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
 from gateway.domain.estimation_service import EstimationService
 from gateway.domain.crash_skip_policy import CrashSkipPolicy
-from gateway.shared.models import Job, JobStatus, JobFilters
+from gateway.shared.models import Job, JobStatus, JobFilters, QueueState
 from gateway.shared.interfaces import (
     StateRepository,
     JobQueueReader,
@@ -123,7 +123,7 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     downstream = MagicMock(spec=DownstreamClient)
     dispatcher = MagicMock(spec=JobDispatcher)
     event_bus = MockEventBus()
-    
+
     # 创建 mock 的 EstimationService
     estimation_service = MagicMock(spec=EstimationService)
     estimation_service.calculate_estimation.return_value = None
@@ -143,7 +143,7 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
             crash_count=crash_count,
             dispatch_skip_offset=dispatch_skip_offset,
         ),
-        **kwargs
+        **kwargs,
     )
     # 绑定 mock 物件方便后续断言
     g._mock_repo = repo
@@ -182,7 +182,9 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_downstream.restart.assert_not_called()
 
         # 情况 2：暂停且当时已闲置，应触发立即重启
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True)
+        g = _make_gateway(
+            paused=False, downstream_executing=False, downstream_ready=True
+        )
         g.pause(restart_after_idle=True)
         self.assertTrue(g.paused)
         self.assertFalse(g._restart_after_idle_on_pause)
@@ -219,11 +221,15 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_power.prevent_sleep.assert_called_once()
 
         # 下游执行完毕变为空闲，重置尝试计数并触发派发
-        g2 = _make_gateway(paused=False, downstream_executing=True, crash_count=5, pending_count=1)
+        g2 = _make_gateway(
+            paused=False, downstream_executing=True, crash_count=5, pending_count=1
+        )
         g2._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertFalse(g2._downstream_executing)
         self.assertEqual(g2._crash_skip.crash_count, 0)
-        self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g2._mock_event_bus.published))
+        self.assertTrue(
+            any(isinstance(e, StatusChangedEvent) for e in g2._mock_event_bus.published)
+        )
         g2._mock_dispatcher.dispatch.assert_called_once()
 
     def test_set_downstream_ready_decision(self):
@@ -243,15 +249,23 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=False, pending_count=1)
 
         # 永久不可恢复错误：不重试
-        g._mock_event_bus.publish(DispatchFailedEvent(prompt_id="job_test", is_permanent=True))
+        g._mock_event_bus.publish(
+            DispatchFailedEvent(prompt_id="job_test", is_permanent=True)
+        )
         self.assertEqual(g._crash_skip.dispatch_skip_offset, 0)
-        self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
+        self.assertTrue(
+            any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published)
+        )
 
         # 临时错误：触发重试，累加偏移
         g._mock_event_bus.published.clear()
-        g._mock_event_bus.publish(DispatchFailedEvent(prompt_id="job_test", is_permanent=False))
+        g._mock_event_bus.publish(
+            DispatchFailedEvent(prompt_id="job_test", is_permanent=False)
+        )
         self.assertEqual(g._crash_skip.dispatch_skip_offset, 1)
-        self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
+        self.assertTrue(
+            any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published)
+        )
 
     def test_downstream_crashed_decision(self):
         """测试下游物理崩溃时的重入列与尝试计数逻辑。"""
@@ -266,7 +280,9 @@ class TestDomainGateway(unittest.TestCase):
 
         self.assertEqual(g._crash_skip.crash_count, 1)
         g._mock_writer.requeue_running_if_exists.assert_called_once()
-        self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
+        self.assertTrue(
+            any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published)
+        )
 
         # 模拟没有正在运行的任务，重入列不应被调用
         g2 = _make_gateway(paused=False)
@@ -284,15 +300,23 @@ class TestDomainGateway(unittest.TestCase):
         def mock_start_timeout(seconds, callback):
             nonlocal timer_callback
             timer_callback = callback
+
             def cancel():
                 nonlocal cancelled
                 cancelled = True
+
             return cancel
 
         timer = MagicMock(spec=Timer)
         timer.start_timeout.side_effect = mock_start_timeout
 
-        g = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer, downstream_ready=True)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=10,
+            timer=timer,
+            downstream_ready=True,
+        )
 
         # 1. 一出生就是空闲状态，应该已经调用了定时器
         self.assertTrue(g._is_idle)
@@ -305,7 +329,13 @@ class TestDomainGateway(unittest.TestCase):
         # 3. 测试离开空闲时能够正常取消定时器
         timer2 = MagicMock(spec=Timer)
         timer2.start_timeout.side_effect = mock_start_timeout
-        g2 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, timer=timer2, downstream_ready=True)
+        g2 = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=10,
+            timer=timer2,
+            downstream_ready=True,
+        )
 
         # 离开空闲 (如因为有排队任务)
         g2._mock_reader.count.side_effect = lambda status=None, limit=None: 1
@@ -321,19 +351,41 @@ class TestDomainGateway(unittest.TestCase):
         self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 2：下游繁忙，不能分发
-        g = _make_gateway(paused=False, downstream_executing=True, downstream_ready=True, pending_count=10)
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            downstream_ready=True,
+            pending_count=10,
+        )
         self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 3：下游未就绪，不能分发
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=False, pending_count=10)
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=False,
+            downstream_ready=False,
+            pending_count=10,
+        )
         self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 4：队列为空，不能分发
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, dispatch_skip_offset=3, pending_count=0)
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=False,
+            downstream_ready=True,
+            dispatch_skip_offset=3,
+            pending_count=0,
+        )
         self.assertIsNone(g.get_dispatch_skip())
 
         # 情况 5：正常派发，指定 pending_count=3 避免构造时重置 dispatch_skip_offset
-        g = _make_gateway(paused=False, downstream_executing=False, downstream_ready=True, dispatch_skip_offset=5, pending_count=3)
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=False,
+            downstream_ready=True,
+            dispatch_skip_offset=5,
+            pending_count=3,
+        )
         skip = g.get_dispatch_skip()
         self.assertEqual(skip, 2)  # 5 % 3 = 2
 
@@ -396,7 +448,10 @@ class TestDomainGateway(unittest.TestCase):
     def test_idle_timeout_restart_prevents_sleep_immediately(self):
         """测试空闲超时发起重启时立即阻止休眠，而非等待异步就绪事件，防止系统休眠打断重启。"""
         g = _make_gateway(
-            paused=False, ever_active=True, idle_restart_timeout=10, downstream_ready=True
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=10,
+            downstream_ready=True,
         )
         g._mock_power.prevent_sleep.reset_mock()
         g._mock_power.allow_sleep.reset_mock()
@@ -427,7 +482,9 @@ class TestDomainGateway(unittest.TestCase):
 
         # 应该是阻止休眠状态被调用
         g._mock_power.prevent_sleep.assert_called()
-        self.assertTrue(any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published))
+        self.assertTrue(
+            any(isinstance(e, StatusChangedEvent) for e in g._mock_event_bus.published)
+        )
 
     def test_downstream_crashed_triggers_refresh(self):
         """测试下游物理崩溃时，不仅重入列还会触发 _refresh。"""
@@ -451,10 +508,11 @@ class TestDomainGateway(unittest.TestCase):
     def test_refresh_reentrancy_prevention(self):
         """测试 _refresh 能够有效防范事件回调触发的无限递归。"""
         g = _make_gateway(paused=False)
-        
+
         # 模拟在 update_state 触发时再次执行 _refresh (比如触发了 ScriptStateChangedEvent)
         # 如果没有防重入机制，这里会造成无限递归导致栈溢出
         call_count = 0
+
         def mock_update_state(is_busy, ever_active):
             nonlocal call_count
             call_count += 1
@@ -463,7 +521,7 @@ class TestDomainGateway(unittest.TestCase):
 
         g._mock_pm.update_state.side_effect = mock_update_state
         g._refresh()
-        
+
         # 验证因为引入了“脏标志+延迟刷新循环”模式，重入调用不会导致递归栈溢出，
         # 而是以循环迭代的形式在当前刷新结束后依次补执行，因此会执行完所有请求（共5次调用）。
         self.assertEqual(call_count, 5)
@@ -471,20 +529,25 @@ class TestDomainGateway(unittest.TestCase):
     def test_idle_timeout_state_validation(self):
         """测试在超时到达前已非空闲状态，不会触发下游重启。"""
         g = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10)
-        
+
         # 退出空闲状态
         g._is_idle = False
-        
+
         # 此时触发空闲超时
         g._on_idle_timeout()
-        
+
         # 应该直接返回，不触发重启
         g._mock_downstream.restart.assert_not_called()
 
     def test_ever_active_reset_on_restarts_and_crashes(self):
         """测试在下游重启与崩溃时，_ever_active 会正确复位为 False（干净状态）。"""
         # 情况 1：从空闲超时重启
-        g1 = _make_gateway(paused=False, ever_active=True, idle_restart_timeout=10, downstream_ready=True)
+        g1 = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=10,
+            downstream_ready=True,
+        )
         g1._on_idle_timeout()
         self.assertFalse(g1._ever_active)
         g1._mock_downstream.restart.assert_called_once()
@@ -506,17 +569,23 @@ class TestDomainGateway(unittest.TestCase):
         running_job = MagicMock(spec=Job)
         running_job.prompt_id = "test_job"
         # 必须传入 pending_count=1，否则 _refresh 时会因为队列无任务而清零 crash_count
-        g = _make_gateway(paused=False, downstream_executing=True, crash_count=0, pending_count=1, running=[running_job])
-        
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            crash_count=0,
+            pending_count=1,
+            running=[running_job],
+        )
+
         # 1. 模拟崩溃：requeue 成功，增加 crash_count
         g._mock_writer.requeue_running_if_exists.return_value = True
         g._mock_event_bus.publish(DownstreamCrashedEvent())
         self.assertEqual(g._crash_skip.crash_count, 1)
         self.assertTrue(g._crash_skip.crashed_executing)
-        
+
         # 2. 模拟下游重启后发布 executing = False（此时 _ever_active 为 False，任务尚未重新执行）
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
-        
+
         # 验证此时 crash_count 依然保留为 1（因为 _ever_active 为 False，说明任务未完成），崩溃标志被清空
         self.assertEqual(g._crash_skip.crash_count, 1)
         self.assertFalse(g._crash_skip.crashed_executing)
@@ -525,7 +594,9 @@ class TestDomainGateway(unittest.TestCase):
         """测试临时派发失败会触发定时器延迟重试，且派发成功时可以取消该定时器。"""
         # 场景 A：派发失败后，在重试触发前收到成功事件，应取消定时器
         g = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
-        g._mock_event_bus.publish(DispatchFailedEvent(prompt_id="job_test", is_permanent=False))
+        g._mock_event_bus.publish(
+            DispatchFailedEvent(prompt_id="job_test", is_permanent=False)
+        )
         self.assertEqual(g._crash_skip.dispatch_skip_offset, 1)
         g._mock_timer.start_timeout.assert_called_once_with(5.0, g._retry_dispatch)
 
@@ -535,7 +606,9 @@ class TestDomainGateway(unittest.TestCase):
 
         # 场景 B：重试回调触发时，应清除取消函数并以最新 skip 触发派发
         g2 = _make_gateway(paused=False, pending_count=2, downstream_ready=True)
-        g2._mock_event_bus.publish(DispatchFailedEvent(prompt_id="job_test", is_permanent=False))
+        g2._mock_event_bus.publish(
+            DispatchFailedEvent(prompt_id="job_test", is_permanent=False)
+        )
         g2._mock_dispatcher.dispatch.assert_not_called()
         g2._retry_dispatch()
         g2._mock_dispatcher.dispatch.assert_called_once_with(1)
@@ -546,14 +619,18 @@ class TestDomainGateway(unittest.TestCase):
         t = MagicMock(spec=Job)
         t.prompt_id = "bad_job_123"
         g = _make_gateway(paused=False, pending_count=0, running=[t], crash_count=2)
-        
+
         # 触发物理崩溃事件
         g._mock_event_bus.publish(DownstreamCrashedEvent())
-        
+
         # 确认：运行中任务被清除，崩溃计数被清零，且调用了 handle_failed_job 备份
-        g._mock_writer.update_status.assert_called_once_with(JobStatus.FAILED, prompt_id="bad_job_123")
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.FAILED, prompt_id="bad_job_123"
+        )
         self.assertEqual(g._crash_skip.crash_count, 0)
-        g._mock_dispatcher.handle_failed_job.assert_called_once_with(t, "Downstream crashed 3 times during execution.")
+        g._mock_dispatcher.handle_failed_job.assert_called_once_with(
+            t, "Downstream crashed 3 times during execution."
+        )
         # 确认 crashed_executing 未被设为 True
         self.assertFalse(g._crash_skip.crashed_executing)
 
@@ -563,15 +640,17 @@ class TestDomainGateway(unittest.TestCase):
         t = MagicMock(spec=Job)
         t.prompt_id = "job_999"
         g = _make_gateway(paused=False, pending=[t], running=[t])
-        g._mock_event_bus.publish(DispatchFailedEvent(prompt_id="job_999", is_permanent=False))
+        g._mock_event_bus.publish(
+            DispatchFailedEvent(prompt_id="job_999", is_permanent=False)
+        )
         self.assertEqual(g._crash_skip.dispatch_skip_offset, 1)
         self.assertEqual(g._crash_skip.last_failed_job_id, "job_999")
-        
+
         # 2. 从 pending 和 running 中将该任务彻底移除（模拟手动删除），触发队列刷新
         g._mock_reader.list.side_effect = lambda filter_by=None: []
         g._mock_reader.count.side_effect = lambda filter_by=None, limit=None: 0
         g._mock_event_bus.publish(QueueModifiedEvent())
-        
+
         # 确认崩溃计数、派发偏移与失败 ID 被清零
         self.assertEqual(g._crash_skip.crash_count, 0)
         self.assertEqual(g._crash_skip.dispatch_skip_offset, 0)
@@ -580,9 +659,11 @@ class TestDomainGateway(unittest.TestCase):
     def test_downstream_ready_changed_cancels_retry(self):
         """测试当下游变为未就绪（offline）时，自动取消正在挂起的延迟派发重试。"""
         g = _make_gateway(paused=False, pending_count=1)
-        g._mock_event_bus.publish(DispatchFailedEvent(prompt_id="job_test", is_permanent=False))
+        g._mock_event_bus.publish(
+            DispatchFailedEvent(prompt_id="job_test", is_permanent=False)
+        )
         g._mock_timer.start_timeout.assert_called_once()
-        
+
         # 下游变为未就绪
         g._mock_timer_cancel.assert_not_called()
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=False))
@@ -592,7 +673,9 @@ class TestDomainGateway(unittest.TestCase):
         """测试完整的正常派发周期：got prompt → Prompt executed → 自动派发下一个任务。"""
         t = MagicMock(spec=Job)
         t.prompt_id = "running_job_id"
-        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2, running=[t])
+        g = _make_gateway(
+            paused=False, downstream_ready=True, pending_count=2, running=[t]
+        )
 
         # 第 1 步：下游开始执行（got prompt）
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
@@ -605,7 +688,9 @@ class TestDomainGateway(unittest.TestCase):
 
         # 验证：执行完毕后应该自动触发派发下一个任务
         g._mock_dispatcher.dispatch.assert_called()
-        g._mock_writer.update_status.assert_called_once_with(JobStatus.COMPLETED, filter_status=JobStatus.RUNNING)
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+        )
 
         # 验证 get_dispatch_skip 返回了合法的 skip 值
         skip = g.get_dispatch_skip()
@@ -620,8 +705,13 @@ class TestDomainGateway(unittest.TestCase):
         # 则 _downstream_executing 初始就是 False，此时收到 executing=False
         # 会因为 guard 而直接返回，导致 clear_running 和 dispatch 都不执行。
         # 这个测试确认 guard 的行为。
-        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2,
-                          downstream_executing=False, running=[t])
+        g = _make_gateway(
+            paused=False,
+            downstream_ready=True,
+            pending_count=2,
+            downstream_executing=False,
+            running=[t],
+        )
 
         # 在 _downstream_executing 已是 False 时发布 executing=False
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
@@ -637,7 +727,9 @@ class TestDomainGateway(unittest.TestCase):
         t1.prompt_id = "job_1"
         t2 = MagicMock(spec=Job)
         t2.prompt_id = "job_2"
-        g = _make_gateway(paused=False, downstream_ready=True, pending_count=3, running=[t1])
+        g = _make_gateway(
+            paused=False, downstream_ready=True, pending_count=3, running=[t1]
+        )
 
         # 预置 _downstream_executing = True 模拟下游正在执行第一个任务
         g._downstream_executing = True
@@ -649,7 +741,9 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertFalse(g._downstream_executing)
         g._mock_dispatcher.dispatch.assert_called_once()
-        g._mock_writer.update_status.assert_called_once_with(JobStatus.COMPLETED, filter_status=JobStatus.RUNNING)
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+        )
 
         # 模拟 dispatch 成功后下游再次开始执行（got prompt）
         g._mock_dispatcher.dispatch.reset_mock()
@@ -662,7 +756,9 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertFalse(g._downstream_executing)
         g._mock_dispatcher.dispatch.assert_called_once()
-        g._mock_writer.update_status.assert_called_once_with(JobStatus.COMPLETED, filter_status=JobStatus.RUNNING)
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+        )
 
     def test_pause_resume_cancels_restart_after_idle(self):
         """测试 pause(restart_after_idle=True) 后立即 resume 会取消挂起的重启请求。"""
@@ -691,16 +787,24 @@ class TestDomainGateway(unittest.TestCase):
         def mock_start_timeout(seconds, callback):
             nonlocal timer_callback
             timer_callback = callback
+
             def cancel():
                 nonlocal cancelled
                 cancelled = True
+
             return cancel
 
         timer = MagicMock(spec=Timer)
         timer.start_timeout.side_effect = mock_start_timeout
 
         # 1. 处于暂停状态，且 ever_active，会启动空闲超时定时器
-        g = _make_gateway(paused=True, ever_active=True, idle_restart_timeout=10, timer=timer, downstream_ready=True)
+        g = _make_gateway(
+            paused=True,
+            ever_active=True,
+            idle_restart_timeout=10,
+            timer=timer,
+            downstream_ready=True,
+        )
         self.assertTrue(g._is_idle)
         self.assertIsNotNone(timer_callback)
         self.assertFalse(cancelled)
@@ -708,6 +812,60 @@ class TestDomainGateway(unittest.TestCase):
         # 2. 恢复队列，应该取消该空闲超时定时器
         g.resume()
         self.assertTrue(cancelled)
+
+    def test_paused_reports_paused_queue_state(self):
+        """暂停且队列仍有任务时，应上报 PAUSED 队列状态而非 IDLE/BUSY。"""
+        g = _make_gateway(
+            paused=True, pending_count=2, downstream_ready=True, ever_active=True
+        )
+        g._mock_pm.update_state.assert_called_with(QueueState.PAUSED, True)
+
+    def test_executing_reports_busy_queue_state_even_when_paused(self):
+        """暂停瞬间下游仍在执行任务时，应上报 BUSY 直到任务完成。"""
+        g = _make_gateway(
+            paused=True,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+        )
+        g._mock_pm.update_state.assert_called_with(QueueState.BUSY, True)
+
+    def test_drained_queue_reports_idle_queue_state(self):
+        """未暂停、队列排空且下游执行过任务时，应上报 IDLE 队列状态。"""
+        g = _make_gateway(
+            paused=False, downstream_ready=True, ever_active=True, pending_count=0
+        )
+        g._mock_pm.update_state.assert_called_with(QueueState.IDLE, True)
+
+    def test_script_running_keeps_gateway_idle(self):
+        """外挂程序运行不应改变空闲判定：暂停且无任务执行时仍视为空闲。"""
+        g = _make_gateway(paused=True, downstream_ready=True, ever_active=True)
+        self.assertTrue(g._is_idle)
+
+        # 外挂程序启动后触发刷新，空闲状态不应被外挂程序破坏
+        g._mock_pm.is_running.return_value = True
+        g._mock_event_bus.publish(ScriptStateChangedEvent())
+        self.assertTrue(g._is_idle)
+
+    def test_restart_after_idle_fires_while_external_program_running(self):
+        """暂停等待重启期间外部程序在运行：当前任务完成后仍必须触发下游重启（#8）。"""
+        # 下游正在执行时请求暂停并等待空闲重启
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+        )
+        g.pause(restart_after_idle=True)
+        self.assertTrue(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
+
+        # 任务完成，外挂程序随之启动并保持运行（旧逻辑会因此卡死重启）
+        g._mock_pm.is_running.return_value = True
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        self.assertFalse(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_called_once()
 
 
 if __name__ == "__main__":

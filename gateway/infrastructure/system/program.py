@@ -4,47 +4,102 @@ import subprocess
 import logging
 import threading
 from typing import Optional, Any
+
 from gateway.shared.interfaces import ProcessManager, EventBus
 from gateway.shared.events import ScriptStateChangedEvent
+from gateway.shared.models import QueueState
 
 logger = logging.getLogger(__name__)
 
 
 class ExternalProgramManager(ProcessManager):
-    """管理在空闲和繁忙状态下需要运行的外部程序（例如监控、挖矿程序等）。"""
+    """根据网关队列的运行状态，管理需要运行的外部程序（例如监控、挖矿程序等）。
+
+    外部程序自身没有状态，本类只是把"队列状态 → 应运行的程序命令"的配置映射
+    应用到进程上：队列状态变化时终止不再需要的程序并启动新状态的程序。
+    目标程序与正在运行的程序是同一条命令时忽略切换，让进程原样继续运行。
+    """
 
     def __init__(
         self,
         idle_path: str,
         busy_path: str,
+        pause_path: str,
         event_bus: Optional[EventBus] = None,
     ):
-        self._idle_path = idle_path
-        self._busy_path = busy_path
+        # 各队列状态下应运行的程序命令（空表示该状态下不运行任何程序）
+        self._paths = {
+            QueueState.IDLE: idle_path,
+            QueueState.BUSY: busy_path,
+            QueueState.PAUSED: pause_path,
+        }
         self._event_bus = event_bus
-        self._idle_process: Optional[subprocess.Popen[Any]] = None
-        self._busy_process: Optional[subprocess.Popen[Any]] = None
-        self._last_state: tuple[bool, bool] | None = None
+        # 同一时刻至多只有一个受管进程，(所属队列状态, 进程) 元组直接表达该不变式
+        self._process: Optional[tuple[QueueState, subprocess.Popen[Any]]] = None
+        self._last_state: Optional[tuple[QueueState, bool]] = None
 
     def is_running(self) -> bool:
-        """检查是否有任何由本管理器启动的外部程序正在运行。"""
-        running = False
-        if self._idle_process and self._idle_process.poll() is None:
-            running = True
-        if self._busy_process and self._busy_process.poll() is None:
-            running = True
-        return running
+        """检查是否有由本管理器启动的外部程序正在运行。"""
+        return self._process is not None and self._process[1].poll() is None
 
-    def update_state(self, is_busy: bool, ever_active: bool) -> None:
-        """根据网关当前是繁忙还是空闲，更新并调度外部程序的启动/停止状态。"""
-        state = (is_busy, ever_active)
-        if state != self._last_state:
-            self._last_state = state
+    def update_state(self, state: QueueState, ever_active: bool) -> None:
+        """接收领域层上报的队列状态，调度外部程序的启动/停止。"""
+        reported = (state, ever_active)
+        if reported == self._last_state:
+            return
+        self._last_state = reported
 
-            if is_busy:
-                self._start_busy()
-            elif ever_active:
-                self._start_idle()
+        # 规格决策（#8 D1 反向约束）：空闲维持既有门控——下游从未执行过任务时
+        # 显存未被占用，无需启动闲置程序；暂停是显式人工意图，不受门控
+        if state == QueueState.IDLE and not ever_active:
+            return
+        self._apply(state)
+
+    def _apply(self, target: QueueState) -> None:
+        """应用目标队列状态对应的程序配置：停掉现有程序，启动目标程序。
+
+        目标路径为空表示该状态下不运行任何程序。
+        现有正在运行的进程若与本状态要启动的是同一条命令，
+        则直接保留该进程继续运行（用户可能把暂停程序配成与闲置程序一样）。
+        """
+        cmd = self._paths[target]
+        carried_over: Optional[subprocess.Popen[Any]] = None
+        if self._process is not None:
+            state, proc = self._process
+            self._process = None
+            if proc.poll() is None:
+                if cmd and self._paths[state] == cmd:
+                    carried_over = proc
+                else:
+                    self._terminate(proc)
+
+        if carried_over is not None:
+            self._process = (target, carried_over)
+            return
+
+        if cmd:
+            self._start(target)
+
+    def _start(self, state: QueueState) -> None:
+        """启动指定队列状态下应运行的外部程序并挂载退出监控线程。"""
+        cmd = self._paths[state]
+        logger.info(f"🚀 Starting {state.value} program: {cmd}")
+        proc = self._run_program(cmd)
+        if proc is None:
+            return
+        self._process = (state, proc)
+        threading.Thread(
+            target=self._monitor_process,
+            args=(proc,),
+            daemon=True,
+        ).start()
+
+    def _terminate(self, proc: subprocess.Popen[Any]) -> None:
+        """终止进程，忽略其已自行退出的情况。"""
+        try:
+            proc.kill()
+        except OSError:
+            pass  # 进程已自行退出，无需清理
 
     def _run_program(self, cmd_str: str) -> Optional[subprocess.Popen[Any]]:
         """在后台静默运行指定的命令字符串，避免弹出 Windows 命令行窗口。"""
@@ -69,71 +124,22 @@ class ExternalProgramManager(ProcessManager):
             logger.error(f"Failed to start program '{cmd_str}': {e}")
             return None
 
-    def _start_idle(self) -> None:
-        """启动空闲时运行的外部程序，并杀掉繁忙时的外部程序。"""
-        if self._busy_process:
-            try:
-                self._busy_process.kill()
-            except (ProcessLookupError, OSError):
-                pass
-            self._busy_process = None
-
-        if self._idle_path and (
-            not self._idle_process or self._idle_process.poll() is not None
-        ):
-            logger.info(f"🌙 Starting idle program: {self._idle_path}")
-            proc = self._run_program(self._idle_path)
-            self._idle_process = proc
-            if proc:
-                threading.Thread(
-                    target=self._monitor_process,
-                    args=(proc, "idle"),
-                    daemon=True,
-                ).start()
-
-    def _start_busy(self) -> None:
-        """启动繁忙时运行的外部程序，并杀掉空闲时的外部程序。"""
-        if self._idle_process:
-            try:
-                self._idle_process.kill()
-            except (ProcessLookupError, OSError):
-                pass
-            self._idle_process = None
-
-        if self._busy_path and (
-            not self._busy_process or self._busy_process.poll() is not None
-        ):
-            logger.info(f"🔥 Starting busy program: {self._busy_path}")
-            proc = self._run_program(self._busy_path)
-            self._busy_process = proc
-            if proc:
-                threading.Thread(
-                    target=self._monitor_process,
-                    args=(proc, "busy"),
-                    daemon=True,
-                ).start()
-
-    def _monitor_process(self, proc: subprocess.Popen[Any], name: str) -> None:
-        """在后台守护线程中等待受控进程退出，若是当前正在运作的进程，则触发事件。"""
+    def _monitor_process(self, proc: subprocess.Popen[Any]) -> None:
+        """在后台守护线程中等待受控进程退出，若是当前受管进程，则触发事件。"""
         proc.wait()
-        if self._event_bus:
-            if proc is self._idle_process or proc is self._busy_process:
-                logger.info(
-                    f"External program {name} terminated with exit code {proc.poll()}"
-                )
-                self._event_bus.publish(ScriptStateChangedEvent())
+        if not self._event_bus:
+            return
+        if self._process is not None and self._process[1] is proc:
+            state, _ = self._process
+            logger.info(
+                f"External program {state.value} terminated with exit code {proc.poll()}"
+            )
+            self._event_bus.publish(ScriptStateChangedEvent())
 
     def cleanup(self) -> None:
-        """终止所有由该管理器启动的外部进程（空闲或繁忙程序）。"""
-        if self._idle_process:
-            try:
-                self._idle_process.kill()
-            except (ProcessLookupError, OSError):
-                pass
-            self._idle_process = None
-        if self._busy_process:
-            try:
-                self._busy_process.kill()
-            except (ProcessLookupError, OSError):
-                pass
-            self._busy_process = None
+        """终止由本管理器启动的外部进程。"""
+        if self._process is None:
+            return
+        _, proc = self._process
+        self._process = None
+        self._terminate(proc)

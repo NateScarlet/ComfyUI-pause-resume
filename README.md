@@ -62,8 +62,9 @@ Create a `.env` file in the same directory as the script, or set environment var
 - `COMFYUI_RESTART_DELAY_SEC`: Delay before restarting after abnormal process exit (seconds, default `10`)
 - `COMFYUI_STARTUP_WAIT_SEC`: When the downstream is starting/restarting, API requests wait up to this many seconds for it to become ready before returning an error (default `600`)
 - `COMFYUI_IDLE_RESTART_SEC`: Timeout to force restart after queue becomes idle (seconds, default `600`, set to `0` to disable)
-- `COMFYUI_IDLE_PROGRAM`: Path to a program to launch when idle (e.g. miner, auto-stopped when tasks arrive)
-- `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle)
+- `COMFYUI_IDLE_PROGRAM`: Path to a program to launch when idle, i.e. the queue drained naturally while not paused (e.g. miner; auto-stopped when tasks arrive or the queue is paused)
+- `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle or paused)
+- `COMFYUI_PAUSE_PROGRAM`: Path to a program to launch while the queue is manually paused (e.g. to hand resources over to a game or another GPU workload; auto-stopped on resume). Set it to the same command as `COMFYUI_IDLE_PROGRAM` to keep the idle program running during pause
 - `COMFYUI_QUEUE_TYPE`: Queue implementation type, supports `sqlite` (default, WAL mode, recommended) or `json` (legacy JSON file queue)
 - `COMFYUI_GATEWAY_DATA_DIR`: Gateway data storage directory (default `gateway_data`, supports absolute or relative paths — relative paths are resolved from the script root)
 - `COMFYUI_HOST`: Gateway listening address (default `127.0.0.1`)
@@ -83,3 +84,5 @@ This implementation uses the HTTP API for queue save and restore. Compared to [y
 3. If the process exits abnormally, the script will automatically attempt a restart
 4. New task submissions always return success immediately (skipping validation); actual validation is deferred until execution. Workflows that encounter errors (e.g. 400-500 responses) are saved to the `failed_workflows/` directory under the data directory (including error details, original request data, and workflow JSON) for inspection and removed from the queue.
 5. GET /queue always returns an empty `outputs_to_execute` since tasks are not parsed immediately on submission.
+6. External programs do not block downstream auto-restarts: even while an external program (e.g. `COMFYUI_IDLE_PROGRAM`) is running, the idle-timeout restart (`COMFYUI_IDLE_RESTART_SEC`) and the "restart after pause" flow still trigger a downstream restart to free VRAM
+7. While the queue is manually paused, only `COMFYUI_PAUSE_PROGRAM` runs (nothing if unset); when set to the same command as `COMFYUI_IDLE_PROGRAM`, that program's process is carried over across mode switches (pause/resume) and keeps running instead of being restarted

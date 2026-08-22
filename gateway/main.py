@@ -86,7 +86,7 @@ async def main() -> None:
 
     # 5. 实例化外部程序管理器
     process_manager = ExternalProgramManager(
-        config.idle_program, config.busy_program, event_bus
+        config.idle_program, config.busy_program, config.pause_program, event_bus
     )
 
     downstream_service = ComfyUIDownstreamClient(

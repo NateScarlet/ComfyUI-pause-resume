@@ -15,6 +15,14 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class QueueState(Enum):
+    """网关队列自身的运行状态（领域事实），供基础设施据此调度外部程序。"""
+
+    BUSY = "busy"
+    PAUSED = "paused"
+    IDLE = "idle"
+
+
 class RawJSON(str):
     """标记一段已经是合法 JSON 的字符串，在序列化时直接嵌入而无需转义，降低转换开销。
 

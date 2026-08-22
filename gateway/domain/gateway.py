@@ -12,7 +12,7 @@ from gateway.shared.interfaces import (
     JobDispatcher,
     EventBus,
 )
-from gateway.shared.models import Job, JobStatus, JobFilters
+from gateway.shared.models import Job, JobStatus, JobFilters, QueueState
 from gateway.shared.events import (
     StateChangedEvent,
     StatusChangedEvent,
@@ -161,8 +161,15 @@ class Gateway:
 
                 is_busy = self._is_busy(has_jobs)
 
-                # 更新空闲/繁忙外挂脚本运行状态
-                self._process_manager.update_state(is_busy, self._ever_active)
+                # 上报网关队列自身的运行状态，由外部程序管理器据此调度程序；
+                # 领域只陈述事实（忙/暂停/空闲），不关心外部程序如何响应
+                if is_busy:
+                    queue_state = QueueState.BUSY
+                elif self._paused:
+                    queue_state = QueueState.PAUSED
+                else:
+                    queue_state = QueueState.IDLE
+                self._process_manager.update_state(queue_state, self._ever_active)
 
                 # 必须在 update_state 触发运行状态变更之后，重新获取外挂脚本最新的实际运行状态，以保证后续判断基于最新数据
                 scripts_running = self._process_manager.is_running()
@@ -174,8 +181,9 @@ class Gateway:
                 else:
                     self._power_controller.allow_sleep()
 
-                # 检测并触发进入或退出空闲状态
-                is_idle = not should_prevent
+                # 空闲判定仅基于业务状态：外挂程序只负责阻止系统休眠，
+                # 不得影响下游重启决策（restart_after_idle 与空闲超时重启）
+                is_idle = not is_busy and self._downstream_ready
                 if is_idle and not self._is_idle:
                     self._is_idle = True
                     self._on_idle_entered()
