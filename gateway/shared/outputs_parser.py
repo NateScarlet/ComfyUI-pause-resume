@@ -1,5 +1,5 @@
 import json
-from typing import Optional, Dict, Any, List, cast
+from typing import Optional, Dict, Any, List, Tuple, cast
 
 THREE_D_EXTENSIONS = frozenset({".obj", ".fbx", ".gltf", ".glb", ".usdz"})
 
@@ -34,6 +34,37 @@ def parse_outputs_count(outputs: Dict[str, Any]) -> int:
                     continue
                 count += 1
     return count
+
+
+def parse_output_images_summary(outputs: Dict[str, Any]) -> Tuple[Optional[str], int]:
+    """从 outputs 字典中提取第一张输出图片的相对路径和图片总数。
+
+    相对路径为 ComfyUI /view 接口语义下的 subfolder/filename 形式，
+    只统计 images 媒体类型，跨节点按出现顺序累加。
+    """
+    total = 0
+    first_rel_path: Optional[str] = None
+    for node_id, node_outputs in outputs.items():
+        if not isinstance(node_outputs, dict):
+            raise ValueError(
+                f"Unexpected node outputs format for node '{node_id}': expected dict, got {type(node_outputs)}"
+            )
+
+        node_outputs_dict = cast(Dict[str, Any], node_outputs)
+        items = node_outputs_dict.get("images", [])
+        if not isinstance(items, list):
+            continue
+
+        for item in cast(List[Any], items):
+            if not isinstance(item, dict):
+                continue
+            item_dict = cast(Dict[str, Any], item)
+            total += 1
+            if first_rel_path is None:
+                subfolder = str(item_dict.get("subfolder") or "")
+                filename = str(item_dict.get("filename") or "")
+                first_rel_path = f"{subfolder}/{filename}" if subfolder else filename
+    return first_rel_path, total
 
 
 def _is_3d_item(filename: str) -> bool:

@@ -11,7 +11,11 @@ from gateway.shared.interfaces import (
 )
 from gateway.shared.events import DispatchSuccessEvent, DownstreamExecutingChangedEvent
 from gateway.shared.models import RawJSON
-from gateway.shared.outputs_parser import parse_outputs_count, THREE_D_EXTENSIONS
+from gateway.shared.outputs_parser import (
+    parse_outputs_count,
+    parse_output_images_summary,
+    THREE_D_EXTENSIONS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +180,16 @@ class JobDownstreamSyncer:
             logger.info(
                 f"✅ Synced and saved task {prompt_id} details from downstream."
             )
+
+            # 任务完成后同步落盘，追加一条输出结果摘要（第一张图片相对路径 + 图片总数）
+            if ds_job.get("status") == "completed" and ds_outputs:
+                first_image_rel_path, image_total = parse_output_images_summary(
+                    ds_outputs
+                )
+                summary = f"{image_total} image(s)"
+                if first_image_rel_path:
+                    summary += f", first: {first_image_rel_path}"
+                logger.info(f"🖼️ Task {prompt_id} completed with {summary}.")
         except Exception as e:
             logger.error(f"Error syncing single task {prompt_id}: {e}", exc_info=True)
 
