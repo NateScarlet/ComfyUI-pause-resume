@@ -66,6 +66,10 @@ start.cmd
 - `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在空闲或暂停时会自动停止）
 - `COMFYUI_PAUSE_PROGRAM`: 手动暂停期间启动的程序路径（例如把资源让给游戏或其他占用 GPU 的程序，恢复队列后自动停止）。设置为与 `COMFYUI_IDLE_PROGRAM` 相同的命令即可让闲置程序在暂停期间继续运行
 - `COMFYUI_QUEUE_TYPE`: 队列实现类型，支持 `sqlite`（默认值，启用 WAL 模式，推荐）或 `json`（传统 JSONFile 队列实现）
+- `COMFYUI_QUEUE_COMPRESSION`: 队列大文本列的压缩档位（仅 `sqlite` 队列生效）。`auto`（默认）检测到可选包 `zstandard` 时使用字典档，缺失则退回标准库 zlib 并输出警告；`zstd` 强制使用字典档——若 `zstandard` 未安装将拒绝启动，避免一次性迁移把数据库锁死在基础档；`zlib` 即使安装了 `zstandard` 也始终使用基础档
+- `COMFYUI_QUEUE_ROTATION_INTERVAL`: 累计多少个新增/更新任务后训练下一代压缩字典（默认 `512`），值越大训练越少、跟随数据漂移越慢
+- `COMFYUI_QUEUE_DICT_SAMPLE_COUNT`: 训练字典时使用的近期任务样本数上限（默认 `300`）
+- `COMFYUI_QUEUE_DICT_TARGET_SIZE`: 训练共享字典的目标体积，单位字节（默认 `65536`）
 - `COMFYUI_GATEWAY_DATA_DIR`: 网关数据存储目录（默认值 `gateway_data`，支持绝对路径或相对路径，相对路径会相对于启动脚本所在根目录解析）
 - `COMFYUI_HOST`: 网关监听地址（默认 `127.0.0.1`）
 - `COMFYUI_HISTORY_RETENTION_DAYS`: 已完成/失败/已取消任务的记录保留天数（默认 `90`）
@@ -76,6 +80,14 @@ start.cmd
 ## 技术说明
 
 此实现使用 HTTP API 进行队列的保存和恢复，相比 [yara](https://github.com/Satellile/yara) 的方案，能够完整保存工作流的 `extra_data` 信息，确保队列恢复的准确性。
+### 队列存储压缩（sqlite）
+
+每个任务的大体积 JSON 列（`prompt`、`extra_data`、`outputs_to_execute`）以压缩形式落库，分两档：
+
+- **字典档**（需要可选包 `zstandard`）：从近期任务训练共享字典，并随新任务定期重训；行以内容指纹标识，无引用的旧字典自动回收。历史数据可压缩到原始体积的百分之几。
+- **基础档**（仅标准库）：逐行 zlib 压缩，不使用字典。
+
+升级后首次启动会对既有数据做一次性重写（分块、断电安全），并通过 `VACUUM` 收缩文件。该迁移会锁定当时所处的档位——若想使用字典档，请先安装 `zstandard`（或设置 `COMFYUI_QUEUE_COMPRESSION=zstd`）再升级；之后再切换档位不会破坏任何行的可读性：每一行的头部都自带编码标识与字典指纹。
 
 ## 注意事项
 

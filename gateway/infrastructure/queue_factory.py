@@ -7,6 +7,7 @@ from typing import Tuple, Callable
 from gateway.config import GatewayConfig, BASE_DIR
 from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from .sqlite.queue import SQLiteQueue
+from .sqlite.compression import select_backend
 from .file.json_queue import JSONFileQueue
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,12 @@ def init_queue(
         db_path = os.path.join(config.data_dir, "queue.db")
         logger.info(f"🗃️ Using SQLiteQueue. DB path: {db_path}")
         queue_instance = SQLiteQueue(
-            db_path, history_retention_days=config.history_retention_days
+            db_path,
+            backend=select_backend(config.queue_compression),
+            history_retention_days=config.history_retention_days,
+            rotation_interval=config.queue_rotation_interval,
+            dict_sample_count=config.queue_dict_sample_count,
+            dict_target_size=config.queue_dict_target_size,
         )
 
     # 检查并迁移旧根目录下的 queue.json

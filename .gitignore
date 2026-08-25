@@ -8,3 +8,4 @@ gateway_data
 .env.ps1
 .trae
 .scratch
+.venv/

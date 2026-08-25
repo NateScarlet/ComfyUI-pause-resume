@@ -5,3 +5,16 @@ requires-python = ">= 3.12"
 
 [project.optional-dependencies]
 tray = ["pystray >= 0.19.5"]
+# 队列大文本列的字典档压缩后端；缺失时自动退回标准库 zlib 基础档
+compression = ["zstandard >= 0.22"]
+
+# 仅开发环境使用的依赖（.venv）；生产运行共享 ComfyUI 运行时，不经此安装
+[dependency-groups]
+dev = [
+    "aiohttp",
+    "pillow",
+    "pystray",
+    "zstandard",
+    "pyright",
+    "black",
+]

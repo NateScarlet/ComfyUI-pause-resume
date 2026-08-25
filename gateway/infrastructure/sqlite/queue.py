@@ -3,38 +3,74 @@ import threading
 import logging
 import time
 import json
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Tuple
 
 from gateway.shared.interfaces import JobQueueReader, JobQueueWriter
 from gateway.shared.models import Job, RawJSON, JobStatus, JobFilters, JobSummary
 from gateway.shared.outputs_parser import extract_workflow_id
+from gateway.infrastructure.sqlite.compression import CompressionBackend
+from gateway.infrastructure.sqlite.dictionary import DictionaryStore
 
 logger = logging.getLogger(__name__)
 
+# 单批迁移的行数：控制单个事务规模，并在每批完成后输出进度日志
+_MIGRATION_CHUNK_SIZE = 500
+
+# WAL 高水位上限：checkpoint 完成且无人使用时自动截断到该值以内，
+# 防止一次全库重建/VACUUM 留下上百 MB 的常驻残留文件
+_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024
+
 
 class SQLiteQueue(JobQueueReader, JobQueueWriter):
-    """基于 SQLite3 数据库实现的任务队列，支持高并发读写，并集成了 WAL 日志模式。"""
+    """基于 SQLite3 数据库实现的任务队列，支持高并发读写，并集成了 WAL 日志模式。
 
-    def __init__(self, db_path: str, history_retention_days: int = 90):
+    大文本列（prompt / extra_data / outputs_to_execute）以自描述压缩 blob 落库，
+    压缩算法由外部注入的 CompressionBackend 决定；字典的注册表与轮换策略
+    收敛在 DictionaryStore（dictionary.py），队列本体只做编排。
+    """
+
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        backend: CompressionBackend,
+        history_retention_days: int = 90,
+        rotation_interval: int = 512,
+        dict_sample_count: int = 300,
+        dict_target_size: int = 65536,
+    ):
         self._db_path = db_path
+        self._backend = backend
         self._history_retention_days = history_retention_days
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             self._db_path, check_same_thread=False, timeout=30.0
         )
+        # 字典轮换节奏（仿 EstimationService 的双桶模式：计数满即训练下一代并切换）
+        self._dictionary = DictionaryStore(
+            self._conn,
+            backend,
+            rotation_interval=rotation_interval,
+            sample_count=dict_sample_count,
+            target_size=dict_target_size,
+        )
         self._init_db()
 
+    # region 初始化与版本迁移
     def _init_db(self) -> None:
         """初始化数据库表结构，处理从低版本的单向平滑迁移。"""
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
+            # 外键按连接生效：让 jobs.dict_ref -> dictionaries 的引用完整性由数据库兜底
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+            self._conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES};")
 
             cursor = self._conn.cursor()
             cursor.execute("PRAGMA user_version")
             db_version = cursor.fetchone()[0]
 
-            SUPPORTED_VERSION = 5
+            SUPPORTED_VERSION = 6
             if db_version > SUPPORTED_VERSION:
                 raise RuntimeError(
                     f"Database version error: The database version is {db_version}, "
@@ -242,38 +278,168 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 )
                 db_version = 5
 
-    @staticmethod
-    def _row_to_job(row: Any) -> Job:
-        """将 DB 查询出的行数据转化为不可变的 Task 实体。"""
+            if db_version < 6:
+                self._migrate_v6_compress_large_columns(cursor)
+                db_version = 6
+
+    def _migrate_v6_compress_large_columns(self, cursor: sqlite3.Cursor) -> None:
+        """v6：大文本列改存自描述压缩 blob，迁移完成后 VACUUM 收缩文件。"""
+        logger.info(
+            "🔧 Migrating SQLite schema to version 6: compressing large text columns..."
+        )
+        # 字典实体表：指纹即主键（内容寻址、不可变），先于 jobs 的外键列创建
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dictionaries (
+                dict_ref INTEGER PRIMARY KEY,
+                content  BLOB NOT NULL
+            )
+        """)
+        # 不可变红线由数据库约束兜底：字典内容一经写入永不覆盖（DELETE 不受限，GC 使用）
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_dictionaries_immutable
+            BEFORE UPDATE ON dictionaries
+            BEGIN
+                SELECT RAISE(ABORT, 'dictionaries are immutable');
+            END
+        """)
+        try:
+            cursor.execute(
+                "ALTER TABLE jobs ADD COLUMN dict_ref INTEGER REFERENCES dictionaries(dict_ref)"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
+        # 用存量 TEXT 行的近期样本引导第一代字典（基础档后端会自然跳过）；
+        # 注册表按需加载，断电续迁时自动识别已落库字典并走"同内容复用"分支
+        cursor.execute(
+            "SELECT extra_data FROM jobs "
+            "WHERE typeof(extra_data) = 'text' AND length(extra_data) > 0 "
+            "ORDER BY number DESC LIMIT ?",
+            (self._dictionary.sample_count,),
+        )
+        samples = [str(row[0]).encode("utf-8") for row in cursor.fetchall()]
+        self._dictionary.train_and_activate(samples)
+        active = self._dictionary.active_ref
+        if active is not None:
+            logger.info(f"🧠 Bootstrapped compression dictionary {active:08x}.")
+        else:
+            logger.info(
+                "🧠 Not enough samples to bootstrap a dictionary; starting at base tier."
+            )
+
+        # 只取仍含 TEXT 列的行（与引导查询同用 typeof 判据）：
+        # 已迁移行由 SQL 过滤掉，中断后重跑幂等，续跑时也不再向应用传输无用行
+        def encode_if_text(cell: Any) -> Any:
+            # 单行 UPDATE 原子生效，正常不会出现行内混合态；
+            # 非 TEXT 格（BLOB/NULL）原样透传，防御未来未知的过渡形态
+            return self._dictionary.encode_cell(cell) if isinstance(cell, str) else cell
+
+        migrated = 0
+        last_id: str = ""
+        while True:
+            cursor.execute(
+                "SELECT id, prompt, extra_data, outputs_to_execute FROM jobs "
+                "WHERE id > ? AND ("
+                "typeof(prompt) = 'text' OR typeof(extra_data) = 'text' "
+                "OR typeof(outputs_to_execute) = 'text'"
+                ") ORDER BY id LIMIT ?",
+                (last_id, _MIGRATION_CHUNK_SIZE),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                break
+            # 每行：(压缩后 prompt, 压缩后 extra_data, 压缩后 outputs, dict_ref, 行id)
+            # dict_ref 为活跃指纹，无字典时写 NULL
+            updates: List[
+                Tuple[
+                    Optional[bytes],
+                    Optional[bytes],
+                    Optional[bytes],
+                    Optional[int],
+                    str,
+                ]
+            ] = []
+            for row_id, prompt, extra_data, outputs in rows:
+                last_id = row_id
+                updates.append(
+                    (
+                        encode_if_text(prompt),
+                        encode_if_text(extra_data),
+                        encode_if_text(outputs),
+                        self._dictionary.active_ref,
+                        row_id,
+                    )
+                )
+            if updates:
+                cursor.executemany(
+                    "UPDATE jobs SET prompt = ?, extra_data = ?, outputs_to_execute = ?, dict_ref = ? "
+                    "WHERE id = ?",
+                    updates,
+                )
+            migrated += len(updates)
+            self._conn.commit()
+            logger.info(f"📦 v6 migration progress: {migrated} rows compressed...")
+
+        # 字典回收的存在性检查走该覆盖索引，避免轮换期对大表做全表扫描
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_dict_ref ON jobs (dict_ref)"
+        )
+
+        cursor.execute("PRAGMA user_version = 6")
+        self._conn.commit()
+        logger.info(
+            f"✅ SQLite schema migration to version 6 completed successfully "
+            f"({migrated} rows compressed)."
+        )
+        # 数据已全部提交，VACUUM 将删除后的空闲页真正归还操作系统
+        cursor.execute("VACUUM")
+
+    # endregion
+
+    # region 行映射与查询（Queries）
+    def _row_to_job(self, row: Any) -> Job:
+        """将 DB 查询出的行数据转化为不可变的 Task 实体（大文本列按行头解压）。"""
+        outputs_text = self._dictionary.decode_cell(row[4])
+        if outputs_text is None:
+            # outputs_to_execute 是任务的必组成部分，缺失即数据损坏
+            raise RuntimeError(f"任务 {row[1]} 缺失 outputs_to_execute，数据可能已损坏")
         return Job(
             number=row[0],
             prompt_id=row[1],
-            prompt=RawJSON(row[2]),
-            extra_data=RawJSON(row[3]),
-            outputs_to_execute=json.loads(row[4]),
+            prompt=RawJSON(self._dictionary.decode_cell(row[2])),
+            extra_data=RawJSON(self._dictionary.decode_cell(row[3])),
+            outputs_to_execute=json.loads(outputs_text),
             create_time=row[5],
             status=JobStatus(row[11]),
-            outputs=RawJSON(row[6]) if row[6] else None,
-            preview_output=RawJSON(row[7]) if row[7] else None,
+            outputs=RawJSON(self._dictionary.decode_cell(row[6])) if row[6] else None,
+            preview_output=(
+                RawJSON(self._dictionary.decode_cell(row[7])) if row[7] else None
+            ),
             execution_start_time=row[8],
             execution_end_time=row[9],
-            execution_error=RawJSON(row[10]) if row[10] else None,
+            execution_error=(
+                RawJSON(self._dictionary.decode_cell(row[10])) if row[10] else None
+            ),
         )
 
-    @staticmethod
-    def _row_to_task_summary(row: Any) -> JobSummary:
-        """将 DB 查询出的行数据转化为不可变的 TaskSummary 实体。"""
+    def _row_to_task_summary(self, row: Any) -> JobSummary:
+        """将 DB 查询出的行数据转化为不可变的 TaskSummary 实体（大文本列按行头解压）。"""
         return JobSummary(
             number=row[0],
             prompt_id=row[1],
             status=JobStatus(row[2]),
             workflow_id=row[3],
             create_time=row[4],
-            outputs=RawJSON(row[5]) if row[5] else None,
-            preview_output=RawJSON(row[6]) if row[6] else None,
+            outputs=RawJSON(self._dictionary.decode_cell(row[5])) if row[5] else None,
+            preview_output=(
+                RawJSON(self._dictionary.decode_cell(row[6])) if row[6] else None
+            ),
             execution_start_time=row[7],
             execution_end_time=row[8],
-            execution_error=RawJSON(row[9]) if row[9] else None,
+            execution_error=(
+                RawJSON(self._dictionary.decode_cell(row[9])) if row[9] else None
+            ),
         )
 
     def list(
@@ -365,7 +531,8 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 limit_offset_clause += " LIMIT -1 OFFSET ?"
                 db_params.append(offset)
 
-            # 查询中彻底省去了 prompt / extra_data / outputs_to_execute 列，完全避免了大 JSON 文本的 I/O 损耗
+            # 摘要路径不拉取 prompt / extra_data / outputs_to_execute 大列，
+            # 完全避免大 JSON 文本的读取与解压开销
             cursor.execute(
                 "SELECT number, id, status, workflow_id, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error "
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
@@ -419,6 +586,23 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
             )
         return result
 
+    def get(self, prompt_id: str) -> Optional[Job]:
+        """根据 ID 获取任务及其当前状态。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error, status "
+                "FROM jobs WHERE id = ?",
+                (prompt_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return self._row_to_job(row)
+            return None
+
+    # endregion
+
+    # region 写入与状态变更（Commands）
     def new_number(self) -> int:
         """分配生成一个新的唯一任务编号。"""
         with self._lock:
@@ -447,16 +631,17 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
             t_serialize = (time.perf_counter() - t_serialize_start) * 1000
 
             cursor.execute(
-                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+                "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, dict_ref, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
                 (
                     job.prompt_id,
                     job.number,
-                    job.prompt,
-                    job.extra_data,
+                    self._dictionary.encode_cell(job.prompt),
+                    self._dictionary.encode_cell(job.extra_data),
                     w_id,
-                    outputs_str,
+                    self._dictionary.encode_cell(outputs_str),
                     job.status.value,
                     job.create_time,
+                    self._dictionary.active_ref,
                 ),
             )
             t_commit_start = time.perf_counter()
@@ -481,15 +666,16 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
 
             if exists:
                 cursor.execute(
-                    "UPDATE jobs SET number = ?, prompt = ?, extra_data = ?, workflow_id = ?, outputs_to_execute = ?, status = ?, create_time = ?, outputs = ?, preview_output = ?, execution_start_time = ?, execution_end_time = ?, execution_error = ? WHERE id = ?",
+                    "UPDATE jobs SET number = ?, prompt = ?, extra_data = ?, workflow_id = ?, outputs_to_execute = ?, status = ?, create_time = ?, dict_ref = ?, outputs = ?, preview_output = ?, execution_start_time = ?, execution_end_time = ?, execution_error = ? WHERE id = ?",
                     (
                         job.number,
-                        job.prompt,
-                        job.extra_data,
+                        self._dictionary.encode_cell(job.prompt),
+                        self._dictionary.encode_cell(job.extra_data),
                         w_id,
-                        outputs_str,
+                        self._dictionary.encode_cell(outputs_str),
                         job.status.value,
                         job.create_time,
+                        self._dictionary.active_ref,
                         str(job.outputs) if job.outputs else None,
                         str(job.preview_output) if job.preview_output else None,
                         job.execution_start_time,
@@ -501,16 +687,17 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 changed = cursor.rowcount > 0
             else:
                 cursor.execute(
-                    "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO jobs (id, number, prompt, extra_data, workflow_id, outputs_to_execute, status, create_time, dict_ref, outputs, preview_output, execution_start_time, execution_end_time, execution_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job.prompt_id,
                         job.number,
-                        job.prompt,
-                        job.extra_data,
+                        self._dictionary.encode_cell(job.prompt),
+                        self._dictionary.encode_cell(job.extra_data),
                         w_id,
-                        outputs_str,
+                        self._dictionary.encode_cell(outputs_str),
                         job.status.value,
                         job.create_time,
+                        self._dictionary.active_ref,
                         str(job.outputs) if job.outputs else None,
                         str(job.preview_output) if job.preview_output else None,
                         job.execution_start_time,
@@ -521,7 +708,7 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 changed = True
 
             self._conn.commit()
-            return changed
+        return changed
 
     def pop(self, skip: int = 0) -> Optional[Job]:
         """弹出指定偏移量的待处理任务，并将其更新标记为正在运行。"""
@@ -620,6 +807,8 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 JobStatus.CANCELLED,
             ):
                 self._cleanup_expired_history()
+                # 完成事件即字典轮换检查点：攒满一个周期才真正训练
+                self._dictionary.rotate_if_due()
             return changed
 
     def _cleanup_expired_history(self) -> None:
@@ -634,21 +823,10 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
         )
         self._conn.commit()
 
+    # endregion
+
+    # region 资源收尾
     def close(self) -> None:
         """释放数据库连接资源。"""
         with self._lock:
             self._conn.close()
-
-    def get(self, prompt_id: str) -> Optional[Job]:
-        """根据 ID 获取任务及其当前状态。"""
-        with self._lock:
-            cursor = self._conn.cursor()
-            cursor.execute(
-                "SELECT number, id, prompt, extra_data, outputs_to_execute, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error, status "
-                "FROM jobs WHERE id = ?",
-                (prompt_id,),
-            )
-            row = cursor.fetchone()
-            if row:
-                return self._row_to_job(row)
-            return None

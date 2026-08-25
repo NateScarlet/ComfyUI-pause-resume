@@ -50,6 +50,28 @@ class GatewayConfig:
         self.comfyui_extra_args = os.environ.get("COMFYUI_EXTRA_ARGS", "")
         self.proxy_host = os.environ.get("COMFYUI_HOST", "127.0.0.1")
         self.queue_type = os.environ.get("COMFYUI_QUEUE_TYPE", "sqlite").lower()
+        # 队列大文本列的压缩档位：
+        # auto=检测到 zstandard 用字典档、缺失退回 zlib 基础档；
+        # zstd=声明使用字典档，依赖缺失直接启动失败（避免误以基础档完成一次性迁移）；
+        # zlib=显式固定基础档
+        self.queue_compression = os.environ.get(
+            "COMFYUI_QUEUE_COMPRESSION", "auto"
+        ).lower()
+        if self.queue_compression not in ("auto", "zstd", "zlib"):
+            raise ValueError(
+                f"COMFYUI_QUEUE_COMPRESSION 取值非法: {self.queue_compression}"
+                "（可选 auto / zstd / zlib）"
+            )
+        # 字典轮换调优参数：训练节奏 / 样本窗口 / 字典目标体积
+        self.queue_rotation_interval = self._positive_int_env(
+            "COMFYUI_QUEUE_ROTATION_INTERVAL", 512
+        )
+        self.queue_dict_sample_count = self._positive_int_env(
+            "COMFYUI_QUEUE_DICT_SAMPLE_COUNT", 300
+        )
+        self.queue_dict_target_size = self._positive_int_env(
+            "COMFYUI_QUEUE_DICT_TARGET_SIZE", 65536
+        )
         # 预估时间桶容量，默认100
         self.estimation_bucket_capacity = int(
             os.environ.get("COMFYUI_ESTIMATION_BUCKET_CAPACITY", "100")
@@ -61,6 +83,17 @@ class GatewayConfig:
         # 剥离了监听端口和地址后的，传递给下游 ComfyUI 进程的参数列表
         self.downstream_args: List[str] = []
         self._parse_extra_args()
+
+    @staticmethod
+    def _positive_int_env(name: str, default: int) -> int:
+        """读取正整数环境变量；未设置用默认值，非法取值直接报错。"""
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        value = int(raw)  # 非数字与其他数值型环境变量保持一致，直接抛出
+        if value <= 0:
+            raise ValueError(f"{name} 必须为正整数，当前值: {value}")
+        return value
 
     def _parse_extra_args(self) -> None:
         """

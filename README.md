@@ -66,6 +66,10 @@ Create a `.env` file in the same directory as the script, or set environment var
 - `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle or paused)
 - `COMFYUI_PAUSE_PROGRAM`: Path to a program to launch while the queue is manually paused (e.g. to hand resources over to a game or another GPU workload; auto-stopped on resume). Set it to the same command as `COMFYUI_IDLE_PROGRAM` to keep the idle program running during pause
 - `COMFYUI_QUEUE_TYPE`: Queue implementation type, supports `sqlite` (default, WAL mode, recommended) or `json` (legacy JSON file queue)
+- `COMFYUI_QUEUE_COMPRESSION`: Compression tier for large queue columns (`sqlite` queue only). `auto` (default) uses the optional `zstandard` package when installed, otherwise falls back to stdlib zlib with a warning; `zstd` requires the dictionary tier — startup fails if `zstandard` is missing, which prevents the one-time migration from locking the database into the base tier; `zlib` always uses the base tier even when `zstandard` is installed
+- `COMFYUI_QUEUE_ROTATION_INTERVAL`: How many new/updated jobs are accumulated before training the next compression dictionary (default `512`). Higher values mean fewer, more gradual retrainings
+- `COMFYUI_QUEUE_DICT_SAMPLE_COUNT`: Maximum number of recent jobs used as samples when training a dictionary (default `300`)
+- `COMFYUI_QUEUE_DICT_TARGET_SIZE`: Target dictionary size in bytes for the trained shared dictionary (default `65536`)
 - `COMFYUI_GATEWAY_DATA_DIR`: Gateway data storage directory (default `gateway_data`, supports absolute or relative paths — relative paths are resolved from the script root)
 - `COMFYUI_HOST`: Gateway listening address (default `127.0.0.1`)
 - `COMFYUI_HISTORY_RETENTION_DAYS`: History retention for completed/failed/cancelled jobs in days (default `90`)
@@ -76,6 +80,14 @@ Create a `.env` file in the same directory as the script, or set environment var
 ## Technical Notes
 
 This implementation uses the HTTP API for queue save and restore. Compared to [yara](https://github.com/Satellile/yara), it fully preserves the workflow's `extra_data`, ensuring accurate queue restoration.
+### Queue storage compression (sqlite)
+
+The large per-job JSON columns (`prompt`, `extra_data`, `outputs_to_execute`) are stored compressed. Two tiers exist:
+
+- **Dictionary tier** (requires the optional `zstandard` package): a shared dictionary is trained from recent jobs and periodically retrained as new jobs arrive; rows are identified by content fingerprints, and unreferenced dictionaries are recycled automatically. Compresses history to a few percent of its original size.
+- **Base tier** (stdlib only): per-row zlib compression without dictionaries.
+
+The first start after upgrading rewrites existing rows once (chunked, crash-safe) and shrinks the file via `VACUUM`. That migration locks in whichever tier is active at that moment, so if you want the dictionary tier, install `zstandard` (or set `COMFYUI_QUEUE_COMPRESSION=zstd`) before upgrading; switching tiers later never breaks readability - every row carries its own codec id and dictionary fingerprint in its header.
 
 ## Caveats
 
