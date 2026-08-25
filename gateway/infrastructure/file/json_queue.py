@@ -127,7 +127,6 @@ class JSONFileQueue(JobQueueReader, JobQueueWriter):
                     status=t.status,
                     workflow_id=w_id,
                     create_time=t.create_time,
-                    extra_data=t.extra_data,
                 )
             )
         return result

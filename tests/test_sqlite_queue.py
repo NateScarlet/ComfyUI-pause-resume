@@ -89,7 +89,8 @@ class TestSQLiteQueue(unittest.TestCase):
         self.assertEqual(s1.prompt_id, "prompt-1")
         self.assertEqual(s1.status, JobStatus.PENDING)
         self.assertEqual(s1.workflow_id, "workflow-1")
-        self.assertIsNotNone(s1.extra_data)
+        # 摘要模型不携带大体积的 extra_data：列表查询不得拉取该列
+        self.assertNotIn("extra_data", JobSummary.__dataclass_fields__)
         self.assertEqual(s1.create_time, 1000)
 
         # 验证支持通过 workflow_id 进行 SQL 精确过滤

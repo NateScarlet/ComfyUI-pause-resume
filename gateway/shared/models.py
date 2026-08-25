@@ -53,7 +53,8 @@ class EstimationState:
 class JobSummary:
     """任务队列中任务的轻量级摘要，用于列表页展示。
 
-    去掉了体积庞大的 prompt 和 outputs_to_execute 字段。
+    去掉了体积庞大的 prompt、extra_data 和 outputs_to_execute 字段；
+    详情一律通过完整任务实体获取。
     """
 
     number: float
@@ -61,7 +62,6 @@ class JobSummary:
     status: JobStatus
     workflow_id: Optional[str]
     create_time: int
-    extra_data: Optional[RawJSON] = None
 
     # 物理下游执行反馈字段 (解耦各自独立)
     outputs: Optional[RawJSON] = None

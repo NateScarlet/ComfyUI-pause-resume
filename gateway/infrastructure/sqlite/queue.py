@@ -269,12 +269,11 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
             status=JobStatus(row[2]),
             workflow_id=row[3],
             create_time=row[4],
-            extra_data=RawJSON(row[5]) if row[5] else None,
-            outputs=RawJSON(row[6]) if row[6] else None,
-            preview_output=RawJSON(row[7]) if row[7] else None,
-            execution_start_time=row[8],
-            execution_end_time=row[9],
-            execution_error=RawJSON(row[10]) if row[10] else None,
+            outputs=RawJSON(row[5]) if row[5] else None,
+            preview_output=RawJSON(row[6]) if row[6] else None,
+            execution_start_time=row[7],
+            execution_end_time=row[8],
+            execution_error=RawJSON(row[9]) if row[9] else None,
         )
 
     def list(
@@ -366,9 +365,9 @@ class SQLiteQueue(JobQueueReader, JobQueueWriter):
                 limit_offset_clause += " LIMIT -1 OFFSET ?"
                 db_params.append(offset)
 
-            # 查询中彻底省去了 prompt 和 outputs_to_execute 列，完全避免了大 JSON 文本的 I/O 损耗
+            # 查询中彻底省去了 prompt / extra_data / outputs_to_execute 列，完全避免了大 JSON 文本的 I/O 损耗
             cursor.execute(
-                "SELECT number, id, status, workflow_id, create_time, extra_data, outputs, preview_output, execution_start_time, execution_end_time, execution_error "
+                "SELECT number, id, status, workflow_id, create_time, outputs, preview_output, execution_start_time, execution_end_time, execution_error "
                 f"FROM jobs {where_clause} ORDER BY number {order_dir}{limit_offset_clause}",
                 db_params,
             )
