@@ -222,26 +222,45 @@ class ComfyUIDownstreamClient(DownstreamClient):
         self._downstream_ready = False
         self.event_bus.publish(DownstreamReadyChangedEvent(ready=False))
 
+    async def _terminate_current_process(self) -> None:
+        """终止当前持有的下游进程（若有）并等待其退出。"""
+        if not self._process:
+            return
+        try:
+            self._process.kill()
+            for _ in range(100):
+                if self._process.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
+        except (ProcessLookupError, OSError):
+            pass
+        self._process = None
+
     async def restart_downstream(self) -> None:
-        """优雅关闭下游老进程并拉起新的下游。"""
+        """优雅关闭下游老进程并拉起新的下游，直到就绪或网关退出。
+
+        就绪等待超时视为本次尝试失败：终止半启动的候选进程后按崩溃重启延迟
+        重试拉起，形成自愈闭环。启动超时不向外传播，避免依赖重启结果的
+        监控协程与优雅重启任务被异常杀死后永久失去自愈能力。
+        """
         if self._is_restarting:
             return
         self._is_restarting = True
         self._mark_downstream_unready()
+        self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         try:
-            if self._process:
+            while not self.exiting:
+                await self._terminate_current_process()
+                self.start_downstream()
                 try:
-                    self._process.kill()
-                    for _ in range(100):
-                        if self._process.poll() is not None:
-                            break
-                        await asyncio.sleep(0.1)
-                except (ProcessLookupError, OSError):
-                    pass
-                self._process = None
-            self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
-            self.start_downstream()
-            await self.wait_downstream_ready()
+                    await self.wait_downstream_ready()
+                    return
+                except DownstreamStartupTimeout:
+                    logger.error(
+                        f"❌ Downstream failed to become ready, retrying in "
+                        f"{self.config.restart_delay_sec} seconds..."
+                    )
+                    await asyncio.sleep(self.config.restart_delay_sec)
         finally:
             self._is_restarting = False
 
