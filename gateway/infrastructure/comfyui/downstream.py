@@ -211,13 +211,23 @@ class ComfyUIDownstreamClient(DownstreamClient):
         logger.error("❌ Downstream wait timeout")
         raise DownstreamStartupTimeout("Downstream wait timeout")
 
+    def _mark_downstream_unready(self) -> None:
+        """将下游置为未就绪；仅在就绪→未就绪的真实状态迁移时发布事件。
+
+        事件语义保持为状态迁移通知：已处于未就绪时再次重启（如崩溃流程中
+        检测阶段已翻转过）不再重复广播，避免订阅方做冗余的刷新与状态发布。
+        """
+        if not self._downstream_ready:
+            return
+        self._downstream_ready = False
+        self.event_bus.publish(DownstreamReadyChangedEvent(ready=False))
+
     async def restart_downstream(self) -> None:
         """优雅关闭下游老进程并拉起新的下游。"""
         if self._is_restarting:
             return
         self._is_restarting = True
-        self._downstream_ready = False
-        self.event_bus.publish(DownstreamReadyChangedEvent(ready=False))
+        self._mark_downstream_unready()
         try:
             if self._process:
                 try:
@@ -247,6 +257,9 @@ class ComfyUIDownstreamClient(DownstreamClient):
                     f"❌ Downstream process exited unexpectedly with code {exit_code}. "
                     f"Restarting in {self.config.restart_delay_sec} seconds..."
                 )
+                # 崩溃被检测到的瞬间立即翻转就绪状态，让代理层从空窗期一开始就让
+                # API 请求进入等待，而不是把请求转发到已死进程上立即返回 502
+                self._mark_downstream_unready()
                 self.event_bus.publish(DownstreamCrashedEvent())
                 await asyncio.sleep(self.config.restart_delay_sec)
                 await self.restart_downstream()

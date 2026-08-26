@@ -634,6 +634,30 @@ class TestDomainGateway(unittest.TestCase):
         # 确认 crashed_executing 未被设为 True
         self.assertFalse(g._crash_skip.crashed_executing)
 
+    def test_permanent_fail_accumulates_across_readiness_transitions(self):
+        """测试崩溃计数跨重启周期累积：每次崩溃都伴随一次未就绪迁移，第 3 次崩溃应永久失败。"""
+        t = MagicMock(spec=Job)
+        t.prompt_id = "bad_job"
+        g = _make_gateway(paused=False, running=[t])
+        g._mock_writer.requeue_running_if_exists.return_value = True
+
+        # 模拟两次完整的崩溃重启周期：未就绪 → 崩溃 → 重新就绪
+        for _ in range(2):
+            g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=False))
+            g._mock_event_bus.publish(DownstreamCrashedEvent())
+            g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+
+        # 前两次崩溃只应重入列，不应标记失败
+        g._mock_writer.update_status.assert_not_called()
+
+        # 第 3 次崩溃（同样先经历未就绪迁移）应触发永久失败
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=False))
+        g._mock_event_bus.publish(DownstreamCrashedEvent())
+
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.FAILED, prompt_id="bad_job"
+        )
+
     def test_attempt_count_reset_when_last_failed_deleted(self):
         """测试先前派发失败的坏任务被手动删除（不再处于队列中）后，崩溃计数、派发偏移及失败 ID 自动复位。"""
         # 1. 派发失败，记录坏任务 ID
