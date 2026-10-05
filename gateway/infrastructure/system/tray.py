@@ -487,9 +487,9 @@ class SystemTrayController:
 
         def restart_text(_: Any) -> str:
             return (
-                _tr("立即重启", "Restart Now")
+                _tr("立即重启下游", "Restart Downstream Now")
                 if self._restart_pending
-                else _tr("暂停后重启", "Pause then Restart")
+                else _tr("暂停后重启下游", "Pause then Restart Downstream")
             )
 
         def queue_text(_: Any) -> str:
