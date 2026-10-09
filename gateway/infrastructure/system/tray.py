@@ -4,7 +4,7 @@ import time
 from typing import Optional, Any
 
 from gateway.application.facade import AppFacade
-from gateway.shared.interfaces import DownstreamClient, JobQueueReader
+from gateway.shared.interfaces import JobQueueReader
 from gateway.shared.models import JobStatus, JobFilters
 from gateway.shared.events import StateChangedEvent, StatusChangedEvent
 from gateway.shared.utils import get_locale
@@ -56,7 +56,6 @@ class SystemTrayController:
         self,
         app_facade: AppFacade,
         queue_reader: JobQueueReader,
-        downstream_service: DownstreamClient,
         loop: Any,
         exit_event: Any,
         fonts: dict[int, Any],
@@ -66,7 +65,6 @@ class SystemTrayController:
 
         self._app_facade = app_facade
         self._queue_reader = queue_reader
-        self._downstream_service = downstream_service
         self._loop = loop
         self._exit_event = exit_event
         self._fonts = fonts
@@ -452,12 +450,12 @@ class SystemTrayController:
         """重启下游 ComfyUI 服务。
 
         第一次点击：暂停队列（带 restart_after_idle 标志），等待当前任务完成后自动重启
-        第二次点击（已处于等待状态）：立即重启下游服务
+        第二次点击（已处于等待状态）：立即强制重启，正在执行的任务会被中断并重新入列
         """
         if self._restart_pending:
-            # 已经处于等待状态，立即重启
+            # 已经处于等待状态，立即强制重启
             self._restart_pending = False
-            self._loop.call_soon_threadsafe(self._downstream_service.restart)
+            self._loop.call_soon_threadsafe(self._app_facade.restart_downstream.handle)
             logger.info("🔄 Restarting downstream immediately via tray")
         else:
             # 第一次点击：暂停并标记等待重启

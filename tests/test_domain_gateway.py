@@ -1,10 +1,11 @@
 import unittest
-from typing import Callable, List
+from dataclasses import replace
+from typing import Callable, List, Optional
 from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
 from gateway.domain.estimation_service import EstimationService
 from gateway.domain.crash_skip_policy import CrashSkipPolicy
-from gateway.shared.models import Job, JobStatus, JobFilters, QueueState
+from gateway.shared.models import Job, JobStatus, JobFilters, QueueState, RawJSON
 from gateway.shared.interfaces import (
     StateRepository,
     JobQueueReader,
@@ -204,8 +205,101 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     g._mock_downstream = downstream
     g._mock_dispatcher = dispatcher
     g._mock_event_bus = event_bus
+    g._mock_estimation = estimation_service
 
     return g
+
+
+def _make_job(prompt_id: str, status: JobStatus = JobStatus.PENDING) -> Job:
+    """构造一个最小可用的任务实体，供队列状态机使用。"""
+    return Job(
+        number=1,
+        prompt_id=prompt_id,
+        prompt=RawJSON("{}"),
+        extra_data=RawJSON("{}"),
+        outputs_to_execute=[],
+        create_time=0,
+        status=status,
+    )
+
+
+class _QueueState:
+    """把队列读写 mock 接到同一份任务状态上，使重入列这类状态迁移可被观察。
+
+    静态 mock 无法表达"重入列后任务回到 PENDING"，因此这里用真实任务实体维护一份状态，
+    只实现网关在派发与中断场景中真正使用到的读写操作。
+    """
+
+    def __init__(self, jobs: List[Job]) -> None:
+        self._jobs = jobs
+        self._statuses: List[JobStatus] = [job.status for job in jobs]
+
+    def list(self, filter_by=None, limit=None, offset=None, desc=False) -> List[Job]:
+        result = [
+            replace(self._jobs[i], status=self._statuses[i])
+            for i in range(len(self._jobs))
+            if self._matches(i, filter_by)
+        ]
+        if desc:
+            result.reverse()
+        if offset:
+            result = result[offset:]
+        if limit is not None:
+            result = result[:limit]
+        return result
+
+    def count(self, filter_by=None, limit=None) -> int:
+        total = sum(
+            1 for i in range(len(self._jobs)) if self._matches(i, filter_by)
+        )
+        return min(total, limit) if limit is not None else total
+
+    def requeue_running_if_exists(self) -> bool:
+        for i, status in enumerate(self._statuses):
+            if status == JobStatus.RUNNING:
+                self._statuses[i] = JobStatus.PENDING
+                return True
+        return False
+
+    def update_status(
+        self,
+        new_status: JobStatus,
+        prompt_id: Optional[str] = None,
+        filter_status: Optional[JobStatus] = None,
+    ) -> bool:
+        changed = False
+        for i, status in enumerate(self._statuses):
+            if prompt_id is not None and self._jobs[i].prompt_id != prompt_id:
+                continue
+            if filter_status is not None and status != filter_status:
+                continue
+            self._statuses[i] = new_status
+            changed = True
+        return changed
+
+    def status_of(self, prompt_id: str) -> Optional[JobStatus]:
+        for i, job in enumerate(self._jobs):
+            if job.prompt_id == prompt_id:
+                return self._statuses[i]
+        return None
+
+    def statuses(self) -> List[JobStatus]:
+        return list(self._statuses)
+
+    def _matches(self, index: int, filter_by: Optional[JobFilters]) -> bool:
+        if filter_by is None or filter_by.statuses is None:
+            return True
+        return self._statuses[index] in filter_by.statuses
+
+
+def _bind_queue_state(g: Gateway, jobs: List[Job]) -> _QueueState:
+    """让网关使用的队列读写 mock 共享同一份状态，便于断言任务是否被丢失。"""
+    state = _QueueState(jobs)
+    g._mock_reader.list.side_effect = state.list
+    g._mock_reader.count.side_effect = state.count
+    g._mock_writer.requeue_running_if_exists.side_effect = state.requeue_running_if_exists
+    g._mock_writer.update_status.side_effect = state.update_status
+    return state
 
 
 class TestDomainGateway(unittest.TestCase):
@@ -1117,6 +1211,127 @@ class TestDomainGateway(unittest.TestCase):
         self.assertEqual(timer.pending_count, 0)
         timer.advance(3600)
         g._mock_downstream.restart.assert_not_called()
+
+    def test_forced_restart_requeues_running_job(self):
+        """强制重启属于中断：执行中的任务回到 PENDING，不得被当作完成而丢失（#12）。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        pending_job = _make_job("pending_1")
+        g = _make_gateway(
+            paused=True,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+            running=[running_job],
+            pending=[pending_job],
+            restart_after_idle_on_pause=True,
+        )
+        queue = _bind_queue_state(g, [running_job, pending_job])
+
+        g.restart_now()
+
+        self.assertEqual(queue.status_of("running_1"), JobStatus.PENDING)
+        self.assertEqual(
+            g._mock_reader.count(JobFilters([JobStatus.PENDING, JobStatus.RUNNING])),
+            2,
+        )
+
+        # 重启流程随后发布的"下游停止执行"事件不得被当作完成处理
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        g._mock_writer.update_status.assert_not_called()
+        self.assertEqual(queue.status_of("running_1"), JobStatus.PENDING)
+        self.assertNotIn(JobStatus.COMPLETED, queue.statuses())
+        self.assertNotIn(JobStatus.FAILED, queue.statuses())
+
+    def test_forced_restart_never_touches_crash_count_or_estimation(self):
+        """反复强制重启不得把任务推向永久失败，也不得写入预估样本（#12）。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(
+            paused=True,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+            crash_count=1,
+            running=[running_job],
+        )
+        queue = _bind_queue_state(g, [running_job])
+
+        for _ in range(3):
+            g.restart_now()
+            # 重启流程发布的"下游停止执行"事件
+            g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+            # 重新就绪并再次执行同一个任务
+            g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+            g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+
+            self.assertEqual(queue.status_of("running_1"), JobStatus.PENDING)
+            self.assertEqual(g._crash_skip.crash_count, 1)
+
+        self.assertNotIn(JobStatus.FAILED, queue.statuses())
+        g._mock_estimation.record_completion.assert_not_called()
+
+    def test_forced_restart_keeps_queue_paused_without_dispatch(self):
+        """强制重启期间队列保持暂停且不派发任务，重启完成后由用户手动恢复（#12）。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(
+            paused=True,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+            running=[running_job],
+        )
+        _bind_queue_state(g, [running_job])
+        g._mock_dispatcher.reset_mock()
+
+        g.restart_now()
+
+        self.assertTrue(g.paused)
+        self.assertFalse(g._downstream_ready)
+        g._mock_dispatcher.dispatch.assert_not_called()
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_forced_restart_consumes_pending_restart_after_idle(self):
+        """强制重启应消费挂起的「暂停后空闲重启」决策，避免重启完成后再次排程重启（#12）。"""
+        timer = FakeTimer()
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(
+            paused=True,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            running=[running_job],
+        )
+        g.pause(restart_after_idle=True)
+        _bind_queue_state(g, [running_job])
+
+        g.restart_now()
+
+        # 重启完成重新就绪，并进入空闲
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+        timer.advance(3600)
+
+        self.assertFalse(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_forced_restart_never_allows_sleep_during_restart(self):
+        """强制重启全程必须阻止系统休眠：就绪标志翻转与刷新都不得放行休眠（#12）。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(
+            paused=True,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+            running=[running_job],
+        )
+        _bind_queue_state(g, [running_job])
+        g._mock_power.reset_mock()
+
+        g.restart_now()
+
+        g._mock_power.allow_sleep.assert_not_called()
+        g._mock_power.prevent_sleep.assert_called()
 
 
 if __name__ == "__main__":

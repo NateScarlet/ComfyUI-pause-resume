@@ -8,6 +8,7 @@ from gateway.shared.interfaces import (
 )
 from .commands.add_job import AddJobCommandHandler
 from .commands.pause_resume import PauseQueueCommandHandler, ResumeQueueCommandHandler
+from .commands.restart_downstream import RestartDownstreamCommandHandler
 from .commands.modify_queue import ModifyQueueCommandHandler
 from .commands.cancel_job import CancelJobCommandHandler
 from .commands.report_activity import ReportActivityCommandHandler
@@ -29,6 +30,7 @@ class AppFacade:
         add_job: AddJobCommandHandler,
         pause_queue: PauseQueueCommandHandler,
         resume_queue: ResumeQueueCommandHandler,
+        restart_downstream: RestartDownstreamCommandHandler,
         modify_queue: ModifyQueueCommandHandler,
         cancel_job: CancelJobCommandHandler,
         report_activity: ReportActivityCommandHandler,
@@ -41,6 +43,7 @@ class AppFacade:
         self.add_job = add_job
         self.pause_queue = pause_queue
         self.resume_queue = resume_queue
+        self.restart_downstream = restart_downstream
         self.modify_queue = modify_queue
         self.cancel_job = cancel_job
         self._report_activity = report_activity
@@ -71,6 +74,7 @@ class AppFacade:
             add_job=AddJobCommandHandler(queue_writer, event_bus),
             pause_queue=PauseQueueCommandHandler(gateway),
             resume_queue=ResumeQueueCommandHandler(gateway),
+            restart_downstream=RestartDownstreamCommandHandler(gateway),
             modify_queue=ModifyQueueCommandHandler(queue_writer, event_bus),
             cancel_job=CancelJobCommandHandler(
                 queue_reader, queue_writer, downstream_client, event_bus

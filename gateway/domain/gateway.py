@@ -340,6 +340,29 @@ class Gateway:
         self._refresh()
         self._dispatcher.dispatch(self.get_dispatch_skip())
 
+    def restart_now(self) -> None:
+        """强制重启下游：正在执行的任务属于中断，重新入列而不是被标记完成。
+
+        强制重启是用户主动发起的中断，不代表任务本身的缺陷，因此既不计入崩溃降级
+        阈值，也不写入预估时长（这次执行没有产出）。
+
+        这里先清空网关自身的执行态，使重启流程随后发布的「下游停止执行」事件因状态
+        未变而被幂等忽略；否则该事件会被当成一次正常完成，把这次执行记成有效样本。
+
+        重启入口必须排在刷新之前：它会同步把就绪翻为未就绪，刷新据此继续阻止休眠，
+        避免在终止老进程与拉起新进程之间被系统休眠打断；刷新也不会把暂停中的队列
+        误判为进入空闲，从而多排程一次重启。
+        """
+        self._queue_writer.requeue_running_if_exists()
+        self._downstream_executing = False
+        self._job_start_time = None
+        # 本次重启已经消费了「暂停后空闲重启」的决策，否则重启完成再次进入空闲时会多排程一次重启
+        self._restart_after_idle_on_pause = False
+
+        self._request_downstream_restart()
+        self._refresh()
+        self._publish_status_changed()
+
     def _handle_downstream_executing_changed(
         self, ev: DownstreamExecutingChangedEvent
     ) -> None:

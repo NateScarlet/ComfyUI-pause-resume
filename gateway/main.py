@@ -215,7 +215,6 @@ async def main() -> None:
         tray_controller = SystemTrayController(
             app_facade=app_facade,
             queue_reader=queue_reader,
-            downstream_service=downstream_service,
             loop=loop,
             exit_event=exit_event,
             fonts=fonts,
