@@ -231,19 +231,43 @@ class GatewayHandlers:
                     status=503, text="Service Unavailable: Downstream is booting up"
                 )
 
-        # 1. 拦截任务提交：POST /prompt
+        # 以下按"是否产生活动"分组排列，请勿随意调换顺序：
+        # 1-2 扩展加载管道：页面自身的加载过程，不算用户活动
+        # 3 WebSocket 代理：连接建立时单独计一次活动（见 _handle_ws_proxy）
+        # 4 之后的所有分支都是用户发起的真实使用，统一计为一次活动
+
+        # 1. 扩展加载管道：向扩展列表追加我们的扩展 URL
+        if method == "GET" and (path == "/api/extensions" or path == "/extensions"):
+            downstream_url = self._build_downstream_url(request)
+            return await self._handle_extensions_proxy(downstream_url)
+
+        # 2. 扩展加载管道：返回我们的扩展 JS 文件
+        if method == "GET" and path == _EXT_JS_URL:
+            return web.Response(
+                content_type="application/javascript",
+                text=_EXT_EXTENSION_JS,
+            )
+
+        # 3. WebSocket 代理连接并拦截 status 推送
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            downstream_url = self._build_downstream_url(request)
+            return await self._handle_ws_proxy(request, downstream_url)
+
+        self._app.report_activity()
+
+        # 4. 拦截任务提交：POST /prompt
         if method == "POST" and path in ("/prompt", "/api/prompt"):
             return await self._handle_prompt_submission(request)
 
-        # 2. 拦截队列状态查询：GET /queue
+        # 5. 拦截队列状态查询：GET /queue
         if method == "GET" and path in ("/queue", "/api/queue"):
             return await self._handle_queue_status()
 
-        # 3. 拦截合并 jobs 查询：GET /api/jobs
+        # 6. 拦截合并 jobs 查询：GET /api/jobs
         if method == "GET" and path in ("/api/jobs", "/api/jobs/"):
             return await self._handle_jobs_list(request)
 
-        # 4. 拦截具体 job 取消：POST /api/jobs/{job_id}/cancel
+        # 7. 拦截具体 job 取消：POST /api/jobs/{job_id}/cancel
         if (
             method == "POST"
             and path.startswith("/api/jobs/")
@@ -251,30 +275,13 @@ class GatewayHandlers:
         ):
             return await self._handle_job_cancel(path)
 
-        # 5. 拦截具体 job 详情查询：GET /api/jobs/{job_id}
+        # 8. 拦截具体 job 详情查询：GET /api/jobs/{job_id}
         if method == "GET" and path.startswith("/api/jobs/"):
             return await self._handle_job_detail(path)
 
-        # 6. 拦截清空/删除操作：POST /queue
+        # 9. 拦截清空/删除操作：POST /queue
         if method == "POST" and path in ("/queue", "/api/queue"):
             return await self._handle_queue_modify(request)
-
-        # 7. WebSocket 代理连接并拦截 status 推送
-        if request.headers.get("Upgrade", "").lower() == "websocket":
-            downstream_url = self._build_downstream_url(request)
-            return await self._handle_ws_proxy(request, downstream_url)
-
-        # 8. 扩展加载管道：向扩展列表追加我们的扩展 URL
-        if method == "GET" and (path == "/api/extensions" or path == "/extensions"):
-            downstream_url = self._build_downstream_url(request)
-            return await self._handle_extensions_proxy(downstream_url)
-
-        # 9. 扩展加载管道：返回我们的扩展 JS 文件
-        if method == "GET" and path == _EXT_JS_URL:
-            return web.Response(
-                content_type="application/javascript",
-                text=_EXT_EXTENSION_JS,
-            )
 
         # 10. 默认普通代理
         downstream_url = self._build_downstream_url(request)
@@ -551,6 +558,8 @@ class GatewayHandlers:
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.ws_connect(downstream_url) as ws_client:
+                    # 连接建立即计一次活动，连接存活期间不重复计数（挂着不等于在用）
+                    self._app.report_activity()
 
                     async def ws_forward(
                         ws_from: Union[

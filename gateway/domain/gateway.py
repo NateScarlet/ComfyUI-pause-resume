@@ -79,6 +79,8 @@ class Gateway:
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
         self._cancel_dispatch_retry: Optional[Callable[[], None]] = None
+        # 空闲窗口的到期时刻（定时器时间基准），每次活动都会把它推迟到活动时刻 + 窗口长度
+        self._idle_window_end = self._timer.now + self._idle_restart_timeout
         self._refreshing = False
         self._refresh_needed = False
         self._job_start_time: Optional[int] = None  # 当前任务开始执行时间（毫秒）
@@ -207,19 +209,59 @@ class Gateway:
         self._downstream_ready = False
         self._downstream.restart()
 
+    def _arm_idle_restart(self) -> None:
+        """按当前空闲窗口剩余时间重新安排下游重启评估。
+
+        窗口到期等价于"窗口内无活动"，因此到期回调可直接执行挂起的重启决策，
+        而不必让刚进入空闲的状态再等待一个完整窗口。
+        """
+        if self._cancel_idle_timeout:
+            self._cancel_idle_timeout()
+            self._cancel_idle_timeout = None
+        if not self._restart_wanted():
+            return
+        self._cancel_idle_timeout = self._timer.start_timeout(
+            self._idle_remaining(), self._on_idle_timeout
+        )
+
+    def _restart_wanted(self) -> bool:
+        """判定当前是否存在需要被空闲窗口约束的下游重启决策。"""
+        return self._restart_after_idle_on_pause or (
+            self._idle_restart_timeout > 0 and self._ever_active
+        )
+
+    def _idle_remaining(self) -> float:
+        """返回空闲窗口的剩余秒数。
+
+        以注入的定时器为时间来源推算：窗口起点被推迟到最近一次活动，
+        因此活动之后剩余时间重新计满一个完整窗口。
+        """
+        if self._idle_restart_timeout <= 0:
+            return 0.0
+        return max(0.0, self._idle_window_end - self._timer.now)
+
+    def _restart_after_idle_or_wait(self) -> None:
+        """处理"空闲后重启下游"的决策。
+
+        窗口内已无活动时立即重启；窗口内仍有活动时，推迟到窗口剩余时间走完。
+        """
+        if self._idle_remaining() > 0:
+            self._arm_idle_restart()
+            return
+        self._restart_after_idle_on_pause = False
+        self._request_downstream_restart()
+
     def _on_idle_entered(self) -> None:
         """进入业务空闲状态时的决策逻辑。"""
         if self._restart_after_idle_on_pause:
-            self._restart_after_idle_on_pause = False
-            self._request_downstream_restart()
+            self._restart_after_idle_or_wait()
             self._event_bus.publish(StateChangedEvent(paused=self._paused))
             self._refresh()
             return
 
-        if self._ever_active and self._idle_restart_timeout > 0:
-            self._cancel_idle_timeout = self._timer.start_timeout(
-                self._idle_restart_timeout, self._on_idle_timeout
-            )
+        # 新进入空闲的周期从此刻起算窗口
+        self._idle_window_end = self._timer.now + self._idle_restart_timeout
+        self._arm_idle_restart()
 
     def _on_idle_exited(self) -> None:
         """退出业务空闲状态时的决策逻辑（取消超时定时器）。"""
@@ -228,14 +270,35 @@ class Gateway:
             self._cancel_idle_timeout = None
 
     def _on_idle_timeout(self) -> None:
-        """空闲超时到达时的自动重启决策。"""
+        """空闲窗口到达时的自动重启决策。"""
         # 超时回调执行时必须进行防竞态空闲状态校验
         if not self._is_idle:
             self._cancel_idle_timeout = None
             return
         self._cancel_idle_timeout = None
+        if not self._restart_wanted():
+            return
+        # 重启决策已消费，避免下游重新就绪进入空闲后重复重启
+        self._restart_after_idle_on_pause = False
         self._request_downstream_restart()
         self._refresh()
+
+    def report_activity(self) -> None:
+        """上报一次活动，把空闲窗口起点推迟到此刻并重新驱动重启评估。
+
+        活动是空闲判定的第三个输入：它既不改变是否阻止系统休眠的判定，也不影响
+        _ever_active（后者只表示下游是否执行过任务），只保证窗口内仍在发生活动时
+        不会触发下游重启。窗口到期本身即是评估时机，因此活动之后无需依赖任何队列或
+        下游事件来推进重启。
+
+        活动只推迟已经挂起的重启决策，不会凭空安排本不打算发生的重启。
+        """
+        had_pending = (
+            self._cancel_idle_timeout is not None or self._restart_after_idle_on_pause
+        )
+        self._idle_window_end = self._timer.now + self._idle_restart_timeout
+        if had_pending:
+            self._arm_idle_restart()
 
     def pause(self, restart_after_idle: bool) -> None:
         """暂停队列。"""
@@ -254,8 +317,7 @@ class Gateway:
         # 如果此时系统已处于空闲状态，_refresh 不会触发 _on_idle_entered 转换，
         # 因此需要在此处直接处理空闲立即重启逻辑
         if restart_after_idle and self._is_idle and self._restart_after_idle_on_pause:
-            self._restart_after_idle_on_pause = False
-            self._request_downstream_restart()
+            self._restart_after_idle_or_wait()
             self._refresh()
 
     def resume(self) -> None:

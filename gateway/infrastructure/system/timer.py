@@ -1,10 +1,16 @@
 import asyncio
+import time
 from typing import Callable
 from gateway.shared.interfaces import Timer
 
 
 class AsyncioTimer(Timer):
     """基于 asyncio 的无状态定时器实现。"""
+
+    @property
+    def now(self) -> float:
+        """返回单调时钟读数，不受系统时间调整影响。"""
+        return time.monotonic()
 
     def start_timeout(
         self, seconds: float, callback: Callable[[], None]

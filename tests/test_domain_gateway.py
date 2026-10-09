@@ -1,4 +1,5 @@
 import unittest
+from typing import Callable, List
 from unittest.mock import MagicMock
 from gateway.domain.gateway import Gateway
 from gateway.domain.estimation_service import EstimationService
@@ -47,6 +48,52 @@ class MockEventBus(EventBus):
         if event_class in self.subscribers:
             for cb in self.subscribers[event_class]:
                 cb(event)
+
+
+class FakeTimer(Timer):
+    """可控时间的测试定时器：只有显式推进时间才会触发到期的回调。"""
+
+    @property
+    def now(self) -> float:
+        return self._now
+
+    class _Task:
+        def __init__(self, deadline: float, callback: Callable[[], None]) -> None:
+            self.deadline = deadline
+            self.callback = callback
+            self.done = False
+
+    def __init__(self) -> None:
+        self._now = 0.0
+        self._tasks: List[FakeTimer._Task] = []
+
+    def start_timeout(
+        self, seconds: float, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        task = FakeTimer._Task(self._now + seconds, callback)
+        self._tasks.append(task)
+
+        def cancel() -> None:
+            task.done = True
+
+        return cancel
+
+    @property
+    def pending_count(self) -> int:
+        return sum(1 for t in self._tasks if not t.done)
+
+    def advance(self, seconds: float) -> None:
+        """推进时间，并按到期先后顺序触发所有尚未取消的回调。"""
+        deadline = self._now + seconds
+        while True:
+            due = [t for t in self._tasks if not t.done and t.deadline <= deadline]
+            if not due:
+                break
+            task = min(due, key=lambda t: t.deadline)
+            task.done = True
+            self._now = task.deadline
+            task.callback()
+        self._now = deadline
 
 
 def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
@@ -118,6 +165,7 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
     timer_cancel = MagicMock()
     if timer is None:
         timer = MagicMock(spec=Timer)
+        timer.now = 0.0
         timer.start_timeout.return_value = timer_cancel
 
     downstream = MagicMock(spec=DownstreamClient)
@@ -308,6 +356,7 @@ class TestDomainGateway(unittest.TestCase):
             return cancel
 
         timer = MagicMock(spec=Timer)
+        timer.now = 0.0
         timer.start_timeout.side_effect = mock_start_timeout
 
         g = _make_gateway(
@@ -328,6 +377,7 @@ class TestDomainGateway(unittest.TestCase):
 
         # 3. 测试离开空闲时能够正常取消定时器
         timer2 = MagicMock(spec=Timer)
+        timer2.now = 0.0
         timer2.start_timeout.side_effect = mock_start_timeout
         g2 = _make_gateway(
             paused=False,
@@ -819,6 +869,7 @@ class TestDomainGateway(unittest.TestCase):
             return cancel
 
         timer = MagicMock(spec=Timer)
+        timer.now = 0.0
         timer.start_timeout.side_effect = mock_start_timeout
 
         # 1. 处于暂停状态，且 ever_active，会启动空闲超时定时器
@@ -890,6 +941,182 @@ class TestDomainGateway(unittest.TestCase):
 
         self.assertFalse(g._restart_after_idle_on_pause)
         g._mock_downstream.restart.assert_called_once()
+
+    def test_idle_window_restart_deferred_by_latest_activity(self):
+        """空闲窗口内的活动应把重启推迟到"最后一次活动 + idle_restart_timeout"（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        self.assertTrue(g._is_idle)
+
+        # 第一次活动：原定的 600s 重启时刻应推迟到 590 + 600
+        timer.advance(590)
+        g.report_activity()
+        timer.advance(590)
+        g._mock_downstream.restart.assert_not_called()
+
+        # 第二次活动：窗口起点继续推迟到最后一次活动
+        g.report_activity()
+        timer.advance(590)
+        g._mock_downstream.restart.assert_not_called()
+
+        # 最后一次活动满 600s 后才允许重启
+        timer.advance(10)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_activity_without_pending_restart_never_restarts(self):
+        """没有挂起的重启决策时，活动不得凭空触发下游重启（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(paused=False, downstream_ready=True, timer=timer)
+        self.assertEqual(timer.pending_count, 0)
+
+        g.report_activity()
+
+        self.assertEqual(timer.pending_count, 0)
+        timer.advance(3600)
+        g._mock_downstream.restart.assert_not_called()
+
+    def test_activity_defers_restart_after_idle_on_pause(self):
+        """暂停后的空闲立即重启同样受空闲窗口约束（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+
+        timer.advance(590)
+        g.report_activity()
+        g.pause(restart_after_idle=True)
+
+        # 空闲窗口内仍有活动：重启被推迟而不是立即执行
+        self.assertTrue(g.paused)
+        self.assertTrue(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
+
+        timer.advance(599)
+        g._mock_downstream.restart.assert_not_called()
+
+        # 窗口结束后才重启，且不会在下次进入空闲时重复重启
+        timer.advance(1)
+        g._mock_downstream.restart.assert_called_once()
+        self.assertFalse(g._restart_after_idle_on_pause)
+
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+        timer.advance(3600)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_activity_during_execution_defers_restart_after_idle_on_pause(self):
+        """下游执行期间的活动同样推迟暂停后的空闲重启（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        g.pause(restart_after_idle=True)
+        g.report_activity()
+
+        # 任务执行完毕进入空闲，但窗口内仍有活动，重启被推迟
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        self.assertTrue(g._is_idle)
+        self.assertTrue(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
+
+        timer.advance(600)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_activity_keeps_ever_active_and_sleep_prevention(self):
+        """活动不改变 _ever_active，也不影响是否阻止系统休眠（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+
+        g.report_activity()
+
+        self.assertTrue(g._ever_active)
+        self.assertTrue(g._is_idle)
+        self.assertFalse(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
+
+    def test_activity_outside_window_does_not_delay_pause_restart(self):
+        """活动已超出空闲窗口时，暂停后的空闲重启必须立即执行（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+
+        # 活动发生在窗口内，随后 resume 放弃了该窗口的评估
+        timer.advance(100)
+        g.report_activity()
+        timer.advance(100)
+        g.resume()
+        self.assertEqual(timer.pending_count, 0)
+
+        # 此时活动早已超出空闲窗口，不应再次推迟重启
+        timer.advance(600)
+        g.pause(restart_after_idle=True)
+
+        self.assertFalse(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_activity_during_execution_still_restarts_after_idle(self):
+        """执行期间的活动不改变"进入空闲后再等待一个完整窗口"的重启时刻（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        g.report_activity()
+
+        timer.advance(100)
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        timer.advance(599)
+        g._mock_downstream.restart.assert_not_called()
+        timer.advance(1)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_activity_after_resume_does_not_schedule_restart(self):
+        """resume 取消了空闲重启评估后，活动不得凭空重新安排重启（#11）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=True,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        g.resume()
+        self.assertEqual(timer.pending_count, 0)
+
+        g.report_activity()
+
+        self.assertEqual(timer.pending_count, 0)
+        timer.advance(3600)
+        g._mock_downstream.restart.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -245,7 +245,13 @@ class SystemPowerController(ABC):
 
 
 class Timer(ABC):
-    """用于处理定时延时触发动作的抽象定时器接口。"""
+    """用于处理定时延时触发动作与查询当前时间的抽象定时器接口。"""
+
+    @property
+    @abstractmethod
+    def now(self) -> float:
+        """返回单调递增的当前时间（秒）。"""
+        pass
 
     @abstractmethod
     def start_timeout(

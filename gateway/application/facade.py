@@ -10,6 +10,7 @@ from .commands.add_job import AddJobCommandHandler
 from .commands.pause_resume import PauseQueueCommandHandler, ResumeQueueCommandHandler
 from .commands.modify_queue import ModifyQueueCommandHandler
 from .commands.cancel_job import CancelJobCommandHandler
+from .commands.report_activity import ReportActivityCommandHandler
 from .queries.get_queue import GetQueueQueryHandler
 from .queries.get_jobs import GetJobsQueryHandler
 from .queries.get_job_detail import GetJobDetailQueryHandler
@@ -30,6 +31,7 @@ class AppFacade:
         resume_queue: ResumeQueueCommandHandler,
         modify_queue: ModifyQueueCommandHandler,
         cancel_job: CancelJobCommandHandler,
+        report_activity: ReportActivityCommandHandler,
         get_queue: GetQueueQueryHandler,
         get_jobs: GetJobsQueryHandler,
         get_job_detail: GetJobDetailQueryHandler,
@@ -41,12 +43,17 @@ class AppFacade:
         self.resume_queue = resume_queue
         self.modify_queue = modify_queue
         self.cancel_job = cancel_job
+        self._report_activity = report_activity
         self.get_queue = get_queue
         self.get_jobs = get_jobs
         self.get_job_detail = get_job_detail
         self.get_job_count = get_job_count
         self.get_state = get_state
         self._outputs_importer: Optional[Any] = None
+
+    def report_activity(self) -> None:
+        """上报一次活动：空闲窗口起点推迟到此刻，下游重启随之顺延。"""
+        self._report_activity.handle()
 
     @classmethod
     def create(
@@ -68,6 +75,7 @@ class AppFacade:
             cancel_job=CancelJobCommandHandler(
                 queue_reader, queue_writer, downstream_client, event_bus
             ),
+            report_activity=ReportActivityCommandHandler(gateway),
             get_queue=GetQueueQueryHandler(queue_reader),
             get_jobs=GetJobsQueryHandler(queue_reader),
             get_job_detail=GetJobDetailQueryHandler(queue_reader),
