@@ -1,7 +1,9 @@
 import unittest
 from dataclasses import replace
-from typing import Callable, List, Optional
+from typing import List, Optional
 from unittest.mock import MagicMock
+
+from tests.fakes import FakeTimer
 from gateway.domain.gateway import Gateway
 from gateway.domain.estimation_service import EstimationService
 from gateway.domain.crash_skip_policy import CrashSkipPolicy
@@ -49,52 +51,6 @@ class MockEventBus(EventBus):
         if event_class in self.subscribers:
             for cb in self.subscribers[event_class]:
                 cb(event)
-
-
-class FakeTimer(Timer):
-    """可控时间的测试定时器：只有显式推进时间才会触发到期的回调。"""
-
-    @property
-    def now(self) -> float:
-        return self._now
-
-    class _Task:
-        def __init__(self, deadline: float, callback: Callable[[], None]) -> None:
-            self.deadline = deadline
-            self.callback = callback
-            self.done = False
-
-    def __init__(self) -> None:
-        self._now = 0.0
-        self._tasks: List[FakeTimer._Task] = []
-
-    def start_timeout(
-        self, seconds: float, callback: Callable[[], None]
-    ) -> Callable[[], None]:
-        task = FakeTimer._Task(self._now + seconds, callback)
-        self._tasks.append(task)
-
-        def cancel() -> None:
-            task.done = True
-
-        return cancel
-
-    @property
-    def pending_count(self) -> int:
-        return sum(1 for t in self._tasks if not t.done)
-
-    def advance(self, seconds: float) -> None:
-        """推进时间，并按到期先后顺序触发所有尚未取消的回调。"""
-        deadline = self._now + seconds
-        while True:
-            due = [t for t in self._tasks if not t.done and t.deadline <= deadline]
-            if not due:
-                break
-            task = min(due, key=lambda t: t.deadline)
-            task.done = True
-            self._now = task.deadline
-            task.callback()
-        self._now = deadline
 
 
 def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
@@ -1332,6 +1288,49 @@ class TestDomainGateway(unittest.TestCase):
 
         g._mock_power.allow_sleep.assert_not_called()
         g._mock_power.prevent_sleep.assert_called()
+
+    def test_stall_requeues_running_job_without_recording_duration(self):
+        """卡死与进程崩溃同构：执行中的任务重新入列，且该次执行不写入预估样本（#14）。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            downstream_ready=True,
+            ever_active=True,
+            running=[running_job],
+            pending_count=1,
+        )
+        queue = _bind_queue_state(g, [running_job])
+        g._mock_estimation.reset_mock()
+
+        # 日志读取层判定卡死后发布的崩溃事件，携带下游的错误摘要
+        g._mock_event_bus.publish(
+            DownstreamCrashedEvent(error_summary="CUDA error: out of memory")
+        )
+        # 重启流程随后发布的"下游停止执行"事件
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        self.assertEqual(queue.status_of("running_1"), JobStatus.PENDING)
+        self.assertEqual(g._crash_skip.crash_count, 1)
+        self.assertNotIn(JobStatus.COMPLETED, queue.statuses())
+        g._mock_estimation.record_completion.assert_not_called()
+
+    def test_stall_permanent_fail_saves_downstream_error_summary(self):
+        """卡死达到崩溃降级阈值时，任务永久失败并以下游错误摘要落盘（#14）。"""
+        bad_job = _make_job("bad_job", JobStatus.RUNNING)
+        g = _make_gateway(paused=False, running=[bad_job], crash_count=2)
+        _bind_queue_state(g, [bad_job])
+
+        g._mock_event_bus.publish(
+            DownstreamCrashedEvent(error_summary="CUDA error: out of memory")
+        )
+
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.FAILED, prompt_id="bad_job"
+        )
+        g._mock_dispatcher.handle_failed_job.assert_called_once_with(
+            bad_job, "CUDA error: out of memory"
+        )
 
 
 if __name__ == "__main__":

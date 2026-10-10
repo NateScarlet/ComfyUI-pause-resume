@@ -62,6 +62,7 @@ Create a `.env` file in the same directory as the script, or set environment var
 - `COMFYUI_RESTART_DELAY_SEC`: Delay before restarting after abnormal process exit (seconds, default `10`)
 - `COMFYUI_STARTUP_WAIT_SEC`: When the downstream is starting/restarting, API requests wait up to this many seconds for it to become ready before returning an error (default `600`)
 - `COMFYUI_IDLE_RESTART_SEC`: Timeout to force restart after queue becomes idle (seconds, default `600`, set to `0` to disable)
+- `COMFYUI_STALL_TIMEOUT_SEC`: How long to wait for the downstream to wrap up after it reports an execution error before declaring it stalled (seconds, must be a positive integer, default `1800`). A stall is handled like a crash: the downstream is restarted and the running job is requeued. Long tasks never print an execution error, so they are never affected by this timeout
 - `COMFYUI_IDLE_PROGRAM`: Path to a program to launch when idle, i.e. the queue drained naturally while not paused (e.g. miner; auto-stopped when tasks arrive or the queue is paused)
 - `COMFYUI_BUSY_PROGRAM`: Path to a program to launch when busy (e.g. GPU monitor or fan control, auto-stopped when idle or paused)
 - `COMFYUI_PAUSE_PROGRAM`: Path to a program to launch while the queue is manually paused (e.g. to hand resources over to a game or another GPU workload; auto-stopped on resume). Set it to the same command as `COMFYUI_IDLE_PROGRAM` to keep the idle program running during pause

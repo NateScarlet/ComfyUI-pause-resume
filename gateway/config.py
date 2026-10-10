@@ -62,6 +62,10 @@ class GatewayConfig:
                 f"COMFYUI_QUEUE_COMPRESSION 取值非法: {self.queue_compression}"
                 "（可选 auto / zstd / zlib）"
             )
+        # 下游抛出执行异常后，等待其自行收尾的最长时间（秒）；超时未收尾即判定下游卡死
+        self.stall_timeout_sec = self._positive_int_env(
+            "COMFYUI_STALL_TIMEOUT_SEC", 1800
+        )
         # 字典轮换调优参数：训练节奏 / 样本窗口 / 字典目标体积
         self.queue_rotation_interval = self._positive_int_env(
             "COMFYUI_QUEUE_ROTATION_INTERVAL", 512

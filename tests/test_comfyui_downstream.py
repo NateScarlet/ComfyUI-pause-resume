@@ -1,14 +1,16 @@
 import asyncio
 import time
 import unittest
-from typing import Any, Callable, List, Type, TypeVar
+from typing import Any, Callable, List, Optional, Type, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 from gateway.config import GatewayConfig
 from gateway.infrastructure.comfyui.downstream import ComfyUIDownstreamClient
+from gateway.infrastructure.comfyui.execution_log import FAILURE_MARKER
 from gateway.shared.events import DownstreamCrashedEvent, DownstreamReadyChangedEvent
 from gateway.shared.exceptions import DownstreamStartupTimeout
 from gateway.shared.interfaces import EventBus
+from tests.fakes import FakeTimer
 
 T = TypeVar("T")
 
@@ -47,14 +49,27 @@ class _FakeProcess:
 class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
     """测试下游客户端的就绪标志在崩溃与重启各阶段的行为。"""
 
+    def setUp(self) -> None:
+        self.timer = FakeTimer()
+        # 客户端构造需要一个事件循环；默认用未运行的新循环，仅重启入口关心它是否在运行
+        self.loop = asyncio.new_event_loop()
+        self.addCleanup(self.loop.close)
+
     def _make_client(
-        self, restart_delay_sec: float = 0.05
+        self,
+        restart_delay_sec: float = 0.05,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> tuple[ComfyUIDownstreamClient, _RecordingEventBus]:
         bus = _RecordingEventBus()
         config = MagicMock(spec=GatewayConfig)
         config.restart_delay_sec = restart_delay_sec
+        config.stall_timeout_sec = 1800.0
         client = ComfyUIDownstreamClient(
-            config=config, event_bus=bus, process_manager=MagicMock()
+            config=config,
+            event_bus=bus,
+            process_manager=MagicMock(),
+            timer=self.timer,
+            loop=loop if loop is not None else self.loop,
         )
         return client, bus
 
@@ -308,6 +323,126 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             self.assertEqual(len(crash_events), 1)
             self.assertEqual(spawn_count, 3)
             self.assertTrue(client.downstream_ready)
+
+        asyncio.run(scenario())
+
+    def test_stall_marks_unready_reports_crash_and_restarts(self):
+        """卡死判定后按崩溃语义处置：立即置未就绪、发布崩溃事件并重启下游。
+
+        卡死时下游进程仍然存活，进程退出监控察觉不到；且工作线程已死，
+        不重启下游就会永久失去消费队列的能力（issue #14）。
+        """
+
+        async def scenario() -> None:
+            client, bus = self._make_client(loop=asyncio.get_running_loop())
+            client._downstream_ready = True
+
+            restart_calls: List[bool] = []
+
+            async def fake_restart() -> None:
+                restart_calls.append(True)
+
+            client.restart_downstream = fake_restart  # type: ignore[method-assign]
+
+            client._on_downstream_stall("CUDA error: out of memory")
+            await asyncio.sleep(0.01)
+
+            self.assertFalse(client.downstream_ready)
+            crash_events = [
+                e for e in bus.events if isinstance(e, DownstreamCrashedEvent)
+            ]
+            self.assertEqual(len(crash_events), 1)
+            self.assertEqual(crash_events[0].error_summary, "CUDA error: out of memory")
+            self.assertEqual(restart_calls, [True])
+
+        asyncio.run(scenario())
+
+    def _feed_failure_line(self, client: ComfyUIDownstreamClient) -> None:
+        """按真实路径把一行执行异常日志投递下去：后台读取线程 -> 事件循环 -> 观察者。"""
+        assert client._log_watcher is not None
+        client._feed_log_line(
+            client._log_watcher, f"[ERROR] {FAILURE_MARKER} CUDA error: out of memory"
+        )
+
+    def test_terminating_process_drops_pending_stall_verdict(self):
+        """老进程被终止时挂起的卡死判定必须丢弃，不得在新进程上误判。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client(loop=asyncio.get_running_loop())
+            client._process = _FakeProcess()
+            watcher = client._create_log_watcher()
+
+            self._feed_failure_line(client)
+            await asyncio.sleep(0)
+            await client._terminate_current_process()
+            self.timer.advance(3600)
+
+            self.assertEqual(
+                [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
+            )
+            # 老进程残留的日志也不得再喂进作废的观察者
+            client._feed_log_line(watcher, f"[ERROR] {FAILURE_MARKER} again")
+            await asyncio.sleep(0)
+            self.timer.advance(3600)
+            self.assertEqual(
+                [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
+            )
+
+        asyncio.run(scenario())
+
+    def test_crash_detection_drops_pending_stall_verdict(self):
+        """崩溃被检测到时就地作废卡死判定，避免同一次失败既记崩溃又记卡死。
+
+        崩溃与重启之间隔着崩溃延迟，期间挂起的卡死计时器一旦到期会把同一次
+        执行异常再记一次崩溃，直接让崩溃降级阈值被数两次（issue #14）。
+        """
+
+        async def scenario() -> None:
+            # 崩溃延迟必须长于卡死超时，才可能让卡死计时器在重启空窗期内到期
+            client, bus = self._make_client(
+                restart_delay_sec=0.5, loop=asyncio.get_running_loop()
+            )
+            client._downstream_ready = True
+            client._process = _FakeProcess()
+            client.start_downstream = MagicMock()  # type: ignore[method-assign]
+
+            async def fake_wait_ready() -> None:
+                # 重启完成后立即置退出信号，让监控循环自然结束
+                client.exiting = True
+
+            client.wait_downstream_ready = fake_wait_ready  # type: ignore[method-assign]
+            client._create_log_watcher()
+
+            self._feed_failure_line(client)
+            monitor = asyncio.create_task(client.monitor_downstream())
+            # 让监控走完崩溃检测、进入重启延迟等待
+            await asyncio.sleep(0.1)
+            self.timer.advance(3600)
+            await asyncio.wait_for(monitor, timeout=10)
+
+            crash_events = [
+                e for e in bus.events if isinstance(e, DownstreamCrashedEvent)
+            ]
+            self.assertEqual(len(crash_events), 1)
+
+        asyncio.run(scenario())
+
+    def test_shutdown_drops_pending_stall_verdict(self):
+        """网关退出时挂起的卡死判定必须丢弃，避免退出流程里再触发一次重启。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client(loop=asyncio.get_running_loop())
+            client._process = _FakeProcess()
+            client._create_log_watcher()
+
+            self._feed_failure_line(client)
+            await asyncio.sleep(0)
+            await client.shutdown()
+            self.timer.advance(3600)
+
+            self.assertEqual(
+                [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
+            )
 
         asyncio.run(scenario())
 

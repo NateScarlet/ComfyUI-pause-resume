@@ -93,6 +93,8 @@ async def main() -> None:
         config=config,
         event_bus=event_bus,
         process_manager=process_manager,
+        timer=timer,
+        loop=loop,
     )
 
     # 7. 实例化应用层任务分派器
@@ -140,8 +142,7 @@ async def main() -> None:
         event_bus=event_bus,
     )
 
-    # 13. 绑定异步事件循环与信号量
-    downstream_service.loop = loop
+    # 13. 绑定信号量
     exit_event = asyncio.Event()
 
     def signal_handler(signum: Any, frame: Any) -> None:

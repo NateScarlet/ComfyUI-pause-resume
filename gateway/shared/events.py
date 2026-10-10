@@ -33,9 +33,10 @@ class DownstreamReadyChangedEvent:
 
 @dataclass(frozen=True)
 class DownstreamCrashedEvent:
-    """下游 ComfyUI 物理进程非预期崩溃的事件。"""
+    """下游 ComfyUI 物理进程非预期崩溃，或因卡死而按崩溃语义处置的事件。"""
 
-    pass
+    # 卡死时来自下游日志的错误摘要；进程崩溃时没有可用的下游报错
+    error_summary: Optional[str] = None
 
 
 @dataclass(frozen=True)

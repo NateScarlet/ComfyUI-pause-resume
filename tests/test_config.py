@@ -73,6 +73,27 @@ class GatewayConfigTest(unittest.TestCase):
                 self.assertRaises(ValueError):
             GatewayConfig()
 
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_stall_timeout_default(self):
+        """未设置环境变量时，下游异常后的收尾超时默认 1800 秒。"""
+        with patch.dict(os.environ, {}, clear=True):
+            config = GatewayConfig()
+        self.assertEqual(config.stall_timeout_sec, 1800)
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_stall_timeout_from_env(self):
+        """COMFYUI_STALL_TIMEOUT_SEC 环境变量应映射到 stall_timeout_sec 配置。"""
+        with patch.dict(os.environ, {"COMFYUI_STALL_TIMEOUT_SEC": "300"}):
+            config = GatewayConfig()
+        self.assertEqual(config.stall_timeout_sec, 300)
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_stall_timeout_non_positive_rejected(self):
+        """收尾超时为 0 会把每次执行异常都误判为卡死，必须在配置解析期直接报错。"""
+        with patch.dict(os.environ, {"COMFYUI_STALL_TIMEOUT_SEC": "0"}), \
+                self.assertRaises(ValueError):
+            GatewayConfig()
+
 
 if __name__ == "__main__":
     unittest.main()

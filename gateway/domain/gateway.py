@@ -444,7 +444,7 @@ class Gateway:
                 self._cancel_dispatch_retry = None
 
     def _handle_downstream_crashed(self, ev: DownstreamCrashedEvent) -> None:
-        """当下游物理进程发生非预期崩溃时，自行决策并执行物理重入列并刷新状态。"""
+        """当下游物理进程发生非预期崩溃或卡死时，自行决策并执行物理重入列并刷新状态。"""
         running_jobs: List[Job] = self._queue_reader.list(
             JobFilters([JobStatus.RUNNING])
         )
@@ -461,7 +461,8 @@ class Gateway:
                     JobStatus.FAILED, prompt_id=job.prompt_id
                 )
                 self._dispatcher.handle_failed_job(
-                    job, "Downstream crashed 3 times during execution."
+                    job,
+                    ev.error_summary or "Downstream crashed 3 times during execution.",
                 )
             elif action == "skip":
                 if self._queue_writer.requeue_running_if_exists():
