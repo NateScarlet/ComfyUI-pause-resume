@@ -4,6 +4,7 @@ import unittest
 from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
@@ -75,12 +76,6 @@ class _FakeWebSocket:
     async def close(self, code=None, message=b""):
         self.closed = True
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        return False
-
     def __aiter__(self):
         return self
 
@@ -100,8 +95,99 @@ class _FakeClientSession:
     async def __aexit__(self, *exc_info):
         return False
 
-    def ws_connect(self, url):
+    async def ws_connect(self, url):
         return _FakeWebSocket()
+
+
+_EOF = object()
+
+
+class _WsMsg:
+    """测试用 WebSocket 消息，仅携带转发逻辑关心的字段。"""
+
+    def __init__(self, type_, data=None):
+        self.type = type_
+        self.data = data
+
+
+class _ScriptedWebSocket:
+    """测试用脚本化 WebSocket：按预设队列产出消息，队列未喂入时挂起等待。
+
+    队列元素可以是消息、`_EOF`（模拟对端正常 EOF）或异常实例（模拟异常断开）。
+    """
+
+    def __init__(self, messages=()):
+        self._inbox: asyncio.Queue = asyncio.Queue()
+        for msg in messages:
+            self._inbox.put_nowait(msg)
+        self.closed = False
+        self.close_attempts = 0
+        self.sent_text = []
+        self.sent_bytes = []
+        self.pings = 0
+        self.pongs = 0
+
+    async def prepare(self, request):
+        return None
+
+    async def send_str(self, data):
+        self.sent_text.append(data)
+
+    async def send_bytes(self, data):
+        self.sent_bytes.append(data)
+
+    async def ping(self):
+        self.pings += 1
+
+    async def pong(self):
+        self.pongs += 1
+
+    async def close(self, code=None, message=b""):
+        self.close_attempts += 1
+        if self.closed:
+            return False
+        self.closed = True
+        return True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self._inbox.get()
+        if item is _EOF:
+            raise StopAsyncIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _ScriptedClientSession:
+    """测试用 HTTP 会话：返回预先构造的下游 WebSocket。"""
+
+    def __init__(self, ws):
+        self._ws = ws
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def ws_connect(self, url):
+        return self._ws
+
+
+class _FailingClientSession:
+    """测试用 HTTP 会话：下游 WebSocket 握手直接失败。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def ws_connect(self, url):
+        raise aiohttp.ClientError("downstream unavailable")
 
 
 class TestGatewayHandlersProxyReadiness(unittest.TestCase):
@@ -418,6 +504,152 @@ class TestGatewayHandlersActivity(unittest.TestCase):
 
             self.assertIsInstance(resp, _FakeWebSocket)
             app.report_activity.assert_called_once_with()
+
+        asyncio.run(scenario())
+
+
+class TestGatewayHandlersWsProxyLifecycle(unittest.TestCase):
+    """WS 代理的成对生命周期：任一侧结束都必须收敛并关闭两侧（#18）。"""
+
+    def _make_handlers(self):
+        app = MagicMock()
+        downstream = MagicMock(spec=DownstreamClient)
+        downstream.downstream_ready = True
+        downstream.downstream_port = 8188
+        return GatewayHandlers(
+            app=app,
+            downstream_service=downstream,
+            queue_reader=MagicMock(),
+            event_bus=_SyncEventBus(),
+            startup_wait_sec=0.05,
+        )
+
+    def _assert_no_pending_forward_tasks(self):
+        """断言当前事件循环中没有遗留的转发任务。"""
+        current = asyncio.current_task()
+        pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        self.assertEqual(pending, [])
+
+    def test_browser_is_closed_when_downstream_ends_without_close_frame(self):
+        """下游以 EOF 结束且未发 CLOSE 帧时，浏览器侧仍必须被 close（#18）。"""
+
+        async def scenario() -> None:
+            handlers = self._make_handlers()
+            browser = _ScriptedWebSocket()
+            downstream = _ScriptedWebSocket(messages=[_EOF])
+            req = make_mocked_request("GET", "/ws", headers={"Upgrade": "websocket"})
+            with (
+                patch(
+                    "aiohttp.ClientSession", lambda: _ScriptedClientSession(downstream)
+                ),
+                patch("aiohttp.web.WebSocketResponse", lambda: browser),
+            ):
+                resp = await asyncio.wait_for(handlers.proxy_handler(req), timeout=1)
+
+            self.assertIs(resp, browser)
+            self.assertTrue(browser.closed)
+            self.assertEqual(browser.close_attempts, 1)
+            self.assertEqual(handlers.ws_clients, set())
+            self._assert_no_pending_forward_tasks()
+
+        asyncio.run(scenario())
+
+    def test_downstream_is_closed_when_browser_disconnects(self):
+        """浏览器侧异常断开时，下游连接也必须被关闭（#18）。"""
+
+        async def scenario() -> None:
+            handlers = self._make_handlers()
+            browser = _ScriptedWebSocket(
+                messages=[ConnectionResetError("browser disconnected")]
+            )
+            downstream = _ScriptedWebSocket()
+            req = make_mocked_request("GET", "/ws", headers={"Upgrade": "websocket"})
+            with (
+                patch(
+                    "aiohttp.ClientSession", lambda: _ScriptedClientSession(downstream)
+                ),
+                patch("aiohttp.web.WebSocketResponse", lambda: browser),
+            ):
+                await asyncio.wait_for(handlers.proxy_handler(req), timeout=1)
+
+            self.assertTrue(downstream.closed)
+            self.assertEqual(downstream.close_attempts, 1)
+            self.assertEqual(browser.close_attempts, 1)
+            self.assertEqual(handlers.ws_clients, set())
+            self._assert_no_pending_forward_tasks()
+
+        asyncio.run(scenario())
+
+    def test_normal_close_frame_closes_both_sides_once(self):
+        """正常 CLOSE 帧路径两侧都被关闭，且每侧只 close 一次（#18）。"""
+
+        async def scenario() -> None:
+            handlers = self._make_handlers()
+            browser = _ScriptedWebSocket()
+            downstream = _ScriptedWebSocket(
+                messages=[_WsMsg(aiohttp.WSMsgType.CLOSE)]
+            )
+            req = make_mocked_request("GET", "/ws", headers={"Upgrade": "websocket"})
+            with (
+                patch(
+                    "aiohttp.ClientSession", lambda: _ScriptedClientSession(downstream)
+                ),
+                patch("aiohttp.web.WebSocketResponse", lambda: browser),
+            ):
+                await asyncio.wait_for(handlers.proxy_handler(req), timeout=1)
+
+            self.assertTrue(browser.closed)
+            self.assertTrue(downstream.closed)
+            self.assertEqual(browser.close_attempts, 1)
+            self.assertEqual(downstream.close_attempts, 1)
+            self.assertEqual(handlers.ws_clients, set())
+            self._assert_no_pending_forward_tasks()
+
+        asyncio.run(scenario())
+
+    def test_cancelled_handler_closes_both_sides(self):
+        """处理任务被取消时同样必须收敛：关闭两侧且不留下转发任务（#18）。"""
+
+        async def scenario() -> None:
+            handlers = self._make_handlers()
+            browser = _ScriptedWebSocket()
+            downstream = _ScriptedWebSocket()
+            req = make_mocked_request("GET", "/ws", headers={"Upgrade": "websocket"})
+            with (
+                patch(
+                    "aiohttp.ClientSession", lambda: _ScriptedClientSession(downstream)
+                ),
+                patch("aiohttp.web.WebSocketResponse", lambda: browser),
+            ):
+                task = asyncio.create_task(handlers.proxy_handler(req))
+                # 让两个转发方向都进入等待状态后再取消
+                await asyncio.sleep(0.01)
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+            self.assertTrue(browser.closed)
+            self.assertTrue(downstream.closed)
+            self.assertEqual(handlers.ws_clients, set())
+            self._assert_no_pending_forward_tasks()
+
+        asyncio.run(scenario())
+
+    def test_ws_handshake_fails_before_upgrade_when_downstream_unavailable(self):
+        """下游连不上时必须在升级浏览器连接之前快速失败，不得接住后静默丢弃（#18）。"""
+
+        async def scenario() -> None:
+            handlers = self._make_handlers()
+            req = make_mocked_request("GET", "/ws", headers={"Upgrade": "websocket"})
+            with (
+                patch("aiohttp.ClientSession", _FailingClientSession),
+                patch("aiohttp.web.WebSocketResponse") as ws_response,
+            ):
+                resp = await asyncio.wait_for(handlers.proxy_handler(req), timeout=1)
+
+            self.assertEqual(resp.status, 503)
+            ws_response.assert_not_called()
+            self.assertEqual(handlers.ws_clients, set())
 
         asyncio.run(scenario())
 

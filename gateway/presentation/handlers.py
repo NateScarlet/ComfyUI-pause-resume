@@ -558,100 +558,156 @@ class GatewayHandlers:
 
     async def _handle_ws_proxy(
         self, request: web.Request, downstream_url: str
-    ) -> web.WebSocketResponse:
-        """WebSocket 代理，拦截 status 消息注入 queue_remaining。"""
-        ws_server = web.WebSocketResponse()
-        await ws_server.prepare(request)
+    ) -> Union[web.WebSocketResponse, web.Response]:
+        """WebSocket 代理，拦截 status 消息注入 queue_remaining。
 
-        self.ws_clients.add(ws_server)
-
+        收尾契约：返回前两侧连接均已结束，浏览器侧 WebSocketResponse 已被 close。
+        下游连不上时在升级浏览器连接之前快速失败，避免接住浏览器连接后静默丢弃。
+        """
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.ws_connect(downstream_url) as ws_client:
-                    # 连接建立即计一次活动，连接存活期间不重复计数（挂着不等于在用）
-                    self._app.report_activity()
+                ws_client = await session.ws_connect(downstream_url)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(f"WebSocket 下游连接失败: {e}")
+                return web.Response(
+                    status=503, text="Service Unavailable: Downstream WS unavailable"
+                )
 
-                    async def ws_forward(
-                        ws_from: Union[
-                            web.WebSocketResponse, aiohttp.ClientWebSocketResponse
-                        ],
-                        ws_to: Union[
-                            web.WebSocketResponse, aiohttp.ClientWebSocketResponse
-                        ],
-                    ) -> None:
-                        async for msg in ws_from:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_str = msg.data
-                                if ws_from == ws_client:
-                                    try:
-                                        data_json = json.loads(data_str)
-                                        if isinstance(data_json, dict):
-                                            data_dict = cast(Dict[str, Any], data_json)
-                                            if data_dict.get("type") == "status":
-                                                remaining = self._queue_reader.count(
-                                                    JobFilters(
-                                                        [
-                                                            JobStatus.PENDING,
-                                                            JobStatus.RUNNING,
-                                                        ]
-                                                    )
-                                                )
-                                                data_payload = data_dict.get("data")
-                                                if isinstance(data_payload, dict):
-                                                    data_payload_dict = cast(
-                                                        Dict[str, Any], data_payload
-                                                    )
-                                                    status_info = data_payload_dict.get(
-                                                        "status"
-                                                    )
-                                                    if isinstance(status_info, dict):
-                                                        status_info_dict = cast(
-                                                            Dict[str, Any],
-                                                            status_info,
-                                                        )
-                                                        exec_info = (
-                                                            status_info_dict.get(
-                                                                "exec_info"
-                                                            )
-                                                        )
-                                                        if isinstance(exec_info, dict):
-                                                            exec_info_dict = cast(
-                                                                Dict[str, Any],
-                                                                exec_info,
-                                                            )
-                                                            exec_info_dict[
-                                                                "queue_remaining"
-                                                            ] = remaining
-                                                            data_str = json.dumps(
-                                                                data_dict
-                                                            )
-                                    except (json.JSONDecodeError, TypeError):
-                                        pass
-                                await ws_to.send_str(data_str)
-                            elif msg.type == aiohttp.WSMsgType.BINARY:
-                                await ws_to.send_bytes(msg.data)
-                            elif msg.type == aiohttp.WSMsgType.PING:
-                                await ws_to.ping()
-                            elif msg.type == aiohttp.WSMsgType.PONG:
-                                await ws_to.pong()
-                            elif msg.type == aiohttp.WSMsgType.CLOSE:
-                                await ws_to.close()
-                                break
+            ws_server = web.WebSocketResponse()
+            await ws_server.prepare(request)
+            self.ws_clients.add(ws_server)
 
-                    t1 = asyncio.create_task(ws_forward(ws_server, ws_client))
-                    t2 = asyncio.create_task(ws_forward(ws_client, ws_server))
-                    await asyncio.gather(t1, t2)
-            except ConnectionResetError:
-                pass
-            except (
-                aiohttp.ClientError,
-                ConnectionResetError,
-                asyncio.TimeoutError,
-            ) as e:
-                logger.error(f"WebSocket Error: {e}")
+            # 连接建立即计一次活动，连接存活期间不重复计数（挂着不等于在用）
+            self._app.report_activity()
+
+            try:
+                await self._forward_ws_pair(ws_server, ws_client)
             finally:
                 self.ws_clients.discard(ws_server)
-        return ws_server
+                await self._close_ws_pair(ws_server, ws_client)
+            return ws_server
+
+    async def _forward_ws_pair(
+        self,
+        ws_server: web.WebSocketResponse,
+        ws_client: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        """双向转发并收敛：任一方向结束、异常或取消时，取消另一方向并等待其结束。
+
+        这里是唯一的收敛点。转发函数本身不关闭任何连接，关闭统一由
+        _handle_ws_proxy 的收尾逻辑完成，保证每侧只被关闭一次。
+        """
+        forwards = [
+            asyncio.create_task(
+                self._forward_ws_direction(ws_client, ws_server, rewrite_status=True)
+            ),
+            asyncio.create_task(
+                self._forward_ws_direction(ws_server, ws_client, rewrite_status=False)
+            ),
+        ]
+        try:
+            done, _ = await asyncio.wait(forwards, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is None:
+                    continue
+                # 任一侧被断开是代理配对正常结束方式，收尾仍由调用方统一执行
+                if isinstance(exc, ConnectionResetError):
+                    continue
+                if isinstance(exc, aiohttp.ClientError):
+                    logger.warning(f"WebSocket 代理下游连接中断: {exc}")
+                    continue
+                raise exc
+        finally:
+            for task in forwards:
+                if not task.done():
+                    task.cancel()
+            # 等所有转发任务真正结束，避免残留任务继续读写已关闭的连接
+            await asyncio.gather(*forwards, return_exceptions=True)
+
+    async def _forward_ws_direction(
+        self,
+        ws_from: Union[web.WebSocketResponse, aiohttp.ClientWebSocketResponse],
+        ws_to: Union[web.WebSocketResponse, aiohttp.ClientWebSocketResponse],
+        rewrite_status: bool,
+    ) -> None:
+        """把 ws_from 的消息转发给 ws_to，来源结束即返回。"""
+        async for msg in ws_from:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data_str = msg.data
+                if rewrite_status:
+                    try:
+                        data_json = json.loads(data_str)
+                        if isinstance(data_json, dict):
+                            data_dict = cast(Dict[str, Any], data_json)
+                            if data_dict.get("type") == "status":
+                                remaining = self._queue_reader.count(
+                                    JobFilters(
+                                        [
+                                            JobStatus.PENDING,
+                                            JobStatus.RUNNING,
+                                        ]
+                                    )
+                                )
+                                data_payload = data_dict.get("data")
+                                if isinstance(data_payload, dict):
+                                    data_payload_dict = cast(
+                                        Dict[str, Any], data_payload
+                                    )
+                                    status_info = data_payload_dict.get("status")
+                                    if isinstance(status_info, dict):
+                                        status_info_dict = cast(
+                                            Dict[str, Any],
+                                            status_info,
+                                        )
+                                        exec_info = status_info_dict.get("exec_info")
+                                        if isinstance(exec_info, dict):
+                                            exec_info_dict = cast(
+                                                Dict[str, Any],
+                                                exec_info,
+                                            )
+                                            exec_info_dict["queue_remaining"] = (
+                                                remaining
+                                            )
+                                            data_str = json.dumps(data_dict)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                await ws_to.send_str(data_str)
+            elif msg.type == aiohttp.WSMsgType.BINARY:
+                await ws_to.send_bytes(msg.data)
+            elif msg.type == aiohttp.WSMsgType.PING:
+                await ws_to.ping()
+            elif msg.type == aiohttp.WSMsgType.PONG:
+                await ws_to.pong()
+            elif msg.type == aiohttp.WSMsgType.CLOSE:
+                break
+
+    async def _close_ws_pair(
+        self,
+        ws_server: Union[web.WebSocketResponse, aiohttp.ClientWebSocketResponse],
+        ws_client: Union[web.WebSocketResponse, aiohttp.ClientWebSocketResponse],
+    ) -> None:
+        """关闭两侧连接；优先关闭浏览器侧，让前端收到 close 后自行重连。"""
+        try:
+            await self._close_ws(ws_server)
+        finally:
+            # 浏览器侧关闭出错也必须继续关闭下游侧，保证整对生命周期收敛
+            await self._close_ws(ws_client)
+
+    @staticmethod
+    async def _close_ws(
+        ws: Union[web.WebSocketResponse, aiohttp.ClientWebSocketResponse],
+    ) -> None:
+        """幂等关闭单侧连接。"""
+        if ws.closed:
+            return
+        try:
+            await ws.close()
+        except ConnectionResetError:
+            # 对端已消失时 close 帧发送失败，连接本身已经结束，无需额外处理
+            pass
 
     async def _handle_extensions_proxy(self, downstream_url: str) -> web.Response:
         """拦截 /api/extensions 响应，追加我们的扩展 URL。"""
