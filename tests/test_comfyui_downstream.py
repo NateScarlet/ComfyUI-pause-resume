@@ -1,4 +1,5 @@
 import asyncio
+import socket
 import time
 import unittest
 from typing import Any, Callable, List, Optional, Type, TypeVar
@@ -8,7 +9,7 @@ from gateway.config import GatewayConfig
 from gateway.infrastructure.comfyui.downstream import ComfyUIDownstreamClient
 from gateway.infrastructure.comfyui.execution_log import FAILURE_MARKER
 from gateway.shared.events import DownstreamCrashedEvent, DownstreamReadyChangedEvent
-from gateway.shared.exceptions import DownstreamStartupTimeout
+from gateway.shared.exceptions import DownstreamError, DownstreamStartupTimeout
 from gateway.shared.interfaces import EventBus
 from tests.fakes import FakeTimer
 
@@ -445,6 +446,45 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             )
 
         asyncio.run(scenario())
+
+
+def _closed_local_port() -> int:
+    """返回一个无人监听的本地端口，用于制造真实的连接失败。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+class TestComfyUIDownstreamClientSendPrompt(unittest.TestCase):
+    """测试下游客户端在发送任务时对失败类型的上报约定。"""
+
+    def test_transport_failure_reports_zero_status_code(self):
+        """未获得任何 HTTP 响应时必须以状态码 0 上报传输层失败，而非伪装成 HTTP 500。
+
+        派发器据状态码区分永久失败与瞬时失败；若此处谎报 500，任务会被错误归档。
+        """
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        bus = _RecordingEventBus()
+        config = MagicMock(spec=GatewayConfig)
+        client = ComfyUIDownstreamClient(
+            config=config,
+            event_bus=bus,
+            process_manager=MagicMock(),
+            timer=FakeTimer(),
+            loop=loop,
+        )
+        client._downstream_port = _closed_local_port()
+
+        with self.assertRaises(DownstreamError) as ctx:
+            asyncio.run(
+                client.send_prompt(
+                    "prompt_id", {"prompt": {}, "prompt_id": "prompt_id"}
+                )
+            )
+
+        self.assertEqual(ctx.exception.status_code, 0)
+        self.assertIn("Network error:", ctx.exception.message)
 
 
 if __name__ == "__main__":

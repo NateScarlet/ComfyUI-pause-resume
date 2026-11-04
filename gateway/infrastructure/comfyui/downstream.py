@@ -92,7 +92,9 @@ class ComfyUIDownstreamClient(DownstreamClient):
         except DownstreamError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            raise DownstreamError(500, f"Network error: {str(e)}")
+            # 0 表示传输层失败：没有拿到任何 HTTP 响应（如派发途中下游被重启），
+            # 派发器据此走瞬时失败分支，让任务退回队列等待重试
+            raise DownstreamError(0, f"Network error: {str(e)}")
 
     async def get_jobs(self, query_params: Dict[str, str]) -> List[Dict[str, Any]]:
         """从下游 ComfyUI 原生 API 获取历史作业列表（接口实现）。"""
