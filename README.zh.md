@@ -21,6 +21,15 @@
 
 ### 方式一：部署脚本
 
+部署位置通过 git 配置读取，脚本内不含本机路径：
+
+```powershell
+git config comfyui.deployPath "C:\ComfyUI"
+.\scripts\deploy.ps1
+```
+
+也可以用 `-TargetDir` 直接指定：
+
 ```powershell
 .\scripts\deploy.ps1 -TargetDir "C:\ComfyUI"
 ```

@@ -21,6 +21,15 @@ A proxy/gateway that wraps ComfyUI to add pause/resume queue controls with persi
 
 ### Option 1: Deploy script
 
+The deploy location is read from git config, so the script contains no local paths:
+
+```powershell
+git config comfyui.deployPath "C:\ComfyUI"
+.\scripts\deploy.ps1
+```
+
+`-TargetDir` can also be passed explicitly:
+
 ```powershell
 .\scripts\deploy.ps1 -TargetDir "C:\ComfyUI"
 ```
