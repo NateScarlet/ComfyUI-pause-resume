@@ -1,6 +1,18 @@
 from typing import Callable, List
 
-from gateway.shared.interfaces import Timer
+from gateway.shared.interfaces import MemorySampler, Timer
+
+
+class FakeMemorySampler(MemorySampler):
+    """可控的可用内存采样替身：默认内存充足，可显式设定采样值。"""
+
+    def __init__(self, available_mb: int = 8192) -> None:
+        self.available_mb = available_mb
+        self.sample_count = 0
+
+    def available_memory_mb(self) -> int:
+        self.sample_count += 1
+        return self.available_mb
 
 
 class FakeTimer(Timer):

@@ -18,6 +18,7 @@ from gateway.shared.events import (
     StatusChangedEvent,
 )
 from gateway.shared.interfaces import DownstreamClient
+from gateway.shared.models import DownstreamState, GatewayState
 
 
 class _SyncEventBus:
@@ -185,6 +186,35 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_shutdown_page_request_wakes_downstream_and_returns_loading_page(self):
+        """停机期间页面 GET 必须先触发唤醒，再返回自动刷新的加载页（#16）。"""
+
+        async def scenario() -> None:
+            handlers, app, _, _ = self._make_handlers(ready=False, wait_sec=0.05)
+            req = make_mocked_request("GET", "/", headers={"Accept": "text/html"})
+            resp = await handlers.proxy_handler(req)
+
+            app.wake_downstream.handle.assert_called_once_with()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.text, _LOADING_HTML)
+
+        asyncio.run(scenario())
+
+    def test_api_request_wakes_downstream_before_waiting(self):
+        """停机期间 API 请求先触发唤醒，等待超时后返回 503 而非 502（#16）。"""
+
+        async def scenario() -> None:
+            handlers, app, _, _ = self._make_handlers(ready=False, wait_sec=0.05)
+            req = make_mocked_request(
+                "GET", "/system_stats", headers={"Accept": "application/json"}
+            )
+            resp = await handlers.proxy_handler(req)
+
+            app.wake_downstream.handle.assert_called_once_with()
+            self.assertEqual(resp.status, 503)
+
+        asyncio.run(scenario())
+
     def test_api_request_returns_503_after_wait_timeout(self):
         """下游未就绪且等待超时仍未就绪，API 请求应返回错误。"""
 
@@ -213,6 +243,39 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class TestGatewayHandlersState(unittest.TestCase):
+    """测试 /state 对下游停机状态的呈现（#16）。"""
+
+    def test_state_reports_downstream_shutdown(self):
+        """下游处于 Shutdown 时，/state 必须如实反映且包含授权勾选。"""
+
+        async def scenario() -> None:
+            app = MagicMock()
+            app.get_state.handle = MagicMock(
+                return_value=GatewayState(
+                    paused=False,
+                    allow_idle_shutdown=True,
+                    downstream_state=DownstreamState.SHUTDOWN,
+                )
+            )
+            handlers = GatewayHandlers(
+                app=app,
+                downstream_service=MagicMock(spec=DownstreamClient),
+                queue_reader=MagicMock(),
+                event_bus=_SyncEventBus(),
+                startup_wait_sec=0.05,
+            )
+            resp = await handlers.handle_state(
+                make_mocked_request("GET", "/state")
+            )
+            payload = json.loads(resp.text)
+            self.assertEqual(payload["paused"], False)
+            self.assertEqual(payload["allow_idle_shutdown"], True)
+            self.assertEqual(payload["downstream"], "shutdown")
+
+        asyncio.run(scenario())
+
+
 class TestGatewayHandlersActivity(unittest.TestCase):
     """测试 proxy_handler 的活动来源判定（#11）。"""
 
@@ -220,7 +283,13 @@ class TestGatewayHandlersActivity(unittest.TestCase):
         app = MagicMock()
         app.get_jobs.handle = AsyncMock(return_value=[])
         app.get_job_count.handle = AsyncMock(return_value=0)
-        app.get_state.handle = MagicMock(return_value=False)
+        app.get_state.handle = MagicMock(
+            return_value=GatewayState(
+                paused=False,
+                allow_idle_shutdown=False,
+                downstream_state=DownstreamState.READY,
+            )
+        )
         app.add_job.handle = MagicMock(
             return_value=MagicMock(prompt_id="prompt_1", number=1)
         )

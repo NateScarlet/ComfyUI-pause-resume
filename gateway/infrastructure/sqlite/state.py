@@ -50,6 +50,26 @@ class SQLiteStateRepository(StateRepository):
             )
             self._conn.commit()
 
+    def get_allow_idle_shutdown(self) -> Optional[bool]:
+        """查询用户是否授权空闲时停机下游；从未设置过时返回 None。"""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT value FROM state WHERE key = 'allow_idle_shutdown'")
+            row = cursor.fetchone()
+            if row is not None:
+                return row[0] == "true"
+            return None
+
+    def set_allow_idle_shutdown(self, allow: bool) -> None:
+        """持久化保存「空闲时允许下游停机」的授权勾选。"""
+        with self._lock:
+            val = "true" if allow else "false"
+            self._conn.execute(
+                "INSERT OR REPLACE INTO state (key, value) VALUES ('allow_idle_shutdown', ?)",
+                (val,),
+            )
+            self._conn.commit()
+
     def get_estimation_state(self) -> Optional[EstimationState]:
         """获取预估时间状态，返回 None 表示无数据。"""
         with self._lock:

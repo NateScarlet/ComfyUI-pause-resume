@@ -84,6 +84,57 @@ class GatewayConfigTest(unittest.TestCase):
         self.assertEqual(config.proxy_port, 9000)
 
     @patch("gateway.config.load_env", lambda path: None)
+    def test_idle_shutdown_switches_default_off(self):
+        """两个新开关默认关闭，行为与改动前一致。"""
+        with patch.dict(os.environ, {}, clear=True):
+            config = GatewayConfig()
+        self.assertFalse(config.on_demand_start)
+        self.assertFalse(config.allow_idle_shutdown)
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_idle_shutdown_switches_from_env(self):
+        """两个新开关从环境变量读取 true/false。"""
+        env = {
+            "COMFYUI_ON_DEMAND_START": "true",
+            "COMFYUI_ALLOW_IDLE_SHUTDOWN": "TRUE",
+        }
+        with patch.dict(os.environ, env):
+            config = GatewayConfig()
+        self.assertTrue(config.on_demand_start)
+        self.assertTrue(config.allow_idle_shutdown)
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_idle_shutdown_switch_invalid_value_rejected(self):
+        """非 true/false 的开关取值应在配置解析期直接报错。"""
+        with patch.dict(os.environ, {"COMFYUI_ON_DEMAND_START": "yes"}), \
+                self.assertRaises(ValueError):
+            GatewayConfig()
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_idle_shutdown_memory_threshold_default(self):
+        """未设置环境变量时，空闲停机内存阈值默认 1024 MB。"""
+        with patch.dict(os.environ, {}, clear=True):
+            config = GatewayConfig()
+        self.assertEqual(config.idle_shutdown_memory_threshold_mb, 1024)
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_idle_shutdown_memory_threshold_from_env(self):
+        """阈值环境变量应映射到配置字段。"""
+        with patch.dict(
+            os.environ, {"COMFYUI_IDLE_SHUTDOWN_MEMORY_THRESHOLD_MB": "2048"}
+        ):
+            config = GatewayConfig()
+        self.assertEqual(config.idle_shutdown_memory_threshold_mb, 2048)
+
+    @patch("gateway.config.load_env", lambda path: None)
+    def test_idle_shutdown_memory_threshold_non_positive_rejected(self):
+        """阈值为 0 会让任何可用内存都判定为紧张，必须在配置解析期直接报错。"""
+        with patch.dict(
+            os.environ, {"COMFYUI_IDLE_SHUTDOWN_MEMORY_THRESHOLD_MB": "0"}
+        ), self.assertRaises(ValueError):
+            GatewayConfig()
+
+    @patch("gateway.config.load_env", lambda path: None)
     def test_stall_timeout_default(self):
         """未设置环境变量时，下游异常后的收尾超时默认 1800 秒。"""
         with patch.dict(os.environ, {}, clear=True):

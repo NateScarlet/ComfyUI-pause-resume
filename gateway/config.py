@@ -44,6 +44,14 @@ class GatewayConfig:
         self.busy_program = os.environ.get("COMFYUI_BUSY_PROGRAM", "")
         self.pause_program = os.environ.get("COMFYUI_PAUSE_PROGRAM", "")
         self.idle_restart_timeout = int(os.environ.get("COMFYUI_IDLE_RESTART_SEC", 600))
+        # 网关启动时是否预热下游；开启后首个代理请求才冷启动
+        self.on_demand_start = self._bool_env("COMFYUI_ON_DEMAND_START", False)
+        # 空闲时允许下游停机：环境变量作为无托盘部署的初始值，托盘勾选在运行时覆盖
+        self.allow_idle_shutdown = self._bool_env("COMFYUI_ALLOW_IDLE_SHUTDOWN", False)
+        # 空闲停机所需的可用物理内存阈值（MB）
+        self.idle_shutdown_memory_threshold_mb = self._positive_int_env(
+            "COMFYUI_IDLE_SHUTDOWN_MEMORY_THRESHOLD_MB", 1024
+        )
         self.restart_delay_sec = int(os.environ.get("COMFYUI_RESTART_DELAY_SEC", 10))
         # 下游未就绪（首次启动/重启中）时，代理 API 请求最长等待其就绪的时间（秒）
         self.startup_wait_sec = int(os.environ.get("COMFYUI_STARTUP_WAIT_SEC", "600"))
@@ -87,6 +95,19 @@ class GatewayConfig:
         # 剥离了监听端口和地址后的，传递给下游 ComfyUI 进程的参数列表
         self.downstream_args: List[str] = []
         self._parse_extra_args()
+
+    @staticmethod
+    def _bool_env(name: str, default: bool) -> bool:
+        """读取布尔环境变量；未设置用默认值，非法取值直接报错。"""
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        value = raw.strip().lower()
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        raise ValueError(f"{name} 必须为 true 或 false，当前值: {raw}")
 
     @staticmethod
     def _positive_int_env(name: str, default: int) -> int:

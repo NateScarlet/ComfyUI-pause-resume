@@ -151,9 +151,15 @@ class GatewayHandlers:
         return web.json_response({"status": "ok", "paused": False})
 
     async def handle_state(self, request: web.Request) -> web.Response:
-        """查询暂停状态接口。"""
-        paused = self._app.get_state.handle()
-        return web.json_response({"paused": paused})
+        """查询网关状态接口。"""
+        state = self._app.get_state.handle()
+        return web.json_response(
+            {
+                "paused": state.paused,
+                "allow_idle_shutdown": state.allow_idle_shutdown,
+                "downstream": state.downstream_state.value,
+            }
+        )
 
     async def handle_sse(self, request: web.Request) -> web.StreamResponse:
         """建立 SSE 连接推送暂停状态。"""
@@ -172,8 +178,8 @@ class GatewayHandlers:
         self.sse_clients.add(q)
         try:
             await response.write(b"retry: 3000\n\n")
-            paused = self._app.get_state.handle()
-            initial_data = json.dumps({"paused": paused})
+            state = self._app.get_state.handle()
+            initial_data = json.dumps({"paused": state.paused})
             await response.write(f"data: {initial_data}\n\n".encode("utf-8"))
 
             while True:
@@ -201,6 +207,10 @@ class GatewayHandlers:
 
         method = request.method
         accept = request.headers.get("Accept", "")
+
+        # 停机只能由活动结束：任何代理请求都在就绪检查之前先触发唤醒，
+        # 随后的等待与加载页逻辑与冷启动中的下游完全一致
+        self._app.wake_downstream.handle()
 
         # 检查是否为网关可以独立处理的本地接口，放行其 503 检查
         is_local_jobs_api = (

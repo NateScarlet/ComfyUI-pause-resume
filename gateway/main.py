@@ -13,6 +13,7 @@ from .infrastructure.sqlite.state import SQLiteStateRepository
 from .infrastructure.queue_factory import init_queue
 from .infrastructure.system.program import ExternalProgramManager
 from .infrastructure.system.power import PowerManagement
+from .infrastructure.system.memory import WindowsMemorySampler
 from .infrastructure.system.timer import AsyncioTimer
 from .infrastructure.system.tray import SystemTrayController
 from .domain.gateway import Gateway
@@ -76,8 +77,9 @@ async def main() -> None:
     state_repo = SQLiteStateRepository(os.path.join(config.data_dir, "state.db"))
     queue_reader, queue_writer, close_queue = init_queue(config)
 
-    # 4. 实例化系统休眠管理器和定时器
+    # 4. 实例化系统休眠管理器、内存采样器和定时器
     power_manager = PowerManagement()
+    memory_sampler = WindowsMemorySampler()
     timer = AsyncioTimer()
 
     # 6. 实例化事件总线
@@ -130,12 +132,16 @@ async def main() -> None:
         queue_writer=queue_writer,
         process_manager=process_manager,
         power_controller=power_manager,
+        memory_sampler=memory_sampler,
         timer=timer,
         downstream=downstream_service,
         dispatcher=dispatcher,
         event_bus=event_bus,
         estimation_service=estimation_service,
         idle_restart_timeout=config.idle_restart_timeout,
+        idle_shutdown_memory_threshold_mb=config.idle_shutdown_memory_threshold_mb,
+        allow_idle_shutdown_initial=config.allow_idle_shutdown,
+        downstream_shutdown=config.on_demand_start,
     )
 
     # 11. 实例化应用层 Facade 门面（组装所有 Command 与 Query 处理器）
@@ -161,7 +167,7 @@ async def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 14. 后台拉起下游服务
+    # 14. 后台拉起下游服务；按需启动时不预热，等待首个代理请求触发冷启动
     async def bootstrap_downstream() -> None:
         if downstream_service.exiting:
             return
@@ -174,7 +180,12 @@ async def main() -> None:
             )
             loop.call_soon_threadsafe(exit_event.set)
 
-    asyncio.create_task(bootstrap_downstream())
+    if config.on_demand_start:
+        logger.info(
+            "🕓 On-demand start enabled, downstream will start on first request"
+        )
+    else:
+        asyncio.create_task(bootstrap_downstream())
 
     # 15. 构建表示层 (GatewayHandlers) 并注册 Web 路由
     app = web.Application(client_max_size=1024**3)

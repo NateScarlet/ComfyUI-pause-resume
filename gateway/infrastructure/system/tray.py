@@ -46,7 +46,7 @@ _MS_PER_DAY = 24 * 60 * 60 * 1000
 
 
 class SystemTrayController:
-    """Windows 系统托盘控制器，提供暂停/恢复、重启下游、查看队列数量与退出等操作。
+    """Windows 系统托盘控制器，提供暂停/恢复、重启下游、空闲停机授权、查看队列数量与退出等操作。
 
     在独立线程中运行 pystray 消息循环，通过 loop.call_soon_threadsafe
     将业务操作安全地调度回主事件循环执行。
@@ -69,7 +69,9 @@ class SystemTrayController:
         self._exit_event = exit_event
         self._fonts = fonts
 
-        self._paused = app_facade.get_state.handle()
+        state = app_facade.get_state.handle()
+        self._paused = state.paused
+        self._allow_idle_shutdown = state.allow_idle_shutdown
         self._queue_count = self._queue_reader.count(
             JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
         )
@@ -233,7 +235,7 @@ class SystemTrayController:
             handlers[WM_WTSSESSION_CHANGE] = patched_on_session_change
 
     def _is_stopping(self) -> bool:
-        """是否处于"正在停止"过渡态：已暂停但仍有任务正在下游执行，等待其完成。
+        """是否处于"等待当前任务完成"过渡态：已暂停但仍有任务正在下游执行。
 
         注意：仅依据队列剩余数量不足以判定，因为暂停后 PENDING 任务不会再被派发，
         但仍会保留在队列中。真正的过渡态只由"是否仍有任务在下游执行"决定。
@@ -344,7 +346,7 @@ class SystemTrayController:
 
     def _get_tooltip(self) -> str:
         if self._is_stopping():
-            state = _tr("正在停止", "Stopping")
+            state = _tr("等待当前任务完成", "Waiting for the current task")
         elif self._paused:
             state = _tr("已暂停", "Paused")
         else:
@@ -468,6 +470,21 @@ class SystemTrayController:
         if self._icon is not None:
             self._icon.update_menu()
 
+    def _is_idle_shutdown_allowed(self, _: Any = None) -> bool:
+        """供菜单勾选状态查询当前授权。"""
+        return self._allow_idle_shutdown
+
+    def _on_toggle_idle_shutdown(self) -> None:
+        """切换「空闲时允许下游停机」授权勾选。"""
+        enabled = not self._allow_idle_shutdown
+        self._allow_idle_shutdown = enabled
+        self._loop.call_soon_threadsafe(
+            self._app_facade.set_allow_idle_shutdown.handle, enabled
+        )
+        logger.info(f"💤 Idle downstream shutdown allowed: {enabled}")
+        if self._icon is not None:
+            self._icon.update_menu()
+
     def _on_exit(self) -> None:
         """触发网关优雅退出。"""
         self._loop.call_soon_threadsafe(self._exit_event.set)
@@ -507,6 +524,11 @@ class SystemTrayController:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(pause_text, self._on_pause_resume),
             pystray.MenuItem(restart_text, self._on_restart),
+            pystray.MenuItem(
+                _tr("空闲时允许下游停机", "Allow downstream shutdown when idle"),
+                self._on_toggle_idle_shutdown,
+                checked=self._is_idle_shutdown_allowed,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(_tr("退出", "Exit"), self._on_exit),
         )

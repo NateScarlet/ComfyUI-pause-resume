@@ -3,11 +3,18 @@ from dataclasses import replace
 from typing import List, Optional
 from unittest.mock import MagicMock
 
-from tests.fakes import FakeTimer
+from tests.fakes import FakeMemorySampler, FakeTimer
 from gateway.domain.gateway import Gateway
 from gateway.domain.estimation_service import EstimationService
 from gateway.domain.crash_skip_policy import CrashSkipPolicy
-from gateway.shared.models import Job, JobStatus, JobFilters, QueueState, RawJSON
+from gateway.shared.models import (
+    DownstreamState,
+    Job,
+    JobStatus,
+    JobFilters,
+    QueueState,
+    RawJSON,
+)
 from gateway.shared.interfaces import (
     StateRepository,
     JobQueueReader,
@@ -76,6 +83,9 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
 
     repo = MagicMock(spec=StateRepository)
     repo.get_paused.return_value = paused
+    repo.get_allow_idle_shutdown.return_value = kwargs.pop(
+        "persisted_allow_idle_shutdown", None
+    )
 
     reader = MagicMock(spec=JobQueueReader)
 
@@ -118,6 +128,10 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
 
     power = MagicMock(spec=SystemPowerController)
 
+    memory_sampler = kwargs.pop("memory_sampler", None)
+    if memory_sampler is None:
+        memory_sampler = FakeMemorySampler()
+
     timer = kwargs.pop("timer", None)
     timer_cancel = MagicMock()
     if timer is None:
@@ -139,6 +153,7 @@ def _make_gateway(**kwargs) -> Gateway:  # type: ignore[no-untyped-def]
         queue_writer=writer,
         process_manager=pm,
         power_controller=power,
+        memory_sampler=memory_sampler,
         timer=timer,
         downstream=downstream,
         dispatcher=dispatcher,
@@ -1314,6 +1329,336 @@ class TestDomainGateway(unittest.TestCase):
         self.assertEqual(g._crash_skip.crash_count, 1)
         self.assertNotIn(JobStatus.COMPLETED, queue.statuses())
         g._mock_estimation.record_completion.assert_not_called()
+
+    def test_idle_shutdown_stops_downstream_when_memory_pressure_confirmed(self):
+        """空闲窗口到期、队列为空、授权开启且连续 3 次低内存采样后才停机（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        self.assertTrue(g.allow_idle_shutdown)
+        g._mock_downstream.stop.reset_mock()
+
+        # 窗口到期前即使已经连续低内存也不得停机
+        timer.advance(590)
+        g._mock_downstream.stop.assert_not_called()
+        self.assertGreaterEqual(g._low_memory_samples, 3)
+
+        timer.advance(10)
+        g._mock_downstream.stop.assert_called_once()
+        g._mock_downstream.restart.assert_not_called()
+        self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
+        self.assertFalse(g._downstream_ready)
+
+    def test_idle_shutdown_releases_startup_memory_without_ever_active(self):
+        """下游从未执行任务时，空闲停机仍需释放启动基线内存（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            ever_active=False,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        self.assertTrue(g._is_idle)
+
+        timer.advance(600)
+
+        g._mock_downstream.stop.assert_called_once()
+        g._mock_downstream.restart.assert_not_called()
+        self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
+
+    def test_idle_shutdown_requires_three_consecutive_low_samples(self):
+        """连续低内存采样被一次充足采样打断后，计数归零（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        timer.advance(10)
+        self.assertEqual(g._low_memory_samples, 2)
+
+        sampler.available_mb = 2048
+        timer.advance(10)
+        self.assertEqual(g._low_memory_samples, 0)
+        g._mock_downstream.stop.assert_not_called()
+
+    def test_idle_shutdown_falls_back_to_restart_when_memory_is_sufficient(self):
+        """授权开启但内存充足时不停机，按既有空闲重启行为执行（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=4096)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+
+        timer.advance(600)
+
+        g._mock_downstream.restart.assert_called_once()
+        g._mock_downstream.stop.assert_not_called()
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
+
+    def test_idle_shutdown_requires_authorization(self):
+        """未勾选授权时即使内存持续低于阈值也只做既有空闲重启（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=False,
+        )
+
+        timer.advance(600)
+
+        g._mock_downstream.restart.assert_called_once()
+        g._mock_downstream.stop.assert_not_called()
+        self.assertEqual(sampler.sample_count, 0)
+
+    def test_idle_shutdown_skipped_while_queue_not_empty(self):
+        """暂停且队列仍有待处理任务时队列非空，不得停机（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=True,
+            ever_active=True,
+            downstream_ready=True,
+            pending_count=2,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        self.assertTrue(g._is_idle)
+
+        timer.advance(600)
+
+        g._mock_downstream.stop.assert_not_called()
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_activity_defers_idle_shutdown(self):
+        """空闲窗口内的活动应推迟停机判定，窗口重新计满后才允许停机（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+
+        timer.advance(590)
+        g.report_activity()
+        timer.advance(10)
+        g._mock_downstream.stop.assert_not_called()
+
+        timer.advance(590)
+        g._mock_downstream.stop.assert_called_once()
+
+    def test_idle_shutdown_allows_system_sleep(self):
+        """停机期间允许系统休眠；未就绪期间仍阻止休眠（#16）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=FakeMemorySampler(available_mb=512),
+            allow_idle_shutdown_initial=True,
+        )
+        g._mock_power.reset_mock()
+
+        timer.advance(600)
+
+        g._mock_power.allow_sleep.assert_called()
+        g._mock_power.prevent_sleep.assert_not_called()
+
+    def test_idle_shutdown_never_auto_restarts(self):
+        """停机后不得被空闲窗口或内存采样自动拉起（#16）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=FakeMemorySampler(available_mb=512),
+            allow_idle_shutdown_initial=True,
+        )
+        timer.advance(600)
+        g._mock_downstream.stop.assert_called_once()
+        g._mock_downstream.restart.reset_mock()
+
+        timer.advance(3600)
+
+        g._mock_downstream.restart.assert_not_called()
+        self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
+
+    def test_explicit_pause_restart_wins_over_idle_shutdown(self):
+        """显式的「暂停后重启」指令优先于空闲停机（#16）。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=FakeMemorySampler(available_mb=512),
+            allow_idle_shutdown_initial=True,
+            restart_after_idle_on_pause=True,
+        )
+
+        timer.advance(600)
+
+        g._mock_downstream.restart.assert_called_once()
+        g._mock_downstream.stop.assert_not_called()
+
+    def test_wake_downstream_transitions_to_starting(self):
+        """Wake 命令在停机状态下冷启动并立即转为未就绪（#16）。"""
+        g = _make_gateway(downstream_shutdown=True)
+        self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
+        g._mock_downstream.start.reset_mock()
+        g._mock_power.reset_mock()
+
+        g.wake_downstream()
+
+        g._mock_downstream.start.assert_called_once()
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
+        g._mock_power.prevent_sleep.assert_called()
+        g._mock_power.allow_sleep.assert_not_called()
+
+    def test_wake_downstream_is_idempotent(self):
+        """重复请求不得重复冷启动（#16）。"""
+        g = _make_gateway(downstream_shutdown=True)
+        g.wake_downstream()
+        g.wake_downstream()
+        g._mock_downstream.start.assert_called_once()
+
+    def test_wake_downstream_does_nothing_when_running(self):
+        """非停机状态下 Wake 命令不得产生副作用（#16）。"""
+        g = _make_gateway(downstream_ready=True)
+        g.wake_downstream()
+        g._mock_downstream.start.assert_not_called()
+
+    def test_on_demand_start_initial_shutdown_state(self):
+        """按需启动时网关以停机状态启动：不派发且允许系统休眠（#16）。"""
+        g = _make_gateway(downstream_shutdown=True)
+        self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
+        self.assertIsNone(g.get_dispatch_skip())
+        g._mock_power.allow_sleep.assert_called()
+        g._mock_downstream.start.assert_not_called()
+
+    def test_set_allow_idle_shutdown_persists_and_samples(self):
+        """勾选授权会持久化并开始内存采样，取消后停止采样（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=False,
+        )
+
+        g.set_allow_idle_shutdown(True)
+        g._mock_repo.set_allow_idle_shutdown.assert_called_once_with(True)
+        self.assertEqual(sampler.sample_count, 1)
+
+        g.set_allow_idle_shutdown(False)
+        g._mock_repo.set_allow_idle_shutdown.assert_called_with(False)
+        self.assertEqual(g._low_memory_samples, 0)
+
+    def test_persisted_authorization_overrides_environment_initial_value(self):
+        """持久化的勾选优先于环境变量初始值，跨网关重启保持（#16）。"""
+        g = _make_gateway(
+            allow_idle_shutdown_initial=False,
+            persisted_allow_idle_shutdown=True,
+        )
+        self.assertTrue(g.allow_idle_shutdown)
+
+        g2 = _make_gateway(
+            allow_idle_shutdown_initial=True,
+            persisted_allow_idle_shutdown=False,
+        )
+        self.assertFalse(g2.allow_idle_shutdown)
+
+    def test_idle_shutdown_disabled_when_idle_window_is_disabled(self):
+        """关闭空闲窗口（COMFYUI_IDLE_RESTART_SEC=0）时不得停机，活动推迟必须仍然有效（#16 C1）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            downstream_ready=True,
+            idle_restart_timeout=0,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        self.assertTrue(g._is_idle)
+
+        timer.advance(30)
+
+        g._mock_downstream.stop.assert_not_called()
+        g._mock_downstream.restart.assert_not_called()
+
+    def test_enabling_authorization_after_window_expires_still_shuts_down(self):
+        """用户在原窗口早已到期后才勾选授权，也要在采样确认后停机（#16）。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=False,
+        )
+
+        timer.advance(600)
+        self.assertTrue(g._is_idle)
+        g.set_allow_idle_shutdown(True)
+
+        timer.advance(20)
+
+        g._mock_downstream.stop.assert_called_once()
+        self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
+
+    def test_restart_now_clears_shutdown_state(self):
+        """停机状态下强制重启必须清除停机状态（#16）。"""
+        g = _make_gateway(downstream_shutdown=True)
+
+        g.restart_now()
+
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
+        g._mock_downstream.restart.assert_called_once()
 
     def test_stall_permanent_fail_saves_downstream_error_summary(self):
         """卡死达到崩溃降级阈值时，任务永久失败并以下游错误摘要落盘（#14）。"""

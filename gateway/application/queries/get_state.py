@@ -1,4 +1,5 @@
 from gateway.domain.gateway import Gateway
+from gateway.shared.models import GatewayState
 
 
 class GetStateQueryHandler:
@@ -7,6 +8,10 @@ class GetStateQueryHandler:
     def __init__(self, gateway: Gateway):
         self._gateway = gateway
 
-    def handle(self) -> bool:
-        """返回网关当前是否处于暂停状态。"""
-        return self._gateway.paused
+    def handle(self) -> GatewayState:
+        """返回网关当前业务状态的快照。"""
+        return GatewayState(
+            paused=self._gateway.paused,
+            allow_idle_shutdown=self._gateway.allow_idle_shutdown,
+            downstream_state=self._gateway.downstream_state,
+        )

@@ -12,6 +12,8 @@ from .commands.restart_downstream import RestartDownstreamCommandHandler
 from .commands.modify_queue import ModifyQueueCommandHandler
 from .commands.cancel_job import CancelJobCommandHandler
 from .commands.report_activity import ReportActivityCommandHandler
+from .commands.wake_downstream import WakeDownstreamCommandHandler
+from .commands.set_allow_idle_shutdown import SetAllowIdleShutdownCommandHandler
 from .queries.get_queue import GetQueueQueryHandler
 from .queries.get_jobs import GetJobsQueryHandler
 from .queries.get_job_detail import GetJobDetailQueryHandler
@@ -34,6 +36,8 @@ class AppFacade:
         modify_queue: ModifyQueueCommandHandler,
         cancel_job: CancelJobCommandHandler,
         report_activity: ReportActivityCommandHandler,
+        wake_downstream: WakeDownstreamCommandHandler,
+        set_allow_idle_shutdown: SetAllowIdleShutdownCommandHandler,
         get_queue: GetQueueQueryHandler,
         get_jobs: GetJobsQueryHandler,
         get_job_detail: GetJobDetailQueryHandler,
@@ -47,6 +51,8 @@ class AppFacade:
         self.modify_queue = modify_queue
         self.cancel_job = cancel_job
         self._report_activity = report_activity
+        self.wake_downstream = wake_downstream
+        self.set_allow_idle_shutdown = set_allow_idle_shutdown
         self.get_queue = get_queue
         self.get_jobs = get_jobs
         self.get_job_detail = get_job_detail
@@ -80,6 +86,8 @@ class AppFacade:
                 queue_reader, queue_writer, downstream_client, event_bus
             ),
             report_activity=ReportActivityCommandHandler(gateway),
+            wake_downstream=WakeDownstreamCommandHandler(gateway),
+            set_allow_idle_shutdown=SetAllowIdleShutdownCommandHandler(gateway),
             get_queue=GetQueueQueryHandler(queue_reader),
             get_jobs=GetJobsQueryHandler(queue_reader),
             get_job_detail=GetJobDetailQueryHandler(queue_reader),

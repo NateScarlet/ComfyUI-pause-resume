@@ -6,7 +6,7 @@ import subprocess
 import asyncio
 import logging
 import aiohttp
-from typing import Optional, Any, List, Dict, cast
+from typing import Optional, Any, Callable, Coroutine, List, Dict, cast
 
 from gateway.config import BASE_DIR, GatewayConfig
 from gateway.shared.utils import raw_json_dumps
@@ -54,7 +54,16 @@ class ComfyUIDownstreamClient(DownstreamClient):
 
         self._process: Optional[subprocess.Popen[str]] = None
         self._is_restarting: bool = False
+        # 进程退出是否属于主动停机：主动终止的退出不得被监控误判为崩溃并自动重启
+        self._intentionally_stopped: bool = False
         self._downstream_ready: bool = False
+
+        # 所有进程生命周期命令都经同一把锁串行执行，避免停机与唤醒在同一 tick 交错
+        self._lifecycle_lock = asyncio.Lock()
+        # 生命周期协程的异常在后续命令中重新抛出，避免失败只留在 asyncio 日志里
+        self._lifecycle_error: Optional[BaseException] = None
+        # 尚未完成的重启生命周期任务：用来合并重复的重启请求
+        self._pending_restart_task: Optional["asyncio.Task[None]"] = None
 
         # 每个下游进程配一个日志观察者，随进程创建与作废；
         # 日志读取在后台线程上进行，而卡死判定用的定时器只能在事件循环线程启停，
@@ -73,8 +82,63 @@ class ComfyUIDownstreamClient(DownstreamClient):
 
     def restart(self) -> None:
         """重启下游服务（接口实现）。"""
-        if self._loop.is_running():
-            self._loop.create_task(self.restart_downstream())
+        if not self._loop.is_running():
+            return
+        # 已有重启周期在进行（含排队等待生命周期锁）时合并本次请求：
+        # 再排一次完整重启会等前一次成功后终止刚就绪的新进程，徒增一次服务中断
+        if (
+            self._pending_restart_task is not None
+            and not self._pending_restart_task.done()
+        ):
+            return
+        self._pending_restart_task = self._schedule_lifecycle(self.restart_downstream)
+
+    def stop(self) -> None:
+        """终止下游进程并保持停机（接口实现）。"""
+        if not self._loop.is_running():
+            return
+        # 停机之后的重启属于新的意图，不能被前面尚未完成的重启请求合并掉
+        self._pending_restart_task = None
+        self._schedule_lifecycle(self._stop_downstream)
+
+    def start(self) -> None:
+        """冷启动下游进程（接口实现）。"""
+        if not self._loop.is_running():
+            return
+        self._pending_restart_task = self._schedule_lifecycle(self.restart_downstream)
+
+    def _schedule_lifecycle(
+        self, coroutine_factory: Callable[[], Coroutine[Any, Any, None]]
+    ) -> "asyncio.Task[None]":
+        """按命令到达顺序串行调度一个生命周期协程。
+
+        先前的生命周期失败会在下次调度时重新抛给调用者，而不是只留在
+        asyncio 默认的「Task exception was never retrieved」日志里。
+        """
+        previous_error = self._lifecycle_error
+        if previous_error is not None:
+            self._lifecycle_error = None
+            raise previous_error
+        task = self._loop.create_task(coroutine_factory())
+        task.add_done_callback(self._on_lifecycle_task_done)
+        return task
+
+    def _on_lifecycle_task_done(self, task: "asyncio.Task[None]") -> None:
+        """记录生命周期协程的失败，使异常不再无人检索。"""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        self._lifecycle_error = error
+        logger.error("Downstream lifecycle task failed", exc_info=error)
+
+    async def _stop_downstream(self) -> None:
+        """主动终止下游并保持停机，不再自动拉起。"""
+        async with self._lifecycle_lock:
+            self._intentionally_stopped = True
+            self._mark_downstream_unready()
+            await self._terminate_current_process()
 
     async def send_prompt(self, prompt_id: str, body: Dict[str, Any]) -> None:
         """向下游发送任务数据（接口实现）。如果发送失败，抛出 DownstreamError。"""
@@ -265,57 +329,75 @@ class ComfyUIDownstreamClient(DownstreamClient):
         self.event_bus.publish(DownstreamReadyChangedEvent(ready=False))
 
     async def _terminate_current_process(self) -> None:
-        """终止当前持有的下游进程（若有）并等待其退出。"""
-        if not self._process:
+        """终止当前持有的下游进程（若有）并等待其退出。
+
+        用局部变量持有本次要终止的进程：等待退出期间进程句柄可能已被其他
+        生命周期阶段更换，结束时只清理仍指向同一进程的句柄。
+        """
+        process = self._process
+        if process is None:
             return
         # 一旦决定终止本进程，其日志判定即告作废
         self._discard_log_watcher()
         try:
-            self._process.kill()
+            process.kill()
             for _ in range(100):
-                if self._process.poll() is not None:
+                if process.poll() is not None:
                     break
                 await asyncio.sleep(0.1)
         except (ProcessLookupError, OSError):
             pass
-        self._process = None
+        if self._process is process:
+            self._process = None
 
     async def restart_downstream(self) -> None:
         """优雅关闭下游老进程并拉起新的下游，直到就绪或网关退出。
 
-        就绪等待超时视为本次尝试失败：终止半启动的候选进程后按崩溃重启延迟
-        重试拉起，形成自愈闭环。启动超时不向外传播，避免依赖重启结果的
-        监控协程与优雅重启任务被异常杀死后永久失去自愈能力。
+        整个重启流程持有生命周期锁，因此停机命令必须等本次重启结束后才生效，
+        不会与进程的拉起/终止交错。就绪等待超时视为本次尝试失败：终止半启动
+        的候选进程后按崩溃重启延迟重试拉起，形成自愈闭环。启动超时不向外传播，
+        避免依赖重启结果的监控协程与优雅重启任务被异常杀死后永久失去自愈能力。
         """
-        if self._is_restarting:
-            return
-        self._is_restarting = True
-        self._mark_downstream_unready()
-        self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
-        try:
-            while not self.exiting:
-                await self._terminate_current_process()
-                self.start_downstream()
-                try:
-                    await self.wait_downstream_ready()
-                    return
-                except DownstreamStartupTimeout:
-                    logger.error(
-                        f"❌ Downstream failed to become ready, retrying in "
-                        f"{self.config.restart_delay_sec} seconds..."
-                    )
-                    await asyncio.sleep(self.config.restart_delay_sec)
-        finally:
-            self._is_restarting = False
+        async with self._lifecycle_lock:
+            # 取得锁意味着前面的停机命令已经完成，此时才解除停机标志：
+            # 否则监控会把尚未结束的主动停机误判为崩溃
+            self._intentionally_stopped = False
+            self._is_restarting = True
+            self._mark_downstream_unready()
+            self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+            try:
+                while not self.exiting:
+                    await self._terminate_current_process()
+                    self.start_downstream()
+                    try:
+                        await self.wait_downstream_ready()
+                        return
+                    except DownstreamStartupTimeout:
+                        logger.error(
+                            f"❌ Downstream failed to become ready, retrying in "
+                            f"{self.config.restart_delay_sec} seconds..."
+                        )
+                        await asyncio.sleep(self.config.restart_delay_sec)
+            finally:
+                self._is_restarting = False
 
     async def monitor_downstream(self) -> None:
         """下游非预期崩溃监控。"""
         while not self.exiting:
-            if self._process and not self._is_restarting:
-                await asyncio.get_event_loop().run_in_executor(None, self._process.wait)
-                if self.exiting or self._is_restarting:
+            process = self._process
+            if (
+                process is not None
+                and not self._is_restarting
+                and not self._intentionally_stopped
+            ):
+                await asyncio.get_event_loop().run_in_executor(None, process.wait)
+                # 主动停机的进程退出不是崩溃：不得发布崩溃事件，也不得自动拉起
+                if self.exiting or self._is_restarting or self._intentionally_stopped:
                     continue
-                exit_code = self._process.poll()
+                # 等待期间句柄可能已被生命周期锁内的下一阶段替换，旧进程的退出不归本次监控处理
+                if self._process is not process:
+                    continue
+                exit_code = process.poll()
                 # 进程已经退出，其日志判定一并作废：否则抛出过执行异常的进程
                 # 会被同时记为崩溃与卡死，让同一次失败在降级阈值上被数两次
                 self._discard_log_watcher()

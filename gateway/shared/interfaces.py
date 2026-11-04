@@ -144,6 +144,16 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
+    def get_allow_idle_shutdown(self) -> Optional[bool]:
+        """查询用户是否授权空闲时停机下游；从未设置过时返回 None。"""
+        pass
+
+    @abstractmethod
+    def set_allow_idle_shutdown(self, allow: bool) -> None:
+        """持久化保存「空闲时允许下游停机」的授权勾选。"""
+        pass
+
+    @abstractmethod
     def get_estimation_state(self) -> Optional[EstimationState]:
         """获取预估时间状态，返回 None 表示无数据。"""
         pass
@@ -186,6 +196,16 @@ class DownstreamClient(ABC):
     @abstractmethod
     def restart(self) -> None:
         """重启下游服务。"""
+        pass
+
+    @abstractmethod
+    def stop(self) -> None:
+        """终止下游进程并保持停机，直到被冷启动唤醒。"""
+        pass
+
+    @abstractmethod
+    def start(self) -> None:
+        """冷启动下游进程（从停机状态拉起）。"""
         pass
 
     @abstractmethod
@@ -241,6 +261,15 @@ class SystemPowerController(ABC):
     @abstractmethod
     def allow_sleep(self) -> None:
         """恢复系统默认的休眠行为。"""
+        pass
+
+
+class MemorySampler(ABC):
+    """系统可用物理内存的采样接口。"""
+
+    @abstractmethod
+    def available_memory_mb(self) -> int:
+        """返回当前系统可用物理内存（MiB）。"""
         pass
 
 

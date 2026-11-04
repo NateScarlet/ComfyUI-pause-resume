@@ -23,6 +23,18 @@ class QueueState(Enum):
     IDLE = "idle"
 
 
+class DownstreamState(str, Enum):
+    """下游进程的生命周期状态（领域事实），供外部呈现与决策使用。
+
+    停机（SHUTDOWN）表示进程被主动终止且只能由活动唤醒，与启动/重启中的
+    未就绪（STARTING）是两个独立概念。
+    """
+
+    READY = "ready"
+    STARTING = "starting"
+    SHUTDOWN = "shutdown"
+
+
 class RawJSON(str):
     """标记一段已经是合法 JSON 的字符串，在序列化时直接嵌入而无需转义，降低转换开销。
 
@@ -47,6 +59,15 @@ class EstimationState:
     active: TimeBucket  # 当前有效窗口
     staging: TimeBucket  # 新数据收集缓冲区
     # 阶段由 active.count 推导：count < N 为初始阶段，count >= N 为轮换阶段
+
+
+@dataclass(frozen=True)
+class GatewayState:
+    """网关对外呈现的业务状态快照。"""
+
+    paused: bool
+    allow_idle_shutdown: bool
+    downstream_state: DownstreamState
 
 
 @dataclass(frozen=True)
