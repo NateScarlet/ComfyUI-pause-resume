@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -24,13 +25,20 @@ class ExternalProgramManagerTest(unittest.TestCase):
         idle_path: str = "prog_idle",
         busy_path: str = "prog_busy",
         pause_path: str = "prog_pause",
+        gateway_host: str = "127.0.0.1",
+        gateway_port: int = 8188,
     ) -> ExternalProgramManager:
-        return ExternalProgramManager(idle_path, busy_path, pause_path, None)
+        return ExternalProgramManager(
+            idle_path, busy_path, pause_path, gateway_host, gateway_port, None
+        )
 
     def _started_command(self) -> str:
         # Popen 的第一个位置参数是命令参数列表
         args = self.popen.call_args.args[0]
         return args[0]
+
+    def _started_env(self) -> dict[str, str]:
+        return self.popen.call_args.kwargs["env"]
 
     def test_paused_state_starts_pause_program(self):
         """队列暂停时启动暂停程序，且不受 ever_active 门控（#8 决策 D1）。"""
@@ -107,6 +115,70 @@ class ExternalProgramManagerTest(unittest.TestCase):
         self.popen.return_value = proc
         mgr.update_state(QueueState.BUSY, False)
         self.assertTrue(mgr.is_running())
+
+    def test_all_states_inject_gateway_url(self):
+        """空闲/繁忙/暂停三种状态启动的程序都应收到指向网关监听地址的 COMFYUI_URL。"""
+        for state, ever_active in (
+            (QueueState.IDLE, True),
+            (QueueState.BUSY, True),
+            (QueueState.PAUSED, False),
+        ):
+            with self.subTest(state=state):
+                self.popen.reset_mock()
+                mgr = self._manager()
+                mgr.update_state(state, ever_active)
+                self.popen.assert_called_once()
+                self.assertEqual(
+                    self._started_env()["COMFYUI_URL"], "http://127.0.0.1:8188"
+                )
+
+    def test_injected_port_is_used_in_url(self):
+        """URL 端口应使用注入的实际监听端口（组合根传入 --port 覆盖后的值）。"""
+        mgr = self._manager(gateway_port=9123)
+        mgr.update_state(QueueState.BUSY, False)
+        self.assertEqual(self._started_env()["COMFYUI_URL"], "http://127.0.0.1:9123")
+
+    def test_regular_listen_host_is_used_in_url(self):
+        """普通监听地址直接作为 URL 的 host。"""
+        mgr = self._manager(gateway_host="192.168.1.10")
+        mgr.update_state(QueueState.BUSY, False)
+        self.assertEqual(
+            self._started_env()["COMFYUI_URL"], "http://192.168.1.10:8188"
+        )
+
+    def test_wildcard_listen_host_falls_back_to_loopback(self):
+        """监听全部接口（0.0.0.0 / :: / 空）时回退为可连接的 127.0.0.1。"""
+        for host in ("0.0.0.0", "::", ""):
+            with self.subTest(host=host):
+                self.popen.reset_mock()
+                mgr = self._manager(gateway_host=host)
+                mgr.update_state(QueueState.BUSY, False)
+                self.assertEqual(
+                    self._started_env()["COMFYUI_URL"], "http://127.0.0.1:8188"
+                )
+
+    def test_ipv6_listen_host_is_bracketed(self):
+        """IPv6 字面量必须用方括号包裹，否则 URL 非法。"""
+        mgr = self._manager(gateway_host="::1")
+        mgr.update_state(QueueState.BUSY, False)
+        self.assertEqual(self._started_env()["COMFYUI_URL"], "http://[::1]:8188")
+
+    def test_existing_environment_url_is_overridden(self):
+        """外部环境已设置的 COMFYUI_URL 应被网关的真实监听地址覆盖。"""
+        with patch.dict(os.environ, {"COMFYUI_URL": "http://example.com:9999"}):
+            mgr = self._manager()
+            mgr.update_state(QueueState.BUSY, False)
+            self.assertEqual(
+                self._started_env()["COMFYUI_URL"], "http://127.0.0.1:8188"
+            )
+
+    def test_other_environment_variables_are_inherited(self):
+        """除 COMFYUI_URL 外，其余环境变量应原样传递给子进程。"""
+        with patch.dict(os.environ, {"COMFYUI_PROGRAM_TEST_MARKER": "marker-value"}):
+            mgr = self._manager()
+            mgr.update_state(QueueState.BUSY, False)
+            env = self._started_env()
+            self.assertEqual(env["COMFYUI_PROGRAM_TEST_MARKER"], "marker-value")
 
     def test_cleanup_kills_all_managed_processes(self):
         """cleanup 应终止所有受管进程。"""

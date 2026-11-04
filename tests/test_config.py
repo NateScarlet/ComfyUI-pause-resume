@@ -74,6 +74,16 @@ class GatewayConfigTest(unittest.TestCase):
             GatewayConfig()
 
     @patch("gateway.config.load_env", lambda path: None)
+    def test_proxy_address_from_extra_args(self):
+        """COMFYUI_EXTRA_ARGS 中的 --listen/--port 应覆盖网关实际监听地址与端口。"""
+        with patch.dict(
+            os.environ, {"COMFYUI_EXTRA_ARGS": "--listen 0.0.0.0 --port 9000"}
+        ):
+            config = GatewayConfig()
+        self.assertEqual(config.proxy_host, "0.0.0.0")
+        self.assertEqual(config.proxy_port, 9000)
+
+    @patch("gateway.config.load_env", lambda path: None)
     def test_stall_timeout_default(self):
         """未设置环境变量时，下游异常后的收尾超时默认 1800 秒。"""
         with patch.dict(os.environ, {}, clear=True):

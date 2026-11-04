@@ -63,9 +63,9 @@ start.cmd
 - `COMFYUI_STARTUP_WAIT_SEC`: 下游启动/重启期间，API 请求最多等待其就绪的秒数，超时才返回错误（默认 `600`）
 - `COMFYUI_IDLE_RESTART_SEC`: 队列空闲后强制重启服务的超时时间（秒，默认 `600`，设置为 0 则禁用）
 - `COMFYUI_STALL_TIMEOUT_SEC`: 下游抛出执行异常后，等待其自行收尾的最长时间（秒，必须为正整数，默认 `1800`），超时未收尾即判定下游卡死并按崩溃处理（重启下游 + 正在执行的任务重新入列）。纯长任务不会打印执行异常，因此不受该超时影响
-- `COMFYUI_IDLE_PROGRAM`: 空闲时启动的程序路径（例如矿工程序；仅在队列自然排空且未暂停时启动，有新任务或手动暂停时会自动停止）
-- `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在空闲或暂停时会自动停止）
-- `COMFYUI_PAUSE_PROGRAM`: 手动暂停期间启动的程序路径（例如把资源让给游戏或其他占用 GPU 的程序，恢复队列后自动停止）。设置为与 `COMFYUI_IDLE_PROGRAM` 相同的命令即可让闲置程序在暂停期间继续运行
+- `COMFYUI_IDLE_PROGRAM`: 空闲时启动的程序路径（例如矿工程序；仅在队列自然排空且未暂停时启动，有新任务或手动暂停时会自动停止）。启动时会注入指向网关监听地址的 `COMFYUI_URL` 环境变量，脚本可直接调用队列 API
+- `COMFYUI_BUSY_PROGRAM`: 繁忙时启动的程序路径（例如 GPU 监控或风扇控制程序，在空闲或暂停时会自动停止）。启动时会注入指向网关监听地址的 `COMFYUI_URL` 环境变量，脚本可直接调用队列 API
+- `COMFYUI_PAUSE_PROGRAM`: 手动暂停期间启动的程序路径（例如把资源让给游戏或其他占用 GPU 的程序，恢复队列后自动停止）。设置为与 `COMFYUI_IDLE_PROGRAM` 相同的命令即可让闲置程序在暂停期间继续运行。启动时会注入指向网关监听地址的 `COMFYUI_URL` 环境变量，脚本可直接调用队列 API
 - `COMFYUI_QUEUE_TYPE`: 队列实现类型，支持 `sqlite`（默认值，启用 WAL 模式，推荐）或 `json`（传统 JSONFile 队列实现）
 - `COMFYUI_QUEUE_COMPRESSION`: 队列大文本列的压缩档位（仅 `sqlite` 队列生效）。`auto`（默认）检测到可选包 `zstandard` 时使用字典档，缺失则退回标准库 zlib 并输出警告；`zstd` 强制使用字典档——若 `zstandard` 未安装将拒绝启动，避免一次性迁移把数据库锁死在基础档；`zlib` 即使安装了 `zstandard` 也始终使用基础档
 - `COMFYUI_QUEUE_ROTATION_INTERVAL`: 累计多少个新增/更新任务后训练下一代压缩字典（默认 `512`），值越大训练越少、跟随数据漂移越慢

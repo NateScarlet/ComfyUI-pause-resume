@@ -1,3 +1,4 @@
+import os
 import sys
 import shlex
 import subprocess
@@ -10,6 +11,19 @@ from gateway.shared.events import ScriptStateChangedEvent
 from gateway.shared.models import QueueState
 
 logger = logging.getLogger(__name__)
+
+
+def _gateway_base_url(host: str, port: int) -> str:
+    """把网关监听地址转换为外挂程序可连接的基础 URL。
+
+    通配地址（0.0.0.0 / ::）与空地址不能作为连接目标，回退到本机回环地址；
+    IPv6 字面量必须用方括号包裹，否则 URL 非法。
+    """
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    elif ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
 
 
 class ExternalProgramManager(ProcessManager):
@@ -25,6 +39,8 @@ class ExternalProgramManager(ProcessManager):
         idle_path: str,
         busy_path: str,
         pause_path: str,
+        gateway_host: str,
+        gateway_port: int,
         event_bus: Optional[EventBus] = None,
     ):
         # 各队列状态下应运行的程序命令（空表示该状态下不运行任何程序）
@@ -33,6 +49,8 @@ class ExternalProgramManager(ProcessManager):
             QueueState.BUSY: busy_path,
             QueueState.PAUSED: pause_path,
         }
+        # 外挂程序启动时注入的网关地址，由组合根从 GatewayConfig 注入实际监听地址
+        self._gateway_url = _gateway_base_url(gateway_host, gateway_port)
         self._event_bus = event_bus
         # 同一时刻至多只有一个受管进程，(所属队列状态, 进程) 元组直接表达该不变式
         self._process: Optional[tuple[QueueState, subprocess.Popen[Any]]] = None
@@ -119,7 +137,10 @@ class ExternalProgramManager(ProcessManager):
                 return None
             if is_win and args[0].lower().endswith((".bat", ".cmd")):
                 args = ["cmd", "/c"] + args
-            return subprocess.Popen(args, startupinfo=startupinfo)
+            # 复制当前环境并覆盖 COMFYUI_URL，让外挂脚本能直接调用网关队列 API
+            env = os.environ.copy()
+            env["COMFYUI_URL"] = self._gateway_url
+            return subprocess.Popen(args, startupinfo=startupinfo, env=env)
         except (OSError, ValueError) as e:
             logger.error(f"Failed to start program '{cmd_str}': {e}")
             return None

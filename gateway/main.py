@@ -84,9 +84,14 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     event_bus = InMemoryEventBus(loop)
 
-    # 5. 实例化外部程序管理器
+    # 5. 实例化外部程序管理器（注入网关实际监听地址供外挂程序回调队列 API）
     process_manager = ExternalProgramManager(
-        config.idle_program, config.busy_program, config.pause_program, event_bus
+        idle_path=config.idle_program,
+        busy_path=config.busy_program,
+        pause_path=config.pause_program,
+        gateway_host=config.proxy_host,
+        gateway_port=config.proxy_port,
+        event_bus=event_bus,
     )
 
     downstream_service = ComfyUIDownstreamClient(
