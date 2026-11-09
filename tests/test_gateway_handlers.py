@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import unittest
 from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +20,7 @@ from gateway.shared.events import (
     StatusChangedEvent,
 )
 from gateway.shared.interfaces import DownstreamClient
-from gateway.shared.models import DownstreamState, GatewayState
+from gateway.shared.models import DownstreamState, GatewayState, JobFilters, JobStatus
 
 
 class _SyncEventBus:
@@ -188,6 +189,28 @@ class _FailingClientSession:
 
     async def ws_connect(self, url):
         raise aiohttp.ClientError("downstream unavailable")
+
+
+class _FakeSseResponse:
+    """测试用假 StreamResponse：记录 SSE 写入的分块内容。"""
+
+    def __init__(self) -> None:
+        self.chunks: list[str] = []
+
+    async def prepare(self, request):
+        return self
+
+    async def write(self, data: bytes) -> None:
+        self.chunks.append(data.decode("utf-8"))
+
+    def frames(self) -> list:
+        """解析所有已写入的 data 帧。"""
+        frames = []
+        for chunk in self.chunks:
+            for block in chunk.split("\n\n"):
+                if block.startswith("data: "):
+                    frames.append(json.loads(block.removeprefix("data: ")))
+        return frames
 
 
 class TestGatewayHandlersProxyReadiness(unittest.TestCase):
@@ -650,6 +673,157 @@ class TestGatewayHandlersWsProxyLifecycle(unittest.TestCase):
             self.assertEqual(resp.status, 503)
             ws_response.assert_not_called()
             self.assertEqual(handlers.ws_clients, set())
+
+        asyncio.run(scenario())
+
+
+class TestGatewayHandlersSse(unittest.TestCase):
+    """测试 /sse 推送暂停状态与队列长度（#19）。"""
+
+    def _make_handlers(self, paused: bool = False, queue_remaining: int = 0):
+        app = MagicMock()
+        app.get_state.handle = MagicMock(
+            return_value=GatewayState(
+                paused=paused,
+                allow_idle_shutdown=False,
+                downstream_state=DownstreamState.READY,
+            )
+        )
+        app.get_job_count.handle = AsyncMock(return_value=queue_remaining)
+        bus = _SyncEventBus()
+        handlers = GatewayHandlers(
+            app=app,
+            downstream_service=MagicMock(spec=DownstreamClient),
+            queue_reader=MagicMock(),
+            event_bus=bus,
+            startup_wait_sec=0.05,
+        )
+        return handlers, app, bus
+
+    async def _connect(self, handlers):
+        """建立 SSE 连接，等待初始帧写入后返回任务、响应与帧列表。"""
+        req = make_mocked_request("GET", "/sse")
+        response = _FakeSseResponse()
+        with patch(
+            "gateway.presentation.handlers.web.StreamResponse",
+            return_value=response,
+        ):
+            task = asyncio.create_task(handlers.handle_sse(req))
+            frames = await self._wait_for_frames(response, 1)
+        return task, response, frames
+
+    async def _wait_for_frames(self, response: _FakeSseResponse, count: int) -> list:
+        """轮询等待至少 count 条 data 帧，避免依赖固定睡眠时长。"""
+        for _ in range(200):
+            frames = response.frames()
+            if len(frames) >= count:
+                return frames
+            await asyncio.sleep(0.005)
+        raise AssertionError(
+            f"等待 SSE 帧超时，期望 {count} 帧，实际 {response.frames()}"
+        )
+
+    async def _disconnect(self, task: asyncio.Task) -> None:
+        """取消并收敛 SSE 处理任务。"""
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    def test_initial_frame_carries_paused_and_queue_remaining(self):
+        """新连接立即收到暂停状态与当前 pending + running 计数的完整快照（#19）。"""
+
+        async def scenario() -> None:
+            handlers, app, _ = self._make_handlers(paused=True, queue_remaining=3)
+            task, response, frames = await self._connect(handlers)
+            try:
+                self.assertEqual(frames[0], {"paused": True, "queue_remaining": 3})
+                self.assertEqual(response.chunks[0], "retry: 3000\n\n")
+                # 初始快照只查询一次队列计数
+                app.get_job_count.handle.assert_awaited_once_with(
+                    filter_by=JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
+                )
+            finally:
+                await self._disconnect(task)
+
+        asyncio.run(scenario())
+
+    def test_queue_change_pushes_latest_count_without_extra_query(self):
+        """队列变化直接复用事件计数推送，不额外查询队列（#19）。"""
+
+        async def scenario() -> None:
+            handlers, app, bus = self._make_handlers(queue_remaining=2)
+            task, response, _ = await self._connect(handlers)
+            try:
+                bus.publish(StatusChangedEvent(queue_remaining=7))
+                frames = await self._wait_for_frames(response, 2)
+                self.assertEqual(frames[1], {"paused": False, "queue_remaining": 7})
+                app.get_job_count.handle.assert_awaited_once()
+            finally:
+                await self._disconnect(task)
+
+        asyncio.run(scenario())
+
+    def test_pause_change_pushes_latest_count_from_snapshot(self):
+        """暂停变化使用最近一次计数推送，连接快照已先更新该缓存（#19）。"""
+
+        async def scenario() -> None:
+            handlers, _, bus = self._make_handlers(paused=False, queue_remaining=4)
+            task, response, _ = await self._connect(handlers)
+            try:
+                bus.publish(StateChangedEvent(paused=True))
+                frames = await self._wait_for_frames(response, 2)
+                self.assertEqual(frames[1], {"paused": True, "queue_remaining": 4})
+            finally:
+                await self._disconnect(task)
+
+        asyncio.run(scenario())
+
+    def test_legacy_client_reading_only_paused_still_works(self):
+        """只读 paused 的旧客户端行为不变：帧仍是 JSON 对象且 paused 语义不变（#19）。"""
+
+        async def scenario() -> None:
+            handlers, _, bus = self._make_handlers(paused=False, queue_remaining=1)
+            task, response, _ = await self._connect(handlers)
+            try:
+                bus.publish(StateChangedEvent(paused=True))
+                frames = await self._wait_for_frames(response, 2)
+                # 旧客户端只读取 paused 字段，忽略新增字段
+                legacy_values = [frame["paused"] for frame in frames]
+                self.assertEqual(legacy_values, [False, True])
+            finally:
+                await self._disconnect(task)
+
+        asyncio.run(scenario())
+
+    def test_status_event_from_worker_thread_is_delivered(self):
+        """非事件循环线程发布的事件也必须安全投递给 SSE 客户端（#19）。"""
+
+        async def scenario() -> None:
+            handlers, _, bus = self._make_handlers(queue_remaining=1)
+            task, response, _ = await self._connect(handlers)
+            try:
+                worker = threading.Thread(
+                    target=bus.publish,
+                    args=(StatusChangedEvent(queue_remaining=6),),
+                )
+                worker.start()
+                worker.join()
+                frames = await self._wait_for_frames(response, 2)
+                self.assertEqual(frames[1], {"paused": False, "queue_remaining": 6})
+            finally:
+                await self._disconnect(task)
+
+        asyncio.run(scenario())
+
+    def test_events_without_connections_do_not_query_queue(self):
+        """尚无 SSE 连接时收到事件不得报错，也不得额外查询队列（#19）。"""
+
+        async def scenario() -> None:
+            handlers, app, bus = self._make_handlers()
+            bus.publish(StatusChangedEvent(queue_remaining=5))
+            bus.publish(StateChangedEvent(paused=True))
+            app.get_job_count.handle.assert_not_awaited()
+            self.assertEqual(handlers.sse_clients, set())
 
         asyncio.run(scenario())
 

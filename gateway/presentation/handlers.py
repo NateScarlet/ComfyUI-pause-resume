@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 import aiohttp
 from aiohttp import web
-from typing import List, Set, Union, cast, Dict, Any
+from typing import List, Optional, Set, Union, cast, Dict, Any
 
 from gateway.shared.utils import raw_json_dumps
 from gateway.shared.interfaces import (
@@ -54,12 +54,21 @@ class GatewayHandlers:
         self.sse_clients: Set[asyncio.Queue[str]] = set()
         self.ws_clients: Set[web.WebSocketResponse] = set()
 
+        # SSE 广播的最近状态缓存：连接快照会先更新，后续增量推送复用
+        self._sse_paused: bool = False
+        self._sse_queue_remaining: int = 0
+        # SSE 客户端所在事件循环；未建立连接时为 None，此时无需广播
+        self._sse_loop: Optional[asyncio.AbstractEventLoop] = None
+
         # 通过订阅 EventBus 事件来处理 WS 和 SSE 广播
         self._unsub_status = self._event_bus.subscribe(
             StatusChangedEvent, self._on_ws_broadcast_triggered
         )
+        self._unsub_sse_status = self._event_bus.subscribe(
+            StatusChangedEvent, self._on_sse_queue_changed
+        )
         self._unsub_state = self._event_bus.subscribe(
-            StateChangedEvent, lambda ev: self._on_sse_broadcast_triggered(ev.paused)
+            StateChangedEvent, self._on_sse_pause_changed
         )
 
         # WS 广播防抖控制变量
@@ -111,9 +120,35 @@ class GatewayHandlers:
         except RuntimeError:
             pass
 
-    def _on_sse_broadcast_triggered(self, paused: bool) -> None:
-        """应用层通知：广播暂停状态给 SSE 客户端。"""
-        data = json.dumps({"paused": paused})
+    def _on_sse_pause_changed(self, ev: StateChangedEvent) -> None:
+        """应用层通知：暂停状态变化，用最近一次计数推送 SSE 帧。"""
+        self._sse_paused = ev.paused
+        self._broadcast_sse_frame()
+
+    def _on_sse_queue_changed(self, ev: StatusChangedEvent) -> None:
+        """应用层通知：队列计数变化，直接复用事件中的计数推送 SSE 帧。"""
+        self._sse_queue_remaining = ev.queue_remaining
+        self._broadcast_sse_frame()
+
+    def _broadcast_sse_frame(self) -> None:
+        """把当前状态快照入队到所有 SSE 客户端。
+
+        事件可能来自任意线程，通过事件循环线程安全地投递，避免跨线程操作 asyncio.Queue。
+        """
+        loop = self._sse_loop
+        if loop is None:
+            return
+        data = json.dumps(
+            {"paused": self._sse_paused, "queue_remaining": self._sse_queue_remaining}
+        )
+        try:
+            loop.call_soon_threadsafe(self._enqueue_sse_data, data)
+        except RuntimeError:
+            # 事件循环已关闭（进程退出中），此时不存在可投递的客户端
+            pass
+
+    def _enqueue_sse_data(self, data: str) -> None:
+        """在事件循环线程中把数据帧投递给每个 SSE 客户端。"""
         for q in list(self.sse_clients):
             try:
                 q.put_nowait(data)
@@ -162,7 +197,7 @@ class GatewayHandlers:
         )
 
     async def handle_sse(self, request: web.Request) -> web.StreamResponse:
-        """建立 SSE 连接推送暂停状态。"""
+        """建立 SSE 连接推送暂停状态与队列长度。"""
         response = web.StreamResponse(
             status=200,
             reason="OK",
@@ -175,11 +210,20 @@ class GatewayHandlers:
         await response.prepare(request)
 
         q: asyncio.Queue[str] = asyncio.Queue()
+        state = self._app.get_state.handle()
+        queue_remaining = await self._app.get_job_count.handle(
+            filter_by=JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
+        )
+        # 连接快照同时作为后续增量推送的计数基线
+        self._sse_loop = asyncio.get_running_loop()
+        self._sse_paused = state.paused
+        self._sse_queue_remaining = queue_remaining
         self.sse_clients.add(q)
         try:
             await response.write(b"retry: 3000\n\n")
-            state = self._app.get_state.handle()
-            initial_data = json.dumps({"paused": state.paused})
+            initial_data = json.dumps(
+                {"paused": state.paused, "queue_remaining": queue_remaining}
+            )
             await response.write(f"data: {initial_data}\n\n".encode("utf-8"))
 
             while True:
@@ -747,10 +791,9 @@ class GatewayHandlers:
 
     def shutdown(self) -> None:
         """关闭所有订阅及 SSE 和 WS 连接。"""
-        if hasattr(self, "_unsub_status"):
-            self._unsub_status()
-        if hasattr(self, "_unsub_state"):
-            self._unsub_state()
+        self._unsub_status()
+        self._unsub_sse_status()
+        self._unsub_state()
 
         for q in list(self.sse_clients):
             try:
