@@ -185,6 +185,15 @@ class GatewayHandlers:
         self._app.resume_queue.handle()
         return web.json_response({"status": "ok", "paused": False})
 
+    async def handle_restart(self, request: web.Request) -> web.Response:
+        """立即强制重启下游接口。
+
+        与托盘「立即重启下游」语义一致：正在执行的任务按中断重新入列。
+        不改变暂停状态，也不等待下游就绪，发起重启后立即返回。
+        """
+        self._app.restart_downstream.handle()
+        return web.json_response({"status": "ok", "restarting": True})
+
     async def handle_state(self, request: web.Request) -> web.Response:
         """查询网关状态接口。"""
         state = self._app.get_state.handle()

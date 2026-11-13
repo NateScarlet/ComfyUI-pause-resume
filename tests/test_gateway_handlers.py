@@ -501,6 +501,7 @@ class TestGatewayHandlersActivity(unittest.TestCase):
 
             await handlers.handle_pause(make_mocked_request("POST", "/pause"))
             await handlers.handle_resume(req)
+            await handlers.handle_restart(req)
             self.assertEqual((await handlers.handle_state(req)).status, 200)
 
             sse_task = asyncio.create_task(handlers.handle_sse(req))
@@ -673,6 +674,50 @@ class TestGatewayHandlersWsProxyLifecycle(unittest.TestCase):
             self.assertEqual(resp.status, 503)
             ws_response.assert_not_called()
             self.assertEqual(handlers.ws_clients, set())
+
+        asyncio.run(scenario())
+
+
+class TestGatewayHandlersRestart(unittest.TestCase):
+    """测试 /restart 端点把已有的强制重启暴露给外部程序（#20）。"""
+
+    def _make_handlers(self):
+        app = MagicMock()
+        handlers = GatewayHandlers(
+            app=app,
+            downstream_service=MagicMock(spec=DownstreamClient),
+            queue_reader=MagicMock(),
+            event_bus=_SyncEventBus(),
+            startup_wait_sec=0.05,
+        )
+        return handlers, app
+
+    def test_restart_endpoint_issues_force_restart(self):
+        """调用端点即执行一次强制重启，并立即返回已发起的成功响应（#20）。"""
+
+        async def scenario() -> None:
+            handlers, app = self._make_handlers()
+            resp = await handlers.handle_restart(
+                make_mocked_request("POST", "/restart")
+            )
+
+            app.restart_downstream.handle.assert_called_once_with()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(
+                json.loads(resp.text), {"status": "ok", "restarting": True}
+            )
+
+        asyncio.run(scenario())
+
+    def test_restart_endpoint_does_not_change_pause_state(self):
+        """端点只做重启，不得顺带暂停或恢复队列（#20）。"""
+
+        async def scenario() -> None:
+            handlers, app = self._make_handlers()
+            await handlers.handle_restart(make_mocked_request("POST", "/restart"))
+
+            app.pause_queue.handle.assert_not_called()
+            app.resume_queue.handle.assert_not_called()
 
         asyncio.run(scenario())
 

@@ -10,6 +10,9 @@ def setup_routes(app: web.Application, handlers: GatewayHandlers) -> None:
     app.router.add_post(
         "/io.github.natescarlet.pause-resume/resume", handlers.handle_resume
     )
+    app.router.add_post(
+        "/io.github.natescarlet.pause-resume/restart", handlers.handle_restart
+    )
     app.router.add_get(
         "/io.github.natescarlet.pause-resume/state", handlers.handle_state
     )
