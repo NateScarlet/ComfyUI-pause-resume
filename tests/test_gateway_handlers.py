@@ -873,5 +873,226 @@ class TestGatewayHandlersSse(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class _FailingWriteSseResponse(_FakeSseResponse):
+    """测试用假 StreamResponse：从第 fail_at 次（1 起算）写入起抛连接重置。"""
+
+    def __init__(self, fail_at: int) -> None:
+        super().__init__()
+        self._fail_at = fail_at
+
+    async def write(self, data: bytes) -> None:
+        if len(self.chunks) + 1 >= self._fail_at:
+            raise ConnectionResetError("client disconnected")
+        await super().write(data)
+
+
+class TestGatewayHandlersSseKeepalive(unittest.TestCase):
+    """SSE 空闲保活：真实连接验证注释帧与状态帧的时序（#21）。"""
+
+    def _make_handlers(
+        self,
+        keepalive_sec: float,
+        paused: bool = False,
+        queue_remaining: int = 0,
+    ):
+        app = MagicMock()
+        app.get_state.handle = MagicMock(
+            return_value=GatewayState(
+                paused=paused,
+                allow_idle_shutdown=False,
+                downstream_state=DownstreamState.READY,
+            )
+        )
+        app.get_job_count.handle = AsyncMock(return_value=queue_remaining)
+        bus = _SyncEventBus()
+        handlers = GatewayHandlers(
+            app=app,
+            downstream_service=MagicMock(spec=DownstreamClient),
+            queue_reader=MagicMock(),
+            event_bus=bus,
+            startup_wait_sec=0.05,
+            sse_keepalive_sec=keepalive_sec,
+        )
+        return handlers, bus
+
+    @staticmethod
+    async def _start_server(handlers: GatewayHandlers):
+        """用真实 aiohttp 服务承载 SSE 处理入口，返回 runner 与访问 URL。"""
+        app = web.Application()
+        app.router.add_get("/sse", handlers.handle_sse)
+        runner = web.AppRunner(app, shutdown_timeout=1)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        host, port = runner.addresses[0][:2]
+        return runner, f"http://{host}:{port}/sse"
+
+    @staticmethod
+    async def _read_frame(content: aiohttp.StreamReader, timeout: float) -> bytes:
+        """读取一个完整的 SSE 帧（含结尾空行）。"""
+        return await asyncio.wait_for(content.readuntil(b"\n\n"), timeout)
+
+    async def _wait_for_chunks(self, response: _FakeSseResponse, count: int) -> None:
+        """轮询等待假响应累计写入至少 count 个分块，避免依赖固定睡眠时长。"""
+        for _ in range(200):
+            if len(response.chunks) >= count:
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError(f"等待 SSE 分块超时，期望 {count} 个，实际 {response.chunks}")
+
+    async def _wait_for_frames(self, response: _FakeSseResponse, count: int) -> list:
+        """轮询等待假响应至少 count 条 data 帧。"""
+        for _ in range(200):
+            frames = response.frames()
+            if len(frames) >= count:
+                return frames
+            await asyncio.sleep(0.005)
+        raise AssertionError(
+            f"等待 SSE 帧超时，期望 {count} 帧，实际 {response.frames()}"
+        )
+
+    def test_idle_connection_receives_comment_frame(self):
+        """空闲连接在 1.5 倍保活间隔内至少收到一个以冒号开头的注释帧（#21）。"""
+
+        async def scenario() -> None:
+            handlers, _ = self._make_handlers(keepalive_sec=0.05)
+            runner, url = await self._start_server(handlers)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(
+                            await self._read_frame(resp.content, 1), b"retry: 3000\n\n"
+                        )
+                        snapshot = await self._read_frame(resp.content, 1)
+                        self.assertTrue(snapshot.startswith(b"data: "))
+                        ping = await self._read_frame(resp.content, 0.075)
+                        self.assertEqual(ping, b": ping\n\n")
+            finally:
+                handlers.shutdown()
+                await runner.cleanup()
+
+        asyncio.run(scenario())
+
+    def test_each_interval_writes_one_comment_frame_without_data(self):
+        """无事件时连续 3 个间隔各写入一个注释帧，且这些帧不产生 data 块（#21）。"""
+
+        async def scenario() -> None:
+            handlers, _ = self._make_handlers(keepalive_sec=0.05)
+            runner, url = await self._start_server(handlers)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        await self._read_frame(resp.content, 1)  # retry
+                        await self._read_frame(resp.content, 1)  # 初始快照
+                        frames = [
+                            await self._read_frame(resp.content, 0.075)
+                            for _ in range(3)
+                        ]
+                        self.assertEqual(frames, [b": ping\n\n"] * 3)
+                        self.assertNotIn(b"data:", b"".join(frames))
+            finally:
+                handlers.shutdown()
+                await runner.cleanup()
+
+        asyncio.run(scenario())
+
+    def test_state_change_is_pushed_before_next_keepalive(self):
+        """有状态变化时优先推送 data 帧，不被保活推迟，JSON 形状与现状一致（#21）。"""
+
+        async def scenario() -> None:
+            handlers, bus = self._make_handlers(keepalive_sec=0.5, queue_remaining=2)
+            runner, url = await self._start_server(handlers)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        await self._read_frame(resp.content, 1)  # retry
+                        snapshot = json.loads(
+                            (await self._read_frame(resp.content, 1)).removeprefix(
+                                b"data: "
+                            )
+                        )
+                        self.assertEqual(
+                            snapshot, {"paused": False, "queue_remaining": 2}
+                        )
+
+                        loop = asyncio.get_running_loop()
+                        started = loop.time()
+                        bus.publish(StatusChangedEvent(queue_remaining=7))
+                        frame = await self._read_frame(resp.content, 0.5)
+                        elapsed = loop.time() - started
+
+                        self.assertTrue(frame.startswith(b"data: "))
+                        self.assertEqual(
+                            json.loads(frame.removeprefix(b"data: ").strip()),
+                            {"paused": False, "queue_remaining": 7},
+                        )
+                        # 状态帧必须在下一个保活间隔到点之前写出
+                        self.assertLess(elapsed, 0.5)
+            finally:
+                handlers.shutdown()
+                await runner.cleanup()
+
+        asyncio.run(scenario())
+
+    def test_event_after_keepalive_is_delivered_exactly_once(self):
+        """保活超时打断等待后入队的事件仍被推送一次，不丢失也不重复（#21）。"""
+
+        async def scenario() -> None:
+            handlers, bus = self._make_handlers(keepalive_sec=0.02, queue_remaining=1)
+            response = _FakeSseResponse()
+            with patch(
+                "gateway.presentation.handlers.web.StreamResponse",
+                return_value=response,
+            ):
+                task = asyncio.create_task(
+                    handlers.handle_sse(make_mocked_request("GET", "/sse"))
+                )
+                try:
+                    # retry + 初始快照 + 至少一个保活帧
+                    await self._wait_for_chunks(response, 3)
+                    bus.publish(StatusChangedEvent(queue_remaining=9))
+                    await self._wait_for_frames(response, 2)
+                    # 再跨越若干个保活间隔，确认没有重复投递
+                    await asyncio.sleep(0.1)
+                finally:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+
+            self.assertEqual(
+                response.frames()[1:], [{"paused": False, "queue_remaining": 9}]
+            )
+
+        asyncio.run(scenario())
+
+    def test_keepalive_write_failure_ends_connection_and_cleans_up(self):
+        """保活写入失败时结束该连接，并把它从活跃客户端集合中移除（#21）。"""
+
+        async def scenario() -> None:
+            handlers, _ = self._make_handlers(keepalive_sec=0.02)
+            response = _FailingWriteSseResponse(fail_at=3)
+            with patch(
+                "gateway.presentation.handlers.web.StreamResponse",
+                return_value=response,
+            ):
+                task = asyncio.create_task(
+                    handlers.handle_sse(make_mocked_request("GET", "/sse"))
+                )
+                await asyncio.wait_for(task, timeout=1)
+
+            # retry 与初始快照已写出，第 3 次写入（保活帧）失败
+            self.assertEqual(len(response.chunks), 2)
+            self.assertEqual(handlers.sse_clients, set())
+
+        asyncio.run(scenario())
+
+    def test_non_positive_keepalive_interval_is_rejected(self):
+        """保活间隔为非正数会导致等待立即超时并空转，构造时必须拒绝（#21）。"""
+
+        with self.assertRaises(ValueError):
+            self._make_handlers(keepalive_sec=0)
+
+
 if __name__ == "__main__":
     unittest.main()

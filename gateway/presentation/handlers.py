@@ -29,6 +29,11 @@ _LOADING_HTML = (_STATIC_DIR / "loading.html").read_text(encoding="utf-8")
 _EXT_EXTENSION_JS = (_STATIC_DIR / "index.js").read_text(encoding="utf-8")
 _EXT_JS_URL = "/extensions/io.github.natescarlet.pause-resume/index.js"
 
+# 默认 SSE 保活间隔：给 60s 级的反向代理空闲阈值留出余量
+_DEFAULT_SSE_KEEPALIVE_SEC = 25.0
+# SSE 注释帧：以冒号开头，客户端按协议忽略，不会触发 message 事件
+_SSE_KEEPALIVE_FRAME = b": ping\n\n"
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +47,7 @@ class GatewayHandlers:
         queue_reader: JobQueueReader,
         event_bus: EventBus,
         startup_wait_sec: float,
+        sse_keepalive_sec: float = _DEFAULT_SSE_KEEPALIVE_SEC,
     ):
         self._app = app
         self._downstream_service = downstream_service
@@ -49,6 +55,12 @@ class GatewayHandlers:
         self._event_bus = event_bus
         # 下游未就绪时，代理 API 请求等待其就绪的最长秒数
         self._startup_wait_sec = startup_wait_sec
+        # SSE 连接空闲多久写一次保活注释帧；0 或负值会让等待立即超时并空转
+        if sse_keepalive_sec <= 0:
+            raise ValueError(
+                f"sse_keepalive_sec 必须为正数，实际为 {sse_keepalive_sec}"
+            )
+        self._sse_keepalive_sec = sse_keepalive_sec
 
         # 维护活跃的连接句柄
         self.sse_clients: Set[asyncio.Queue[str]] = set()
@@ -236,7 +248,13 @@ class GatewayHandlers:
             await response.write(f"data: {initial_data}\n\n".encode("utf-8"))
 
             while True:
-                data = await q.get()
+                try:
+                    # 空闲超过保活间隔时写注释帧，避免客户端与代理按空闲断流
+                    async with asyncio.timeout(self._sse_keepalive_sec):
+                        data = await q.get()
+                except TimeoutError:
+                    await response.write(_SSE_KEEPALIVE_FRAME)
+                    continue
                 if data == "shutdown":
                     q.task_done()
                     break
