@@ -17,6 +17,7 @@ const _str = (function () {
     cmdResume: _locale === "zh" ? "恢复队列" : "Resume Queue",
     cmdPauseRestart:
       _locale === "zh" ? "暂停并重启" : "Pause and Restart",
+    cmdRestart: _locale === "zh" ? "立即重启下游" : "Restart Downstream Now",
   };
   return function (key) {
     return t[key] || key;
@@ -45,6 +46,10 @@ const api = {
 
   resume() {
     return this._post("resume");
+  },
+
+  restart() {
+    return this._post("restart");
   },
 };
 
@@ -98,6 +103,11 @@ comfyApp.registerExtension({
       id: `${EXT_NAMESPACE}.pause_and_restart`,
       label: _str("cmdPauseRestart"),
       function: () => api.pause(true),
+    },
+    {
+      id: `${EXT_NAMESPACE}.restart`,
+      label: _str("cmdRestart"),
+      function: () => api.restart(),
     },
   ],
 

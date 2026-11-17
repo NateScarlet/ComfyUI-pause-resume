@@ -247,14 +247,18 @@ class SystemTrayController:
     def _should_restart_now(self) -> bool:
         """重启项当前是否应表示「立即重启下游」。
 
-        两种情况：已经点过一次进入等待重启，或队列已暂停且下游没有任务在执行。
-        「暂停后仍有任务执行」的过渡态不算暂停完成，仍按「暂停后重启下游」处理，
+        两种情况：已经点过一次进入等待重启，或队列已排空且没有任务在执行。
+        队列排空时「空闲后重启」已是空操作，不论是否暂停都应直接强制重启。
+        「仍有任务执行」的过渡态不算空闲，仍按「暂停后重启下游」处理，
         因此复用 _is_stopping 判定，避免文案与点击动作各自推断导致分叉。
         """
         if self._restart_pending:
             return True
-        # 暂停已完成（下游不再有任务执行）时，重启项直接表示强制重启
-        return self._paused and not self._is_stopping()
+        if self._is_stopping():
+            return False
+        # 队列排空（PENDING/RUNNING 均为 0）时不再有「空闲」边沿可用，
+        # 重启项直接表示强制重启，与是否暂停无关
+        return self._queue_count <= 0
 
     def _get_state_color(self) -> str:
         """获取当前状态对应的颜色代码。"""
@@ -463,11 +467,12 @@ class SystemTrayController:
     def _on_restart(self) -> None:
         """重启下游 ComfyUI 服务。
 
-        队列已暂停且下游空闲，或已点过一次进入等待重启：立即强制重启，正在执行的任务会被中断并重新入列。
-        否则：暂停队列（带 restart_after_idle 标志），等待当前任务完成后自动重启。
+        队列已排空且无任务执行，或已点过一次进入等待重启：立即强制重启，正在执行的
+        任务会被中断并重新入列。否则：暂停队列（带 restart_after_idle 标志），
+        等待当前任务完成后由「非空闲→空闲」边沿触发自动重启。
         """
         if self._should_restart_now():
-            # 已处于等待重启或队列本就已暂停，立即强制重启
+            # 已处于等待重启、队列已排空或暂停已完成，立即强制重启
             self._restart_pending = False
             self._loop.call_soon_threadsafe(self._app_facade.restart_downstream.handle)
             logger.info("🔄 Restarting downstream immediately via tray")

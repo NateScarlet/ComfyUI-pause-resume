@@ -98,10 +98,13 @@ class Gateway:
         self._low_memory_samples = 0
         self._cancel_memory_sample: Optional[Callable[[], None]] = None
 
-        # _ever_active 指的是下游在当前运行生命周期内是否曾经收到或执行过任务（即决定是否占用了显存/系统资源）。
-        # 当下游发生重启（包括空闲超时重启、被动崩溃重启）时，代表下游进程返回干净的初始状态，
-        # 此时该标志必须被重置为 False，直到下游下一次真正开始执行任务时才置为 True。
+        # 两个标志承载不同语义，不可合并：
+        # _ever_active 是网关启动以来「下游是否曾执行过任务」的粘滞门控，仅用于 idle program 启停，
+        #   下游重启/停机/崩溃时不得复位，否则暂停恢复后队列排空将无法重新启动 idle program。
+        # _allow_restart 是当前运行生命周期内是否执行过任务，重启/停机/崩溃时复位，
+        #   驱动空闲重启决策与崩溃完成判定，避免无任务的下游在每个空闲窗口循环重启。
         self._ever_active = ever_active
+        self._allow_restart = ever_active
 
         self._crash_skip = crash_skip_policy or CrashSkipPolicy()
 
@@ -252,7 +255,7 @@ class Gateway:
         必须在 _refresh 之前同步翻转就绪标志，否则重启期间 _refresh 仍按旧的就绪状态
         允许系统休眠，可能被系统闲置休眠打断重启流程。后续下游就绪事件到达时会再次更新该标志。
         """
-        self._ever_active = False
+        self._allow_restart = False
         self._downstream_ready = False
         self._downstream_shutdown = False
         self._downstream.restart()
@@ -260,7 +263,8 @@ class Gateway:
     def _request_downstream_shutdown(self) -> None:
         """发起下游停机：终止进程并保持停机，直到有活动将其唤醒。"""
         logger.info("💤 Idle shutdown: terminating downstream to release memory")
-        self._ever_active = False
+        # 粘滞门控保留，仅复位生命周期标志，使后续唤醒成为一个全新的生命周期
+        self._allow_restart = False
         self._downstream_ready = False
         self._downstream_shutdown = True
         self._downstream.stop()
@@ -291,9 +295,13 @@ class Gateway:
         )
 
     def _restart_wanted(self) -> bool:
-        """判定当前是否存在需要被空闲窗口约束的下游重启决策。"""
-        return self._restart_after_idle_on_pause or (
-            self._idle_restart_timeout > 0 and self._ever_active
+        """判定当前是否存在需要被空闲窗口约束的下游重启决策。
+
+        无论显式「暂停后重启」还是空闲超时重启，都必须以当前生命周期执行过任务为前提，
+        否则从未跑过任务的下游会在每个空闲窗口被反复重启。
+        """
+        return self._allow_restart and (
+            self._restart_after_idle_on_pause or self._idle_restart_timeout > 0
         )
 
     def _idle_remaining(self) -> float:
@@ -344,8 +352,9 @@ class Gateway:
         self._cancel_idle_timeout = None
         if not self._idle_window_needed():
             return
-        # 显式的「暂停后重启」是用户的直接指令，优先于空闲停机
-        explicit_restart = self._restart_after_idle_on_pause
+        # 显式的「暂停后重启」是用户的直接指令，但仅在本生命周期执行过任务时
+        # 才优先于空闲停机，避免无任务的显式指令绕过停机判定
+        explicit_restart = self._restart_after_idle_on_pause and self._allow_restart
         # 决策已消费，避免下游重新就绪进入空闲后重复重启
         self._restart_after_idle_on_pause = False
         if not explicit_restart and self._should_shutdown_downstream():
@@ -445,15 +454,14 @@ class Gateway:
         """上报一次活动，把空闲窗口起点推迟到此刻并重新驱动重启评估。
 
         活动是空闲判定的第三个输入：它既不改变是否阻止系统休眠的判定，也不影响
-        _ever_active（后者只表示下游是否执行过任务），只保证窗口内仍在发生活动时
-        不会触发下游重启。窗口到期本身即是评估时机，因此活动之后无需依赖任何队列或
-        下游事件来推进重启。
+        _ever_active / _allow_restart（后者只表示下游是否执行过任务），只保证窗口内
+        仍在发生活动时不会触发下游重启。窗口到期本身即是评估时机，因此活动之后无需
+        依赖任何队列或下游事件来推进重启。
 
-        活动只推迟已经挂起的重启决策，不会凭空安排本不打算发生的重启。
+        活动只推迟已经排程的空闲窗口，不会因「暂停后重启」标志凭空安排本不打算发生的
+        重启——该标志只在「非空闲→空闲」的边沿被消费。
         """
-        had_pending = (
-            self._cancel_idle_timeout is not None or self._restart_after_idle_on_pause
-        )
+        had_pending = self._cancel_idle_timeout is not None
         self._idle_window_end = self._timer.now + self._idle_restart_timeout
         if had_pending:
             self._arm_idle_restart()
@@ -472,11 +480,9 @@ class Gateway:
         self._event_bus.publish(StateChangedEvent(paused=True))
         self._refresh()
 
-        # 如果此时系统已处于空闲状态，_refresh 不会触发 _on_idle_entered 转换，
-        # 因此需要在此处直接处理空闲立即重启逻辑
-        if restart_after_idle and self._is_idle and self._restart_after_idle_on_pause:
-            self._restart_after_idle_or_wait()
-            self._refresh()
+        # 「空闲后重启」是边沿触发的：已处于空闲时设置该标志不产生任何重启，
+        # 只有后续「非空闲→空闲」的转换才会由 _on_idle_entered 消费它。
+        # 恢复队列时该标志会被清除，因此这里无需针对已空闲状态做特殊处理。
 
     def resume(self) -> None:
         """恢复队列，并自动触发副作用。"""
@@ -537,18 +543,20 @@ class Gateway:
             return
 
         logger.info(
-            "DownstreamExecutingChanged: %s → %s (crashed=%s paused=%s ready=%s ever_active=%s)",
+            "DownstreamExecutingChanged: %s → %s (crashed=%s paused=%s ready=%s ever_active=%s allow_restart=%s)",
             self._downstream_executing,
             executing,
             self._crash_skip.crashed_executing,
             self._paused,
             self._downstream_ready,
             self._ever_active,
+            self._allow_restart,
         )
         self._downstream_executing = executing
         if executing:
-            # 只有在下游真正开始执行任务时，才将 _ever_active 设为 True
+            # 下游真正开始执行任务时，粘滞门控与生命周期标志同时置真
             self._ever_active = True
+            self._allow_restart = True
             self._job_start_time = int(time.time() * 1000)
             self._refresh()
         else:
@@ -561,7 +569,7 @@ class Gateway:
                 self._estimation_service.record_completion(duration_ms)
             self._job_start_time = None
 
-            completion_result = self._crash_skip.record_completion(self._ever_active)
+            completion_result = self._crash_skip.record_completion(self._allow_restart)
 
             if completion_result == "requeue_complete":
                 self._queue_writer.update_status(
@@ -606,7 +614,7 @@ class Gateway:
         running_jobs: List[Job] = self._queue_reader.list(
             JobFilters([JobStatus.RUNNING])
         )
-        self._ever_active = False
+        self._allow_restart = False
         # 崩溃即视为下游未就绪，立即阻止休眠，覆盖崩溃检测到重启开始之间的空窗期
         self._downstream_ready = False
 

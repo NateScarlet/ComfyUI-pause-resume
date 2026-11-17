@@ -59,15 +59,27 @@ class TestSystemTrayController(unittest.TestCase):
         )
         controller._app_facade.pause_queue.handle.assert_not_called()
 
-    def test_restart_label_is_pause_then_restart_when_not_paused(self):
-        """未暂停时重启项文案为「暂停后重启下游」（#17）。"""
+    def test_restart_label_is_restart_now_when_not_paused_and_drained(self):
+        """未暂停但队列排空且无任务执行时，重启项文案为「立即重启下游」。"""
         controller = self._make_controller(paused=False, running=0)
         with patch("gateway.infrastructure.system.tray._LC", "zh"):
-            self.assertEqual(self._restart_item(controller).text, "暂停后重启下游")
+            self.assertEqual(self._restart_item(controller).text, "立即重启下游")
 
-    def test_first_click_when_not_paused_pauses_then_upgrades_to_restart_now(self):
-        """未暂停时第一次单击只暂停并排程空闲后重启，文案随即升级（#17）。"""
+    def test_first_click_when_not_paused_and_drained_restarts_immediately(self):
+        """队列排空时第一次单击即强制重启，不再先暂停并等待空闲边沿。"""
         controller = self._make_controller(paused=False, running=0)
+        item = self._restart_item(controller)
+
+        item(MagicMock())
+
+        controller._loop.call_soon_threadsafe.assert_called_once_with(
+            controller._app_facade.restart_downstream.handle
+        )
+        controller._app_facade.pause_queue.handle.assert_not_called()
+
+    def test_task_running_requires_two_clicks_to_force_restart(self):
+        """仍有任务执行时第一次单击只暂停并排程，第二次单击才强制重启。"""
+        controller = self._make_controller(paused=False, running=1)
         item = self._restart_item(controller)
 
         item(MagicMock())
@@ -77,22 +89,10 @@ class TestSystemTrayController(unittest.TestCase):
         )
         controller._app_facade.restart_downstream.handle.assert_not_called()
 
-        with patch("gateway.infrastructure.system.tray._LC", "zh"):
-            self.assertEqual(self._restart_item(controller).text, "立即重启下游")
-
-    def test_second_click_when_not_paused_forces_restart(self):
-        """未暂停时单击一次后再单击，执行强制重启（原有升级语义，#17）。"""
-        controller = self._make_controller(paused=False, running=0)
-        item = self._restart_item(controller)
-
-        item(MagicMock())
         item(MagicMock())
 
         controller._loop.call_soon_threadsafe.assert_any_call(
             controller._app_facade.restart_downstream.handle
-        )
-        controller._loop.call_soon_threadsafe.assert_any_call(
-            controller._app_facade.pause_queue.handle, True
         )
 
     def test_pending_restart_forces_restart_even_while_task_running(self):
@@ -129,7 +129,7 @@ class TestSystemTrayController(unittest.TestCase):
             self.assertEqual(
                 self._restart_item(idle_controller).text, "Restart Downstream Now"
             )
-            running_controller = self._make_controller(paused=False, running=0)
+            running_controller = self._make_controller(paused=False, running=1)
             self.assertEqual(
                 self._restart_item(running_controller).text,
                 "Pause then Restart Downstream",

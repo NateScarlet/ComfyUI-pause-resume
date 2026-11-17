@@ -287,21 +287,21 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_pause_decision(self):
         """测试暂停时的决策流。"""
-        # 情况 1：暂停且当时不闲置，不应该触发立即重启
+        # 情况 1：暂停且当时不空闲，标记挂起的重启请求，等待空闲边沿
         g = _make_gateway(paused=False, downstream_executing=True)
         g.pause(restart_after_idle=True)
         self.assertTrue(g.paused)
         self.assertTrue(g._restart_after_idle_on_pause)
         g._mock_downstream.restart.assert_not_called()
 
-        # 情况 2：暂停且当时已闲置，应触发立即重启
+        # 情况 2：暂停且当时已空闲，边沿已过，标志挂起但不重启（无操作）
         g = _make_gateway(
             paused=False, downstream_executing=False, downstream_ready=True
         )
         g.pause(restart_after_idle=True)
         self.assertTrue(g.paused)
-        self.assertFalse(g._restart_after_idle_on_pause)
-        g._mock_downstream.restart.assert_called_once()
+        self.assertTrue(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
 
     def test_pause_persists_state(self):
         """测试暂停操作会自动持久化状态。"""
@@ -654,30 +654,138 @@ class TestDomainGateway(unittest.TestCase):
         # 应该直接返回，不触发重启
         g._mock_downstream.restart.assert_not_called()
 
-    def test_ever_active_reset_on_restarts_and_crashes(self):
-        """测试在下游重启与崩溃时，_ever_active 会正确复位为 False（干净状态）。"""
-        # 情况 1：从空闲超时重启
+    def test_allow_restart_resets_on_restarts_and_crashes(self):
+        """重启与崩溃只复位生命周期标志，粘滞的 _ever_active 保留供 idle program 门控。"""
+        timer = FakeTimer()
         g1 = _make_gateway(
             paused=False,
             ever_active=True,
             idle_restart_timeout=10,
             downstream_ready=True,
+            timer=timer,
         )
         g1._on_idle_timeout()
-        self.assertFalse(g1._ever_active)
+        self.assertFalse(g1._allow_restart)
+        self.assertTrue(g1._ever_active)
         g1._mock_downstream.restart.assert_called_once()
 
-        # 情况 2：从 pause 带有重启参数且已空闲的立即重启
-        g2 = _make_gateway(paused=False, ever_active=True, downstream_ready=True)
-        g2._is_idle = True
-        g2.pause(restart_after_idle=True)
-        self.assertFalse(g2._ever_active)
-        g2._mock_downstream.restart.assert_called_once()
+        # 崩溃同样只复位生命周期标志
+        g2 = _make_gateway(paused=False, ever_active=True)
+        g2._mock_event_bus.publish(DownstreamCrashedEvent())
+        self.assertFalse(g2._allow_restart)
+        self.assertTrue(g2._ever_active)
 
-        # 情况 3：崩溃重启
-        g3 = _make_gateway(paused=False, ever_active=True)
-        g3._mock_event_bus.publish(DownstreamCrashedEvent())
-        self.assertFalse(g3._ever_active)
+    def test_idle_program_gate_stays_on_across_downstream_restart(self):
+        """下游重启后队列再次排空时，粘滞门控仍为真，idle program 应重新启动。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        g._mock_pm.update_state.assert_called_with(QueueState.IDLE, True)
+
+        timer.advance(600)
+        g._mock_downstream.restart.assert_called_once()
+
+        # 下游重新就绪、队列仍为空：上报进程管理器的仍是粘滞门控 True
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+        g._mock_pm.update_state.assert_called_with(QueueState.IDLE, True)
+
+        # 没有新任务时，随后的空闲窗口不再重启下游（防止循环）
+        timer.advance(3600)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_idle_timeout_never_restarts_without_task_in_current_lifecycle(self):
+        """粘滞门控为真但当前生命周期未执行任务时，空闲超时不得重启下游。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        # 模拟一次下游重启（复位生命周期标志，但粘滞标志保留）
+        g._request_downstream_restart()
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+
+        timer.advance(600)
+
+        g._mock_downstream.restart.assert_called_once()  # 仅模拟的那一次
+        g._mock_pm.update_state.assert_called_with(QueueState.IDLE, True)
+
+    def test_pause_with_restart_while_already_idle_is_noop(self):
+        """已空闲时设置空闲后重启是空操作：不立即重启，也不因活动排程重启。"""
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            idle_restart_timeout=0,
+            downstream_ready=True,
+        )
+        self.assertTrue(g._is_idle)
+
+        g.pause(restart_after_idle=True)
+
+        g._mock_downstream.restart.assert_not_called()
+        g.report_activity()
+        g._mock_downstream.restart.assert_not_called()
+        g.resume()
+        self.assertFalse(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
+
+    def test_pause_with_restart_activates_on_idle_edge(self):
+        """非空闲→空闲的边沿仍会消费空闲后重启请求。"""
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            ever_active=True,
+            idle_restart_timeout=0,
+            downstream_ready=True,
+        )
+        g.pause(restart_after_idle=True)
+        g._mock_downstream.restart.assert_not_called()
+
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        g._mock_downstream.restart.assert_called_once()
+        self.assertFalse(g._restart_after_idle_on_pause)
+
+    def test_activity_does_not_schedule_restart_from_pause_flag(self):
+        """活动不得仅因挂起的暂停后重启标志而排程空闲窗口。"""
+        timer = FakeTimer()
+        g = _make_gateway(
+            paused=False,
+            downstream_executing=True,
+            ever_active=True,
+            idle_restart_timeout=600,
+            downstream_ready=True,
+            timer=timer,
+        )
+        g.pause(restart_after_idle=True)
+        g.report_activity()
+
+        self.assertEqual(timer.pending_count, 0)
+
+        # 任务完成后进入空闲，才由边沿排程窗口并在到期时重启
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+        self.assertEqual(timer.pending_count, 1)
+        timer.advance(600)
+        g._mock_downstream.restart.assert_called_once()
+
+    def test_idle_program_not_launched_before_first_task(self):
+        """网关启动以来从未执行任务时，上报进程管理器的门控为 False。"""
+        g = _make_gateway(paused=False, downstream_ready=True)
+        g._mock_pm.update_state.assert_called_with(QueueState.IDLE, False)
+
+    def test_task_start_sets_both_flags(self):
+        """下游真正开始执行任务时，粘滞门控与生命周期标志同时置真。"""
+        g = _make_gateway(paused=False, downstream_ready=True)
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+        self.assertTrue(g._ever_active)
+        self.assertTrue(g._allow_restart)
 
     def test_crashed_executing_prevents_attempt_count_reset(self):
         """测试崩溃后下游重启导致的 executing=False 不会重置崩溃计数（任务尚未重新执行）。"""
@@ -1118,8 +1226,8 @@ class TestDomainGateway(unittest.TestCase):
         self.assertTrue(g._is_idle)
         self.assertFalse(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
 
-    def test_activity_outside_window_does_not_delay_pause_restart(self):
-        """活动已超出空闲窗口时，暂停后的空闲重启必须立即执行（#11）。"""
+    def test_pause_with_restart_while_already_idle_stays_noop_after_window(self):
+        """已空闲时即便空闲窗口已过，pause(restart_after_idle) 也不得立即重启（边沿语义）。"""
         timer = FakeTimer()
         g = _make_gateway(
             paused=False,
@@ -1136,12 +1244,12 @@ class TestDomainGateway(unittest.TestCase):
         g.resume()
         self.assertEqual(timer.pending_count, 0)
 
-        # 此时活动早已超出空闲窗口，不应再次推迟重启
+        # 此时活动早已超出空闲窗口，但队列仍处于空闲，设置标志不得立即重启
         timer.advance(600)
         g.pause(restart_after_idle=True)
 
-        self.assertFalse(g._restart_after_idle_on_pause)
-        g._mock_downstream.restart.assert_called_once()
+        self.assertTrue(g._restart_after_idle_on_pause)
+        g._mock_downstream.restart.assert_not_called()
 
     def test_activity_during_execution_still_restarts_after_idle(self):
         """执行期间的活动不改变"进入空闲后再等待一个完整窗口"的重启时刻（#11）。"""
@@ -1356,6 +1464,33 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_downstream.restart.assert_not_called()
         self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
         self.assertFalse(g._downstream_ready)
+
+    def test_idle_shutdown_resets_allow_restart_for_next_lifecycle(self):
+        """空闲停机保留粘滞门控但复位生命周期标志，唤醒后须等新任务才允许空闲重启。"""
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        timer.advance(600)
+
+        g._mock_downstream.stop.assert_called_once()
+        self.assertFalse(g._allow_restart)
+        self.assertTrue(g._ever_active)
+
+        g.wake_downstream()
+        self.assertFalse(g._allow_restart)
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+
+        # 新生命周期没有任务，空闲窗口只触发停机，不会重启下游
+        timer.advance(600)
+        g._mock_downstream.restart.assert_not_called()
 
     def test_idle_shutdown_releases_startup_memory_without_ever_active(self):
         """下游从未执行任务时，空闲停机仍需释放启动基线内存（#16）。"""

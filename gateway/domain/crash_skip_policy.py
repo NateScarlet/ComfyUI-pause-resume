@@ -85,8 +85,11 @@ class CrashSkipPolicy:
         self._crash_count += 1
         self._crashed_executing = True
 
-    def record_completion(self, ever_active: bool) -> str:
+    def record_completion(self, allow_restart: bool) -> str:
         """任务执行结束（非崩溃），返回完成类型。
+
+        allow_restart 是当前运行生命周期内是否执行过任务的标志：崩溃重启后下游
+        尚未真正开始执行任务时为 False，此时完成事件不应清零崩溃计数。
 
         Returns:
             'complete': 正常完成，清零崩溃计数。
@@ -94,7 +97,7 @@ class CrashSkipPolicy:
         """
         if self._crashed_executing:
             self._crashed_executing = False
-            if ever_active:
+            if allow_restart:
                 self.reset()
                 return "requeue_complete"
             return "noop"
