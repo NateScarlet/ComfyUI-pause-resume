@@ -232,11 +232,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                 line = line.rstrip()
                 if not line:
                     continue
-                if is_stderr:
-                    print(f"[{self._downstream_port}] STDERR: {line}", file=sys.stderr)
-                else:
-                    print(f"[{self._downstream_port}] STDOUT: {line}")
-
+                self._log_downstream_line(line, is_stderr)
                 self._feed_log_line(watcher, line)
 
         threading.Thread(
@@ -245,6 +241,13 @@ class ComfyUIDownstreamClient(DownstreamClient):
         threading.Thread(
             target=log_reader, args=(self._process.stderr, True), daemon=True
         ).start()
+
+    def _log_downstream_line(self, line: str, is_stderr: bool) -> None:
+        """把下游进程的一行输出写入 root logger，使其随日志文件一起落盘。"""
+        if is_stderr:
+            logger.info("[%s] STDERR: %s", self._downstream_port, line)
+        else:
+            logger.info("[%s] STDOUT: %s", self._downstream_port, line)
 
     def _create_log_watcher(self) -> ComfyUIExecutionLogWatcher:
         """为新拉起的下游进程创建执行日志观察者。"""

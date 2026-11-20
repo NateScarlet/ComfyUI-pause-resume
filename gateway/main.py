@@ -9,6 +9,7 @@ from aiohttp.web_log import AccessLogger
 from typing import Any
 
 from .config import GatewayConfig
+from .infrastructure.logging_config import configure_logging
 from .infrastructure.sqlite.state import SQLiteStateRepository
 from .infrastructure.queue_factory import init_queue
 from .infrastructure.system.program import ExternalProgramManager
@@ -26,11 +27,6 @@ from .presentation.routes import setup_routes
 from .shared.events import StateChangedEvent, StatusChangedEvent
 from .shared.exceptions import DownstreamStartupTimeout
 
-logging.basicConfig(
-    level=(logging.DEBUG if os.getenv("GATEWAY_DEBUG") == "true" else logging.INFO),
-    format="[GATEWAY] %(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +57,9 @@ class DebugAccessLogger(AccessLogger):
 async def main() -> None:
     # 1. 实例化依赖配置
     config = GatewayConfig()
+
+    # 组合根构建日志：stderr + 数据目录滚动文件，供事后诊断
+    configure_logging(config.data_dir, os.getenv("GATEWAY_DEBUG") == "true")
 
     # 2. 提前进行端口占用检查
     try:

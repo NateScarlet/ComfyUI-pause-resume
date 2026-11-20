@@ -763,6 +763,33 @@ class TestComfyUIDownstreamClientSendPrompt(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 0)
         self.assertIn("Network error:", ctx.exception.message)
 
+    def test_downstream_output_goes_through_logger(self) -> None:
+        """下游进程的每行输出都应经 logger 落盘，而不是只 print 到终端。
+
+        现场诊断依赖 `[端口] STDOUT/STDERR:` 这类行；若只 print，日志文件里看不到。
+        """
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        config = MagicMock(spec=GatewayConfig)
+        client = ComfyUIDownstreamClient(
+            config=config,
+            event_bus=_RecordingEventBus(),
+            process_manager=MagicMock(),
+            timer=FakeTimer(),
+            loop=loop,
+        )
+        client._downstream_port = 56004
+
+        with self.assertLogs(
+            "gateway.infrastructure.comfyui.downstream", level="INFO"
+        ) as captured:
+            client._log_downstream_line("hello from downstream", False)
+            client._log_downstream_line("a stderr line", True)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("[56004] STDOUT: hello from downstream", joined)
+        self.assertIn("[56004] STDERR: a stderr line", joined)
+
 
 if __name__ == "__main__":
     unittest.main()
