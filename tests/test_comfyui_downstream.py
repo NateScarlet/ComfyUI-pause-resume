@@ -448,6 +448,34 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
         asyncio.run(scenario())
 
 
+    def test_mark_unready_logs_real_transition_with_reason(self):
+        """就绪→未就绪的迁移必须留下带原因的 INFO 日志（#24）。"""
+        client, _ = self._make_client()
+        client._downstream_ready = True
+
+        with self.assertLogs(
+            "gateway.infrastructure.comfyui.downstream", level="INFO"
+        ) as captured:
+            client._mark_downstream_unready("crash")
+
+        self.assertTrue(
+            any(
+                "True → False" in line and "reason=crash" in line
+                for line in captured.output
+            )
+        )
+        self.assertFalse(client.downstream_ready)
+
+    def test_mark_unready_silent_when_already_unready(self):
+        """已经未就绪时重复标记不得刷屏（#24）。"""
+        client, _ = self._make_client()
+        with self.assertNoLogs(
+            "gateway.infrastructure.comfyui.downstream", level="INFO"
+        ):
+            client._mark_downstream_unready("restart")
+        self.assertFalse(client.downstream_ready)
+
+
 class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
     """测试下游主动停机与冷启动的进程生命周期契约（#16）。"""
 
