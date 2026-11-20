@@ -111,6 +111,8 @@ class Gateway:
         self._is_idle = False
         self._cancel_idle_timeout: Optional[Callable[[], None]] = None
         self._cancel_dispatch_retry: Optional[Callable[[], None]] = None
+        # 最近一次记录的派发门控拦截原因：相同原因连续出现时不重复刷屏
+        self._last_dispatch_gate_reason: Optional[str] = None
         # 空闲窗口的到期时刻（定时器时间基准），每次活动都会把它推迟到活动时刻 + 窗口长度
         self._idle_window_end = self._timer.now + self._idle_restart_timeout
         self._refreshing = False
@@ -249,6 +251,31 @@ class Gateway:
         finally:
             self._refreshing = False
 
+    def _set_downstream_ready(self, ready: bool, reason: str) -> None:
+        """统一改写就绪标志，并在改写点输出带原因与上下文的 INFO 日志。
+
+        日志绑定在业务决策的改写点（重启 / 停机 / 唤醒 / 就绪事件 / 崩溃），
+        不进入 _refresh 等高频轮询路径；即使新旧值相同也记录，使日志能证明
+        该改写路径确实被执行过，便于定死 ready 被翻转的步骤。
+        """
+        old_ready = self._downstream_ready
+        self._downstream_ready = ready
+        # 仅在真实迁移时读取队列长度：空改写保持可追踪，但不额外引入队列查询
+        pending: Optional[int] = None
+        if old_ready != ready:
+            pending = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
+        logger.info(
+            "DownstreamReady: %s → %s (reason=%s paused=%s shutdown=%s "
+            "downstream_executing=%s pending=%s)",
+            old_ready,
+            ready,
+            reason,
+            self._paused,
+            self._downstream_shutdown,
+            self._downstream_executing,
+            pending if pending is not None else "n/a",
+        )
+
     def _request_downstream_restart(self) -> None:
         """发起下游重启并同步将就绪标志置为未就绪。
 
@@ -256,8 +283,8 @@ class Gateway:
         允许系统休眠，可能被系统闲置休眠打断重启流程。后续下游就绪事件到达时会再次更新该标志。
         """
         self._allow_restart = False
-        self._downstream_ready = False
         self._downstream_shutdown = False
+        self._set_downstream_ready(False, "restart")
         self._downstream.restart()
 
     def _request_downstream_shutdown(self) -> None:
@@ -265,8 +292,8 @@ class Gateway:
         logger.info("💤 Idle shutdown: terminating downstream to release memory")
         # 粘滞门控保留，仅复位生命周期标志，使后续唤醒成为一个全新的生命周期
         self._allow_restart = False
-        self._downstream_ready = False
         self._downstream_shutdown = True
+        self._set_downstream_ready(False, "shutdown")
         self._downstream.stop()
 
     def _arm_idle_restart(self) -> None:
@@ -432,7 +459,7 @@ class Gateway:
             return
         logger.info("⏰ Activity detected, cold starting the downstream")
         self._downstream_shutdown = False
-        self._downstream_ready = False
+        self._set_downstream_ready(False, "wakeup")
         self._downstream.start()
         self._refresh()
 
@@ -595,7 +622,7 @@ class Gateway:
 
     def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
         """设置下游就绪状态，并在合适时触发派发。"""
-        self._downstream_ready = ev.ready
+        self._set_downstream_ready(ev.ready, "ready_event")
         self._refresh()
         self._publish_status_changed()
         if ev.ready:
@@ -616,7 +643,7 @@ class Gateway:
         )
         self._allow_restart = False
         # 崩溃即视为下游未就绪，立即阻止休眠，覆盖崩溃检测到重启开始之间的空窗期
-        self._downstream_ready = False
+        self._set_downstream_ready(False, "crash")
 
         if running_jobs:
             job = running_jobs[0]
@@ -675,10 +702,34 @@ class Gateway:
         self._dispatcher.dispatch(self.get_dispatch_skip())
 
     def get_dispatch_skip(self) -> Optional[int]:
-        """核心派发调度决策（无副作用纯查询）。"""
-        if self._paused or self._downstream_executing or not self._downstream_ready:
+        """核心派发调度决策（无业务副作用，仅记录门控决策日志）。"""
+        if self._paused:
+            reason: Optional[str] = "paused"
+        elif self._downstream_executing:
+            reason = "downstream_executing"
+        elif not self._downstream_ready:
+            reason = "not downstream_ready"
+        else:
+            reason = None
+
+        if reason is not None:
+            # 同一拦截原因连续出现时只记录一次，把日志聚集在门控原因的迁移上，
+            # 避免队列积压等事件驱动场景重复刷屏
+            if reason != self._last_dispatch_gate_reason:
+                pending = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
+                logger.info(
+                    "Dispatch blocked: %s (paused=%s downstream_executing=%s "
+                    "downstream_ready=%s pending=%d)",
+                    reason,
+                    self._paused,
+                    self._downstream_executing,
+                    self._downstream_ready,
+                    pending,
+                )
+                self._last_dispatch_gate_reason = reason
             return None
 
+        self._last_dispatch_gate_reason = None
         pending_count = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
         return self._crash_skip.get_skip(pending_count)
 

@@ -1813,5 +1813,142 @@ class TestDomainGateway(unittest.TestCase):
         )
 
 
+class TestDownstreamReadyAndDispatchLogging(unittest.TestCase):
+    """验证 ready 改写与派发门控留下可定位的 INFO 日志（#24）。"""
+
+    _LOGGER = "gateway.domain.gateway"
+
+    @staticmethod
+    def _ready_lines(output: List[str]) -> List[str]:
+        return [line for line in output if "DownstreamReady:" in line]
+
+    @staticmethod
+    def _gate_lines(output: List[str]) -> List[str]:
+        return [line for line in output if "Dispatch blocked:" in line]
+
+    def test_restart_ready_write_logs_reason_and_context(self):
+        g = _make_gateway(
+            paused=True,
+            downstream_ready=True,
+            downstream_executing=True,
+            ever_active=True,
+            pending_count=3,
+        )
+        with self.assertLogs(self._LOGGER, level="INFO") as captured:
+            g.restart_now()
+
+        lines = self._ready_lines(captured.output)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("True → False", lines[0])
+        self.assertIn("reason=restart", lines[0])
+        self.assertIn("paused=True", lines[0])
+        self.assertIn("shutdown=False", lines[0])
+        self.assertIn("downstream_executing=False", lines[0])
+        self.assertIn("pending=3", lines[0])
+
+    def test_shutdown_ready_write_logs_reason_and_context(self):
+        timer = FakeTimer()
+        sampler = FakeMemorySampler(available_mb=512)
+        g = _make_gateway(
+            paused=False,
+            ever_active=True,
+            downstream_ready=True,
+            idle_restart_timeout=600,
+            timer=timer,
+            memory_sampler=sampler,
+            allow_idle_shutdown_initial=True,
+        )
+        with self.assertLogs(self._LOGGER, level="INFO") as captured:
+            timer.advance(600)
+
+        lines = self._ready_lines(captured.output)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("True → False", lines[0])
+        self.assertIn("reason=shutdown", lines[0])
+        self.assertIn("shutdown=True", lines[0])
+
+    def test_wakeup_ready_write_logs_reason(self):
+        g = _make_gateway(downstream_shutdown=True, downstream_ready=False)
+        with self.assertLogs(self._LOGGER, level="INFO") as captured:
+            g.wake_downstream()
+
+        lines = self._ready_lines(captured.output)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("False → False", lines[0])
+        self.assertIn("reason=wakeup", lines[0])
+        self.assertIn("shutdown=False", lines[0])
+
+    def test_ready_event_write_logs_reason_and_context(self):
+        g = _make_gateway(paused=False, downstream_ready=False, pending_count=2)
+        with self.assertLogs(self._LOGGER, level="INFO") as captured:
+            g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
+
+        lines = self._ready_lines(captured.output)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("False → True", lines[0])
+        self.assertIn("reason=ready_event", lines[0])
+        self.assertIn("paused=False", lines[0])
+        self.assertIn("pending=2", lines[0])
+
+    def test_crash_ready_write_logs_reason(self):
+        g = _make_gateway(paused=False, downstream_ready=True)
+        with self.assertLogs(self._LOGGER, level="INFO") as captured:
+            g._mock_event_bus.publish(DownstreamCrashedEvent())
+
+        lines = self._ready_lines(captured.output)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("True → False", lines[0])
+        self.assertIn("reason=crash", lines[0])
+
+    def test_dispatch_gate_logs_specific_blocking_condition(self):
+        cases = [
+            (_make_gateway(paused=True, downstream_ready=True), "paused"),
+            (
+                _make_gateway(
+                    paused=False, downstream_ready=True, downstream_executing=True
+                ),
+                "downstream_executing",
+            ),
+            (
+                _make_gateway(paused=False, downstream_ready=False),
+                "not downstream_ready",
+            ),
+        ]
+        for g, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertLogs(self._LOGGER, level="INFO") as captured:
+                    self.assertIsNone(g.get_dispatch_skip())
+                lines = self._gate_lines(captured.output)
+                self.assertEqual(len(lines), 1)
+                self.assertIn(f"Dispatch blocked: {reason}", lines[0])
+                self.assertIn("pending=", lines[0])
+
+    def test_dispatch_gate_does_not_repeat_same_blocking_reason(self):
+        g = _make_gateway(paused=True, downstream_ready=True)
+        with self.assertLogs(self._LOGGER, level="INFO") as captured:
+            self.assertIsNone(g.get_dispatch_skip())
+            self.assertIsNone(g.get_dispatch_skip())
+            self.assertIsNone(g.get_dispatch_skip())
+        self.assertEqual(len(self._gate_lines(captured.output)), 1)
+
+    def test_dispatch_gate_logs_again_when_blocking_reason_changes(self):
+        g = _make_gateway(paused=True, downstream_ready=False)
+        with self.assertLogs(self._LOGGER, level="INFO") as first:
+            self.assertIsNone(g.get_dispatch_skip())
+        self.assertIn("Dispatch blocked: paused", first.output[0])
+
+        # 恢复队列后拦截条件从 paused 变为 not downstream_ready，应再次记录
+        with self.assertLogs(self._LOGGER, level="INFO") as second:
+            g.resume()
+        lines = self._gate_lines(second.output)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Dispatch blocked: not downstream_ready", lines[0])
+
+    def test_dispatch_gate_silent_when_dispatch_allowed(self):
+        g = _make_gateway(paused=False, downstream_ready=True, pending_count=2)
+        with self.assertNoLogs(self._LOGGER, level="INFO"):
+            self.assertEqual(g.get_dispatch_skip(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
