@@ -889,6 +889,9 @@ class _FailingWriteSseResponse(_FakeSseResponse):
 class TestGatewayHandlersSseKeepalive(unittest.TestCase):
     """SSE 空闲保活：真实连接验证注释帧与状态帧的时序（#21）。"""
 
+    # 保活帧读取超时：CI 机器事件循环调度延迟大于本地，不能用 keepalive 间隔的 1.5 倍
+    _PING_READ_TIMEOUT = 1.0
+
     def _make_handlers(
         self,
         keepalive_sec: float,
@@ -966,7 +969,9 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         )
                         snapshot = await self._read_frame(resp.content, 1)
                         self.assertTrue(snapshot.startswith(b"data: "))
-                        ping = await self._read_frame(resp.content, 0.075)
+                        ping = await self._read_frame(
+                            resp.content, self._PING_READ_TIMEOUT
+                        )
                         self.assertEqual(ping, b": ping\n\n")
             finally:
                 handlers.shutdown()
@@ -986,7 +991,9 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         await self._read_frame(resp.content, 1)  # retry
                         await self._read_frame(resp.content, 1)  # 初始快照
                         frames = [
-                            await self._read_frame(resp.content, 0.075)
+                            await self._read_frame(
+                                resp.content, self._PING_READ_TIMEOUT
+                            )
                             for _ in range(3)
                         ]
                         self.assertEqual(frames, [b": ping\n\n"] * 3)
