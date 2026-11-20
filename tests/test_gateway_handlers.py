@@ -16,11 +16,18 @@ from gateway.presentation.handlers import (
 )
 from gateway.shared.events import (
     DownstreamReadyChangedEvent,
+    DownstreamStateChanged,
     StateChangedEvent,
     StatusChangedEvent,
 )
 from gateway.shared.interfaces import DownstreamClient
-from gateway.shared.models import DownstreamState, GatewayState, JobFilters, JobStatus
+from gateway.shared.models import (
+    DownstreamState,
+    GatewayState,
+    JobFilters,
+    JobStatus,
+    Reason,
+)
 
 
 class _SyncEventBus:
@@ -220,8 +227,19 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         app = MagicMock()
         app.get_jobs.handle = AsyncMock(return_value=[])
         app.get_job_count.handle = AsyncMock(return_value=0)
+        state = {
+            "downstream": (
+                DownstreamState.READY if ready else DownstreamState.STARTING
+            )
+        }
+        app.get_state.handle = MagicMock(
+            side_effect=lambda: GatewayState(
+                paused=False,
+                allow_idle_shutdown=False,
+                downstream_state=state["downstream"],
+            )
+        )
         downstream = MagicMock(spec=DownstreamClient)
-        downstream.downstream_ready = ready
         downstream.downstream_port = 8188
         bus = _SyncEventBus()
         handlers = _ProxyStubHandlers(
@@ -231,13 +249,13 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
             event_bus=bus,
             startup_wait_sec=wait_sec,
         )
-        return handlers, app, downstream, bus
+        return handlers, app, downstream, bus, state
 
     def test_html_request_returns_loading_page_without_waiting(self):
         """下游未就绪时，HTML 提示页仍应立即返回，不应等待就绪事件。"""
 
         async def scenario() -> None:
-            handlers, _, _, bus = self._make_handlers(ready=False)
+            handlers, _, _, bus, _ = self._make_handlers(ready=False)
             req = make_mocked_request("GET", "/", headers={"Accept": "text/html"})
             resp = await handlers.proxy_handler(req)
             self.assertEqual(resp.status, 200)
@@ -251,14 +269,18 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         """下游未就绪时，API 请求应等待就绪事件，就绪后继续转发。"""
 
         async def scenario() -> None:
-            handlers, _, downstream, bus = self._make_handlers(ready=False)
+            handlers, _, _, bus, state = self._make_handlers(ready=False)
             req = make_mocked_request(
                 "GET", "/system_stats", headers={"Accept": "application/json"}
             )
             task = asyncio.create_task(handlers.proxy_handler(req))
             await asyncio.sleep(0)
-            downstream.downstream_ready = True
-            bus.publish(DownstreamReadyChangedEvent(ready=True))
+            state["downstream"] = DownstreamState.READY
+            bus.publish(
+                DownstreamStateChanged(
+                    state=DownstreamState.READY, reason=Reason.READY_POLL
+                )
+            )
             resp = await asyncio.wait_for(task, timeout=1)
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.text, "proxied")
@@ -269,26 +291,38 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         """等待期间收到就绪事件后下游又立即重启，应继续等待而非误判就绪。"""
 
         async def scenario() -> None:
-            handlers, _, downstream, bus = self._make_handlers(ready=False)
+            handlers, _, _, bus, state = self._make_handlers(ready=False)
             req = make_mocked_request(
                 "GET", "/system_stats", headers={"Accept": "application/json"}
             )
             task = asyncio.create_task(handlers.proxy_handler(req))
             await asyncio.sleep(0)
 
-            # 就绪后立即再次重启
-            downstream.downstream_ready = True
-            bus.publish(DownstreamReadyChangedEvent(ready=True))
-            downstream.downstream_ready = False
-            bus.publish(DownstreamReadyChangedEvent(ready=False))
+            # 权威事件就绪后立即重启：门面状态才是复核依据
+            state["downstream"] = DownstreamState.READY
+            bus.publish(
+                DownstreamStateChanged(
+                    state=DownstreamState.READY, reason=Reason.READY_POLL
+                )
+            )
+            state["downstream"] = DownstreamState.STARTING
+            bus.publish(
+                DownstreamStateChanged(
+                    state=DownstreamState.STARTING, reason=Reason.RESTART
+                )
+            )
             await asyncio.sleep(0)
 
             # 此时下游并未真正就绪，handler 不应误判就绪而完成
             self.assertFalse(task.done())
 
             # 再次就绪后才应放行
-            downstream.downstream_ready = True
-            bus.publish(DownstreamReadyChangedEvent(ready=True))
+            state["downstream"] = DownstreamState.READY
+            bus.publish(
+                DownstreamStateChanged(
+                    state=DownstreamState.READY, reason=Reason.READY_POLL
+                )
+            )
             resp = await asyncio.wait_for(task, timeout=1)
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.text, "proxied")
@@ -299,7 +333,9 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         """停机期间页面 GET 必须先触发唤醒，再返回自动刷新的加载页（#16）。"""
 
         async def scenario() -> None:
-            handlers, app, _, _ = self._make_handlers(ready=False, wait_sec=0.05)
+            handlers, app, _, _, _ = self._make_handlers(
+                ready=False, wait_sec=0.05
+            )
             req = make_mocked_request("GET", "/", headers={"Accept": "text/html"})
             resp = await handlers.proxy_handler(req)
 
@@ -313,7 +349,9 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         """停机期间 API 请求先触发唤醒，等待超时后返回 503 而非 502（#16）。"""
 
         async def scenario() -> None:
-            handlers, app, _, _ = self._make_handlers(ready=False, wait_sec=0.05)
+            handlers, app, _, _, _ = self._make_handlers(
+                ready=False, wait_sec=0.05
+            )
             req = make_mocked_request(
                 "GET", "/system_stats", headers={"Accept": "application/json"}
             )
@@ -328,7 +366,9 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         """下游未就绪且等待超时仍未就绪，API 请求应返回错误。"""
 
         async def scenario() -> None:
-            handlers, _, _, _ = self._make_handlers(ready=False, wait_sec=0.05)
+            handlers, _, _, _, _ = self._make_handlers(
+                ready=False, wait_sec=0.05
+            )
             req = make_mocked_request(
                 "GET", "/system_stats", headers={"Accept": "application/json"}
             )
@@ -341,7 +381,7 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         """网关本地 jobs API 不应受下游未就绪影响，无需等待就绪事件。"""
 
         async def scenario() -> None:
-            handlers, _, _, bus = self._make_handlers(ready=False)
+            handlers, _, _, bus, _ = self._make_handlers(ready=False)
             req = make_mocked_request(
                 "GET", "/api/jobs", headers={"Accept": "application/json"}
             )
@@ -396,14 +436,15 @@ class TestGatewayHandlersActivity(unittest.TestCase):
             return_value=GatewayState(
                 paused=False,
                 allow_idle_shutdown=False,
-                downstream_state=DownstreamState.READY,
+                downstream_state=(
+                    DownstreamState.READY if ready else DownstreamState.STARTING
+                ),
             )
         )
         app.add_job.handle = MagicMock(
             return_value=MagicMock(prompt_id="prompt_1", number=1)
         )
         downstream = MagicMock(spec=DownstreamClient)
-        downstream.downstream_ready = ready
         downstream.downstream_port = 8188
         handlers = _ProxyStubHandlers(
             app=app,
@@ -537,8 +578,14 @@ class TestGatewayHandlersWsProxyLifecycle(unittest.TestCase):
 
     def _make_handlers(self):
         app = MagicMock()
+        app.get_state.handle = MagicMock(
+            return_value=GatewayState(
+                paused=False,
+                allow_idle_shutdown=False,
+                downstream_state=DownstreamState.READY,
+            )
+        )
         downstream = MagicMock(spec=DownstreamClient)
-        downstream.downstream_ready = True
         downstream.downstream_port = 8188
         return GatewayHandlers(
             app=app,
@@ -781,7 +828,14 @@ class TestGatewayHandlersSse(unittest.TestCase):
             handlers, app, _ = self._make_handlers(paused=True, queue_remaining=3)
             task, response, frames = await self._connect(handlers)
             try:
-                self.assertEqual(frames[0], {"paused": True, "queue_remaining": 3})
+                self.assertEqual(
+                    frames[0],
+                    {
+                        "paused": True,
+                        "queue_remaining": 3,
+                        "downstream": "ready",
+                    },
+                )
                 self.assertEqual(response.chunks[0], "retry: 3000\n\n")
                 # 初始快照只查询一次队列计数
                 app.get_job_count.handle.assert_awaited_once_with(
@@ -801,7 +855,14 @@ class TestGatewayHandlersSse(unittest.TestCase):
             try:
                 bus.publish(StatusChangedEvent(queue_remaining=7))
                 frames = await self._wait_for_frames(response, 2)
-                self.assertEqual(frames[1], {"paused": False, "queue_remaining": 7})
+                self.assertEqual(
+                    frames[1],
+                    {
+                        "paused": False,
+                        "queue_remaining": 7,
+                        "downstream": "ready",
+                    },
+                )
                 app.get_job_count.handle.assert_awaited_once()
             finally:
                 await self._disconnect(task)
@@ -817,7 +878,14 @@ class TestGatewayHandlersSse(unittest.TestCase):
             try:
                 bus.publish(StateChangedEvent(paused=True))
                 frames = await self._wait_for_frames(response, 2)
-                self.assertEqual(frames[1], {"paused": True, "queue_remaining": 4})
+                self.assertEqual(
+                    frames[1],
+                    {
+                        "paused": True,
+                        "queue_remaining": 4,
+                        "downstream": "ready",
+                    },
+                )
             finally:
                 await self._disconnect(task)
 
@@ -854,7 +922,14 @@ class TestGatewayHandlersSse(unittest.TestCase):
                 worker.start()
                 worker.join()
                 frames = await self._wait_for_frames(response, 2)
-                self.assertEqual(frames[1], {"paused": False, "queue_remaining": 6})
+                self.assertEqual(
+                    frames[1],
+                    {
+                        "paused": False,
+                        "queue_remaining": 6,
+                        "downstream": "ready",
+                    },
+                )
             finally:
                 await self._disconnect(task)
 
@@ -1020,7 +1095,12 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                             )
                         )
                         self.assertEqual(
-                            snapshot, {"paused": False, "queue_remaining": 2}
+                            snapshot,
+                            {
+                                "paused": False,
+                                "queue_remaining": 2,
+                                "downstream": "ready",
+                            },
                         )
 
                         loop = asyncio.get_running_loop()
@@ -1032,7 +1112,11 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         self.assertTrue(frame.startswith(b"data: "))
                         self.assertEqual(
                             json.loads(frame.removeprefix(b"data: ").strip()),
-                            {"paused": False, "queue_remaining": 7},
+                            {
+                                "paused": False,
+                                "queue_remaining": 7,
+                                "downstream": "ready",
+                            },
                         )
                         # 状态帧必须在下一个保活间隔到点之前写出
                         self.assertLess(elapsed, 0.5)
@@ -1068,7 +1152,14 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         await task
 
             self.assertEqual(
-                response.frames()[1:], [{"paused": False, "queue_remaining": 9}]
+                response.frames()[1:],
+                [
+                    {
+                        "paused": False,
+                        "queue_remaining": 9,
+                        "downstream": "ready",
+                    }
+                ],
             )
 
         asyncio.run(scenario())

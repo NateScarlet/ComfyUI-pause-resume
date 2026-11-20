@@ -30,7 +30,6 @@ def _make_syncer(task: Job):
     reader.get.return_value = task
     writer = MagicMock(spec=JobQueueWriter)
     downstream = MagicMock(spec=DownstreamClient)
-    downstream.downstream_ready = True
     event_bus = MagicMock(spec=EventBus)
     syncer = JobDownstreamSyncer(
         queue_reader=reader,

@@ -35,6 +35,18 @@ class DownstreamState(str, Enum):
     SHUTDOWN = "shutdown"
 
 
+class Reason(str, Enum):
+    """下游生命周期转换的原因，仅用于日志与诊断，不进入对外状态契约。"""
+
+    RESTART = "restart"
+    SHUTDOWN = "shutdown"
+    WAKEUP = "wakeup"
+    READY_POLL = "ready_poll"
+    CRASH = "crash"
+    STALL = "stall"
+    STOP = "stop"
+
+
 class RawJSON(str):
     """标记一段已经是合法 JSON 的字符串，在序列化时直接嵌入而无需转义，降低转换开销。
 

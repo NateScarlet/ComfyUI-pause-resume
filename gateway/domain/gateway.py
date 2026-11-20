@@ -19,6 +19,7 @@ from gateway.shared.models import (
     JobFilters,
     QueueState,
     DownstreamState,
+    Reason,
 )
 from gateway.shared.events import (
     StateChangedEvent,
@@ -31,6 +32,7 @@ from gateway.shared.events import (
     DispatchFailedEvent,
     ScriptStateChangedEvent,
 )
+from gateway.domain.downstream_lifecycle import DownstreamLifecycle
 from gateway.domain.estimation_service import EstimationService
 from gateway.domain.crash_skip_policy import CrashSkipPolicy
 
@@ -84,9 +86,17 @@ class Gateway:
         self._paused = state_repo.get_paused()
         self._restart_after_idle_on_pause = restart_after_idle_on_pause
         self._downstream_executing = downstream_executing
-        self._downstream_ready = downstream_ready
-        # 停机是网关运行时状态，不持久化：网关每次启动时由配置决定（按需启动即初始停机）
-        self._downstream_shutdown = downstream_shutdown
+
+        # 构造参数仅提供初始状态；停机是运行时状态，不持久化，由配置决定
+        if downstream_shutdown:
+            initial_downstream_state = DownstreamState.SHUTDOWN
+        elif downstream_ready:
+            initial_downstream_state = DownstreamState.READY
+        else:
+            initial_downstream_state = DownstreamState.STARTING
+        self._downstream_lifecycle = DownstreamLifecycle(
+            initial_downstream_state, event_bus, queue_reader
+        )
 
         # 授权勾选以持久化的用户选择为准，从未勾选过时使用环境变量提供的初始值
         persisted_allow_idle_shutdown = state_repo.get_allow_idle_shutdown()
@@ -177,12 +187,8 @@ class Gateway:
 
     @property
     def downstream_state(self) -> DownstreamState:
-        """下游进程当前的生命周期状态。"""
-        if self._downstream_shutdown:
-            return DownstreamState.SHUTDOWN
-        if not self._downstream_ready:
-            return DownstreamState.STARTING
-        return DownstreamState.READY
+        """下游进程当前的权威生命周期状态。"""
+        return self._downstream_lifecycle.state
 
     def _refresh(self) -> None:
         """根据网关当前的业务决策，刷新阻止系统休眠、空闲重启超时与外挂脚本状态。"""
@@ -237,7 +243,10 @@ class Gateway:
 
                 # 空闲判定仅基于业务状态：外挂程序只负责阻止系统休眠，
                 # 不得影响下游重启决策（restart_after_idle 与空闲超时重启）
-                is_idle = not is_busy and self._downstream_ready
+                is_idle = (
+                    not is_busy
+                    and self._downstream_lifecycle.state == DownstreamState.READY
+                )
                 if is_idle and not self._is_idle:
                     self._is_idle = True
                     self._on_idle_entered()
@@ -251,49 +260,22 @@ class Gateway:
         finally:
             self._refreshing = False
 
-    def _set_downstream_ready(self, ready: bool, reason: str) -> None:
-        """统一改写就绪标志，并在改写点输出带原因与上下文的 INFO 日志。
-
-        日志绑定在业务决策的改写点（重启 / 停机 / 唤醒 / 就绪事件 / 崩溃），
-        不进入 _refresh 等高频轮询路径；即使新旧值相同也记录，使日志能证明
-        该改写路径确实被执行过，便于定死 ready 被翻转的步骤。
-        """
-        old_ready = self._downstream_ready
-        self._downstream_ready = ready
-        # 仅在真实迁移时读取队列长度：空改写保持可追踪，但不额外引入队列查询
-        pending: Optional[int] = None
-        if old_ready != ready:
-            pending = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
-        logger.info(
-            "DownstreamReady: %s → %s (reason=%s paused=%s shutdown=%s "
-            "downstream_executing=%s pending=%s)",
-            old_ready,
-            ready,
-            reason,
-            self._paused,
-            self._downstream_shutdown,
-            self._downstream_executing,
-            pending if pending is not None else "n/a",
-        )
-
     def _request_downstream_restart(self) -> None:
-        """发起下游重启并同步将就绪标志置为未就绪。
+        """发起下游重启并同步把权威生命周期置为未就绪待恢复。
 
-        必须在 _refresh 之前同步翻转就绪标志，否则重启期间 _refresh 仍按旧的就绪状态
-        允许系统休眠，可能被系统闲置休眠打断重启流程。后续下游就绪事件到达时会再次更新该标志。
+        必须在 _refresh 之前同步迁移，否则重启期间 _refresh 仍按旧的就绪状态
+        允许系统休眠，可能被系统闲置休眠打断重启流程。后续就绪观测会再经 seam 迁移。
         """
         self._allow_restart = False
-        self._downstream_shutdown = False
-        self._set_downstream_ready(False, "restart")
+        self._downstream_lifecycle.transition(DownstreamState.STARTING, Reason.RESTART)
         self._downstream.restart()
 
     def _request_downstream_shutdown(self) -> None:
         """发起下游停机：终止进程并保持停机，直到有活动将其唤醒。"""
         logger.info("💤 Idle shutdown: terminating downstream to release memory")
-        # 粘滞门控保留，仅复位生命周期标志，使后续唤醒成为一个全新的生命周期
+        # 粘滞门控保留，生命周期经 seam 进入 SHUTDOWN，后续唤醒成为全新的生命周期
         self._allow_restart = False
-        self._downstream_shutdown = True
-        self._set_downstream_ready(False, "shutdown")
+        self._downstream_lifecycle.transition(DownstreamState.SHUTDOWN, Reason.SHUTDOWN)
         self._downstream.stop()
 
     def _arm_idle_restart(self) -> None:
@@ -455,11 +437,10 @@ class Gateway:
 
     def wake_downstream(self) -> None:
         """由活动触发唤醒下游：从停机状态进入未就绪并开始冷启动。"""
-        if not self._downstream_shutdown:
+        if self._downstream_lifecycle.state != DownstreamState.SHUTDOWN:
             return
         logger.info("⏰ Activity detected, cold starting the downstream")
-        self._downstream_shutdown = False
-        self._set_downstream_ready(False, "wakeup")
+        self._downstream_lifecycle.transition(DownstreamState.STARTING, Reason.WAKEUP)
         self._downstream.start()
         self._refresh()
 
@@ -561,21 +542,21 @@ class Gateway:
         executing = ev.executing
         if self._downstream_executing == executing:
             logger.debug(
-                "DownstreamExecutingChanged ignored: already %s (crashed=%s paused=%s ready=%s)",
+                "DownstreamExecutingChanged ignored: already %s (crashed=%s paused=%s downstream_state=%s)",
                 executing,
                 self._crash_skip.crashed_executing,
                 self._paused,
-                self._downstream_ready,
+                self._downstream_lifecycle.state,
             )
             return
 
         logger.info(
-            "DownstreamExecutingChanged: %s → %s (crashed=%s paused=%s ready=%s ever_active=%s allow_restart=%s)",
+            "DownstreamExecutingChanged: %s → %s (crashed=%s paused=%s downstream_state=%s ever_active=%s allow_restart=%s)",
             self._downstream_executing,
             executing,
             self._crash_skip.crashed_executing,
             self._paused,
-            self._downstream_ready,
+            self._downstream_lifecycle.state,
             self._ever_active,
             self._allow_restart,
         )
@@ -610,19 +591,20 @@ class Gateway:
             skip = self.get_dispatch_skip()
             logger.info(
                 "DownstreamExecutingChanged: executing=False done, dispatch_skip=%s "
-                "(pending=%s crashed=%s paused=%s ready=%s)",
+                "(pending=%s crashed=%s paused=%s downstream_state=%s)",
                 skip,
                 self._queue_reader.count(JobFilters([JobStatus.PENDING])),
                 self._crash_skip.crashed_executing,
                 self._paused,
-                self._downstream_ready,
+                self._downstream_lifecycle.state,
             )
             self._publish_status_changed()
             self._dispatcher.dispatch(skip)
 
     def _handle_downstream_ready_changed(self, ev: DownstreamReadyChangedEvent) -> None:
-        """设置下游就绪状态，并在合适时触发派发。"""
-        self._set_downstream_ready(ev.ready, "ready_event")
+        """处理基础设施的就绪观测，经 seam 改写权威状态并在合适时触发派发。"""
+        target = DownstreamState.READY if ev.ready else DownstreamState.STARTING
+        self._downstream_lifecycle.transition(target, Reason.READY_POLL)
         self._refresh()
         self._publish_status_changed()
         if ev.ready:
@@ -642,8 +624,9 @@ class Gateway:
             JobFilters([JobStatus.RUNNING])
         )
         self._allow_restart = False
-        # 崩溃即视为下游未就绪，立即阻止休眠，覆盖崩溃检测到重启开始之间的空窗期
-        self._set_downstream_ready(False, "crash")
+        # 崩溃与卡死都归入未就绪待恢复，立即阻止休眠，覆盖检测到重启之间的空窗期
+        crash_reason = Reason.STALL if ev.error_summary is not None else Reason.CRASH
+        self._downstream_lifecycle.transition(DownstreamState.STARTING, crash_reason)
 
         if running_jobs:
             job = running_jobs[0]
@@ -707,7 +690,7 @@ class Gateway:
             reason: Optional[str] = "paused"
         elif self._downstream_executing:
             reason = "downstream_executing"
-        elif not self._downstream_ready:
+        elif self._downstream_lifecycle.state != DownstreamState.READY:
             reason = "not downstream_ready"
         else:
             reason = None
@@ -719,11 +702,11 @@ class Gateway:
                 pending = self._queue_reader.count(JobFilters([JobStatus.PENDING]))
                 logger.info(
                     "Dispatch blocked: %s (paused=%s downstream_executing=%s "
-                    "downstream_ready=%s pending=%d)",
+                    "downstream_state=%s pending=%d)",
                     reason,
                     self._paused,
                     self._downstream_executing,
-                    self._downstream_ready,
+                    self._downstream_lifecycle.state,
                     pending,
                 )
                 self._last_dispatch_gate_reason = reason
@@ -746,7 +729,7 @@ class Gateway:
         """
         is_busy = self._is_busy(has_jobs)
         downstream_starting = (
-            not self._downstream_ready and not self._downstream_shutdown
+            self._downstream_lifecycle.state == DownstreamState.STARTING
         )
         return is_busy or scripts_running or downstream_starting
 

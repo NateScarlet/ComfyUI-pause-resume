@@ -77,7 +77,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
     def test_initial_state_is_not_ready(self):
         """初始启动阶段下游必须视为未就绪，API 请求从网关启动起就应进入等待。"""
         client, _ = self._make_client()
-        self.assertFalse(client.downstream_ready)
+        self.assertFalse(client._downstream_ready)
 
     def test_monitor_marks_unready_before_crash_event_within_delay_window(self):
         """崩溃被检测到的瞬间就应翻转未就绪并先于崩溃事件发布，而非等重启开始。
@@ -117,7 +117,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             self.assertLess(bus.events.index(ready_events[0]), crash_indexes[0])
 
             # 崩溃周期结束后下游仍应保持未就绪，直到真正重新就绪
-            self.assertFalse(client.downstream_ready)
+            self.assertFalse(client._downstream_ready)
             self.assertEqual(restart_calls, [True])
 
         asyncio.run(scenario())
@@ -163,7 +163,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
                 if isinstance(e, DownstreamReadyChangedEvent) and not e.ready
             ]
             self.assertEqual(len(unready_events), 1)
-            self.assertFalse(client2.downstream_ready)
+            self.assertFalse(client2._downstream_ready)
 
         asyncio.run(scenario())
 
@@ -194,7 +194,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             async def fake_wait() -> None:
                 wait_calls.append(True)
                 if len(wait_calls) <= 2:
-                    ready_during_failures.append(client.downstream_ready)
+                    ready_during_failures.append(client._downstream_ready)
                     raise DownstreamStartupTimeout("Downstream wait timeout")
                 # 第三次成功：模拟真实契约——翻转就绪标志
                 client._downstream_ready = True
@@ -216,7 +216,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             self.assertFalse(spawned[2].killed)
             # 失败重试期间必须保持未就绪，成功后才翻转
             self.assertEqual(ready_during_failures, [False, False])
-            self.assertTrue(client.downstream_ready)
+            self.assertTrue(client._downstream_ready)
             # 两次失败重试之间应遵守配置的重试延迟下限
             self.assertGreaterEqual(elapsed, 2 * 0.01)
 
@@ -323,7 +323,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             ]
             self.assertEqual(len(crash_events), 1)
             self.assertEqual(spawn_count, 3)
-            self.assertTrue(client.downstream_ready)
+            self.assertTrue(client._downstream_ready)
 
         asyncio.run(scenario())
 
@@ -348,7 +348,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             client._on_downstream_stall("CUDA error: out of memory")
             await asyncio.sleep(0.01)
 
-            self.assertFalse(client.downstream_ready)
+            self.assertFalse(client._downstream_ready)
             crash_events = [
                 e for e in bus.events if isinstance(e, DownstreamCrashedEvent)
             ]
@@ -448,34 +448,6 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
         asyncio.run(scenario())
 
 
-    def test_mark_unready_logs_real_transition_with_reason(self):
-        """就绪→未就绪的迁移必须留下带原因的 INFO 日志（#24）。"""
-        client, _ = self._make_client()
-        client._downstream_ready = True
-
-        with self.assertLogs(
-            "gateway.infrastructure.comfyui.downstream", level="INFO"
-        ) as captured:
-            client._mark_downstream_unready("crash")
-
-        self.assertTrue(
-            any(
-                "True → False" in line and "reason=crash" in line
-                for line in captured.output
-            )
-        )
-        self.assertFalse(client.downstream_ready)
-
-    def test_mark_unready_silent_when_already_unready(self):
-        """已经未就绪时重复标记不得刷屏（#24）。"""
-        client, _ = self._make_client()
-        with self.assertNoLogs(
-            "gateway.infrastructure.comfyui.downstream", level="INFO"
-        ):
-            client._mark_downstream_unready("restart")
-        self.assertFalse(client.downstream_ready)
-
-
 class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
     """测试下游主动停机与冷启动的进程生命周期契约（#16）。"""
 
@@ -515,7 +487,7 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             self.assertTrue(process.killed)
             self.assertIsNone(client._process)
             self.assertTrue(client._intentionally_stopped)
-            self.assertFalse(client.downstream_ready)
+            self.assertFalse(client._downstream_ready)
             self.assertEqual(
                 [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
             )
@@ -574,7 +546,7 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
 
             self.assertFalse(client._intentionally_stopped)
             self.assertEqual(len(spawned), 1)
-            self.assertTrue(client.downstream_ready)
+            self.assertTrue(client._downstream_ready)
 
         asyncio.run(scenario())
 
@@ -606,7 +578,7 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             self.assertEqual(len(spawned), 1)
             self.assertIsNotNone(client._process)
             self.assertFalse(client._intentionally_stopped)
-            self.assertTrue(client.downstream_ready)
+            self.assertTrue(client._downstream_ready)
 
         asyncio.run(scenario())
 
@@ -639,7 +611,7 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             self.assertEqual(len(spawned), 1)
             self.assertEqual(client._process, spawned[0])
             self.assertFalse(client._intentionally_stopped)
-            self.assertTrue(client.downstream_ready)
+            self.assertTrue(client._downstream_ready)
 
         asyncio.run(scenario())
 

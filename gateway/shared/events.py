@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from gateway.shared.models import DownstreamState, Reason
+
 
 @dataclass(frozen=True)
 class StateChangedEvent:
@@ -29,6 +31,14 @@ class DownstreamReadyChangedEvent:
     """下游 ComfyUI 启动就绪状态发生变化的物理事件。"""
 
     ready: bool
+
+
+@dataclass(frozen=True)
+class DownstreamStateChanged:
+    """下游生命周期权威状态在 seam 成功转换后发布的事件。"""
+
+    state: DownstreamState
+    reason: Reason
 
 
 @dataclass(frozen=True)

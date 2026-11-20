@@ -58,10 +58,10 @@ class JobDownstreamSyncer:
             asyncio.create_task(self._sync_all())
 
     async def _sync_all(self) -> None:
-        """从下游批量同步当前队列中所有可能存在的任务的 outputs 和 assets 数据。"""
-        if not self._downstream.downstream_ready:
-            return
+        """从下游批量同步当前队列中所有可能存在的任务的 outputs 和 assets 数据。
 
+        下游未就绪时物理客户端的 get_queue/get_history 直接返回 None，无需在此重复检查。
+        """
         logger.debug("🔄 Bulk syncing all tasks from downstream...")
         try:
             # 1. 发起并发查询拉取 queue 和 history

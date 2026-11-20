@@ -14,11 +14,11 @@ from gateway.shared.interfaces import (
     DownstreamClient,
     EventBus,
 )
-from gateway.shared.models import JobStatus, JobFilters
+from gateway.shared.models import DownstreamState, JobStatus, JobFilters
 from gateway.shared.events import (
     StatusChangedEvent,
     StateChangedEvent,
-    DownstreamReadyChangedEvent,
+    DownstreamStateChanged,
 )
 from gateway.shared.exceptions import GatewayError, JobNotFoundError
 from gateway.application.facade import AppFacade
@@ -69,6 +69,7 @@ class GatewayHandlers:
         # SSE 广播的最近状态缓存：连接快照会先更新，后续增量推送复用
         self._sse_paused: bool = False
         self._sse_queue_remaining: int = 0
+        self._sse_downstream: Optional[DownstreamState] = None
         # SSE 客户端所在事件循环；未建立连接时为 None，此时无需广播
         self._sse_loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -81,6 +82,9 @@ class GatewayHandlers:
         )
         self._unsub_state = self._event_bus.subscribe(
             StateChangedEvent, self._on_sse_pause_changed
+        )
+        self._unsub_downstream_state = self._event_bus.subscribe(
+            DownstreamStateChanged, self._on_sse_downstream_state_changed
         )
 
         # WS 广播防抖控制变量
@@ -142,6 +146,11 @@ class GatewayHandlers:
         self._sse_queue_remaining = ev.queue_remaining
         self._broadcast_sse_frame()
 
+    def _on_sse_downstream_state_changed(self, ev: DownstreamStateChanged) -> None:
+        """领域 seam 发布的权威状态变化，直接作为 SSE 推送的状态值。"""
+        self._sse_downstream = ev.state
+        self._broadcast_sse_frame()
+
     def _broadcast_sse_frame(self) -> None:
         """把当前状态快照入队到所有 SSE 客户端。
 
@@ -151,7 +160,15 @@ class GatewayHandlers:
         if loop is None:
             return
         data = json.dumps(
-            {"paused": self._sse_paused, "queue_remaining": self._sse_queue_remaining}
+            {
+                "paused": self._sse_paused,
+                "queue_remaining": self._sse_queue_remaining,
+                "downstream": (
+                    self._sse_downstream.value
+                    if self._sse_downstream is not None
+                    else None
+                ),
+            }
         )
         try:
             loop.call_soon_threadsafe(self._enqueue_sse_data, data)
@@ -239,11 +256,16 @@ class GatewayHandlers:
         self._sse_loop = asyncio.get_running_loop()
         self._sse_paused = state.paused
         self._sse_queue_remaining = queue_remaining
+        self._sse_downstream = state.downstream_state
         self.sse_clients.add(q)
         try:
             await response.write(b"retry: 3000\n\n")
             initial_data = json.dumps(
-                {"paused": state.paused, "queue_remaining": queue_remaining}
+                {
+                    "paused": state.paused,
+                    "queue_remaining": queue_remaining,
+                    "downstream": state.downstream_state.value,
+                }
             )
             await response.write(f"data: {initial_data}\n\n".encode("utf-8"))
 
@@ -298,7 +320,10 @@ class GatewayHandlers:
             )
         )
 
-        if not self._downstream_service.downstream_ready and not is_local_jobs_api:
+        if (
+            self._app.get_state.handle().downstream_state != DownstreamState.READY
+            and not is_local_jobs_api
+        ):
             if method == "GET" and (
                 path == "/" or path == "/index.html" or "text/html" in accept
             ):
@@ -369,16 +394,16 @@ class GatewayHandlers:
         return await self._handle_default_proxy(request, method, downstream_url)
 
     async def _wait_for_downstream_ready(self) -> bool:
-        """等待下游服务就绪，最多等待 _startup_wait_sec 秒。
+        """等待下游进入权威 READY 状态，最多等待 _startup_wait_sec 秒。
 
-        通过事件总线订阅 DownstreamReadyChangedEvent；就绪事件唤醒后仍需复核
-        downstream_ready，避免下游就绪后立即再次重启导致误判就绪。
+        通过事件总线订阅领域 seam 发布的 DownstreamStateChanged；事件唤醒后仍从门面复核
+        权威状态，避免就绪后立即再次重启导致误判就绪。
         超过 _startup_wait_sec 秒仍未就绪则返回 False。
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._startup_wait_sec
         while True:
-            if self._downstream_service.downstream_ready:
+            if self._app.get_state.handle().downstream_state == DownstreamState.READY:
                 return True
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -386,12 +411,12 @@ class GatewayHandlers:
 
             ready_event = asyncio.Event()
 
-            def _on_ready_changed(ev: DownstreamReadyChangedEvent) -> None:
-                if ev.ready:
+            def _on_state_changed(ev: DownstreamStateChanged) -> None:
+                if ev.state == DownstreamState.READY:
                     ready_event.set()
 
             unsubscribe = self._event_bus.subscribe(
-                DownstreamReadyChangedEvent, _on_ready_changed
+                DownstreamStateChanged, _on_state_changed
             )
             try:
                 try:
@@ -821,6 +846,7 @@ class GatewayHandlers:
         self._unsub_status()
         self._unsub_sse_status()
         self._unsub_state()
+        self._unsub_downstream_state()
 
         for q in list(self.sse_clients):
             try:

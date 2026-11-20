@@ -183,12 +183,6 @@ class DownstreamClient(ABC):
 
     @property
     @abstractmethod
-    def downstream_ready(self) -> bool:
-        """下游服务是否已就绪。"""
-        pass
-
-    @property
-    @abstractmethod
     def downstream_port(self) -> int:
         """下游服务监听的物理端口。"""
         pass

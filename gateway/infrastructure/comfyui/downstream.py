@@ -71,11 +71,6 @@ class ComfyUIDownstreamClient(DownstreamClient):
         self._log_watcher: Optional[ComfyUIExecutionLogWatcher] = None
 
     @property
-    def downstream_ready(self) -> bool:
-        """下游服务是否已就绪（接口实现）。"""
-        return self._downstream_ready
-
-    @property
     def downstream_port(self) -> int:
         """下游服务监听的物理端口（接口实现）。"""
         return self._downstream_port
@@ -137,7 +132,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
         """主动终止下游并保持停机，不再自动拉起。"""
         async with self._lifecycle_lock:
             self._intentionally_stopped = True
-            self._mark_downstream_unready("stop")
+            self._mark_downstream_unready()
             await self._terminate_current_process()
 
     async def send_prompt(self, prompt_id: str, body: Dict[str, Any]) -> None:
@@ -284,7 +279,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
         logger.error("❌ Downstream stalled after an execution error, restarting...")
         # 卡死被检测到的瞬间立即翻转就绪状态，让代理层从空窗期一开始就让
         # API 请求进入等待，而不是把请求转发到已失去执行能力的下游上
-        self._mark_downstream_unready("stall")
+        self._mark_downstream_unready()
         self.event_bus.publish(DownstreamCrashedEvent(error_summary=error_summary))
         self.restart()
 
@@ -308,7 +303,6 @@ class ComfyUIDownstreamClient(DownstreamClient):
                         url, timeout=aiohttp.ClientTimeout(total=3)
                     ) as resp:
                         if resp.status == 200:
-                            logger.info("✅ Downstream service ready")
                             self._downstream_ready = True
                             self.event_bus.publish(
                                 DownstreamReadyChangedEvent(ready=True)
@@ -320,17 +314,16 @@ class ComfyUIDownstreamClient(DownstreamClient):
         logger.error("❌ Downstream wait timeout")
         raise DownstreamStartupTimeout("Downstream wait timeout")
 
-    def _mark_downstream_unready(self, reason: str) -> None:
-        """将下游置为未就绪；仅在就绪→未就绪的真实状态迁移时发布事件。
+    def _mark_downstream_unready(self) -> None:
+        """把私有物理观测标志置为未就绪；仅在真实迁移时发布观测事件。
 
-        事件语义保持为状态迁移通知：已处于未就绪时再次重启（如崩溃流程中
-        检测阶段已翻转过）不再重复广播，避免订阅方做冗余的刷新与状态发布。
-        日志同样只记录真实迁移，并带上触发原因，便于定位静默的未就绪翻转。
+        该标志只供本客户端的轮询循环内部控制；业务权威状态由领域 seam 负责，
+        因此这里既不暴露就绪属性，也不输出第二套生命周期日志。
+        已处于未就绪时再次翻转不再重复广播，避免订阅方做冗余刷新。
         """
         if not self._downstream_ready:
             return
         self._downstream_ready = False
-        logger.info("Downstream client ready: True → False (reason=%s)", reason)
         self.event_bus.publish(DownstreamReadyChangedEvent(ready=False))
 
     async def _terminate_current_process(self) -> None:
@@ -368,7 +361,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
             # 否则监控会把尚未结束的主动停机误判为崩溃
             self._intentionally_stopped = False
             self._is_restarting = True
-            self._mark_downstream_unready("restart")
+            self._mark_downstream_unready()
             self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
             try:
                 while not self.exiting:
@@ -412,7 +405,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
                 )
                 # 崩溃被检测到的瞬间立即翻转就绪状态，让代理层从空窗期一开始就让
                 # API 请求进入等待，而不是把请求转发到已死进程上立即返回 502
-                self._mark_downstream_unready("crash")
+                self._mark_downstream_unready()
                 self.event_bus.publish(DownstreamCrashedEvent())
                 await asyncio.sleep(self.config.restart_delay_sec)
                 await self.restart_downstream()

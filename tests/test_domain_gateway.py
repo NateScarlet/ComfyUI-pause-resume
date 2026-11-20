@@ -14,6 +14,7 @@ from gateway.shared.models import (
     JobFilters,
     QueueState,
     RawJSON,
+    Reason,
 )
 from gateway.shared.interfaces import (
     StateRepository,
@@ -31,6 +32,7 @@ from gateway.shared.events import (
     StatusChangedEvent,
     DownstreamExecutingChangedEvent,
     DownstreamReadyChangedEvent,
+    DownstreamStateChanged,
     DownstreamCrashedEvent,
     QueueModifiedEvent,
     DispatchSuccessEvent,
@@ -281,7 +283,7 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=False)
         self.assertFalse(g.paused)
         self.assertFalse(g._downstream_executing)
-        self.assertFalse(g._downstream_ready)
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
         self.assertEqual(g._crash_skip.crash_count, 0)
         self.assertEqual(g._crash_skip.dispatch_skip_offset, 0)
 
@@ -349,12 +351,12 @@ class TestDomainGateway(unittest.TestCase):
         """测试下游就绪变化的派发决策。"""
         g = _make_gateway(paused=False)
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
-        self.assertTrue(g._downstream_ready)
+        self.assertEqual(g.downstream_state, DownstreamState.READY)
         g._mock_dispatcher.dispatch.assert_called_once()
 
         g = _make_gateway(paused=True)
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
-        self.assertTrue(g._downstream_ready)
+        self.assertEqual(g.downstream_state, DownstreamState.READY)
         g._mock_dispatcher.dispatch.assert_not_called()
 
     def test_dispatch_failed_decision(self):
@@ -541,8 +543,8 @@ class TestDomainGateway(unittest.TestCase):
         # 空闲 且 无脚本在跑，但下游未就绪 -> 阻止休眠
         self.assertTrue(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
 
-        # 下游就绪后恢复允许休眠
-        g._downstream_ready = True
+        # 下游就绪后恢复允许休眠（就绪观测经 seam 改写权威状态）
+        g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
         self.assertFalse(g._should_prevent_sleep(has_jobs=False, scripts_running=False))
 
     def test_downstream_ready_change_drives_sleep_prevention(self):
@@ -573,7 +575,7 @@ class TestDomainGateway(unittest.TestCase):
 
         g._on_idle_timeout()
 
-        self.assertFalse(g._downstream_ready)
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
         g._mock_downstream.restart.assert_called_once()
         g._mock_power.prevent_sleep.assert_called()
 
@@ -584,7 +586,7 @@ class TestDomainGateway(unittest.TestCase):
 
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
-        self.assertFalse(g._downstream_ready)
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
         g._mock_power.prevent_sleep.assert_called()
 
     def test_script_state_changed_decision(self):
@@ -603,7 +605,7 @@ class TestDomainGateway(unittest.TestCase):
 
     def test_downstream_crashed_triggers_refresh(self):
         """测试下游物理崩溃时，不仅重入列还会触发 _refresh。"""
-        g = _make_gateway(paused=False)
+        g = _make_gateway(paused=False, downstream_ready=True)
         g._mock_writer.requeue_running_if_exists.return_value = True
 
         # 初始化时调用过一次 _refresh（每次 _refresh 调用 count 一次）
@@ -616,9 +618,20 @@ class TestDomainGateway(unittest.TestCase):
         # 触发崩溃事件
         g._mock_event_bus.publish(DownstreamCrashedEvent())
 
-        # 崩溃后 _refresh 被触发，并且触发了 _publish_status_changed
-        self.assertEqual(g._mock_reader.count.call_count, 4)
-        self.assertEqual(g._mock_pm.is_running.call_count, 2)
+        # 崩溃后经 seam 改写权威状态，再触发 _refresh 与状态发布
+        self.assertEqual(
+            [
+                ev
+                for ev in g._mock_event_bus.published
+                if isinstance(ev, DownstreamStateChanged)
+            ],
+            [
+                DownstreamStateChanged(
+                    state=DownstreamState.STARTING, reason=Reason.CRASH
+                )
+            ],
+        )
+        self.assertEqual(g._mock_pm.is_running.call_count, initial_count_running + 1)
 
     def test_refresh_reentrancy_prevention(self):
         """测试 _refresh 能够有效防范事件回调触发的无限递归。"""
@@ -1365,7 +1378,7 @@ class TestDomainGateway(unittest.TestCase):
         g.restart_now()
 
         self.assertTrue(g.paused)
-        self.assertFalse(g._downstream_ready)
+        self.assertEqual(g.downstream_state, DownstreamState.STARTING)
         g._mock_dispatcher.dispatch.assert_not_called()
         g._mock_downstream.restart.assert_called_once()
 
@@ -1463,7 +1476,6 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_downstream.stop.assert_called_once()
         g._mock_downstream.restart.assert_not_called()
         self.assertEqual(g.downstream_state, DownstreamState.SHUTDOWN)
-        self.assertFalse(g._downstream_ready)
 
     def test_idle_shutdown_resets_allow_restart_for_next_lifecycle(self):
         """空闲停机保留粘滞门控但复位生命周期标志，唤醒后须等新任务才允许空闲重启。"""
@@ -1813,92 +1825,18 @@ class TestDomainGateway(unittest.TestCase):
         )
 
 
-class TestDownstreamReadyAndDispatchLogging(unittest.TestCase):
-    """验证 ready 改写与派发门控留下可定位的 INFO 日志（#24）。"""
+class TestDispatchGateLogging(unittest.TestCase):
+    """验证派发门控留下可定位的 INFO 日志（#24）。
+
+    生命周期改写路径的日志断言已迁移到 test_downstream_lifecycle.py 与
+    test_gateway_lifecycle_seam.py，统一由 seam 产生。
+    """
 
     _LOGGER = "gateway.domain.gateway"
 
     @staticmethod
-    def _ready_lines(output: List[str]) -> List[str]:
-        return [line for line in output if "DownstreamReady:" in line]
-
-    @staticmethod
     def _gate_lines(output: List[str]) -> List[str]:
         return [line for line in output if "Dispatch blocked:" in line]
-
-    def test_restart_ready_write_logs_reason_and_context(self):
-        g = _make_gateway(
-            paused=True,
-            downstream_ready=True,
-            downstream_executing=True,
-            ever_active=True,
-            pending_count=3,
-        )
-        with self.assertLogs(self._LOGGER, level="INFO") as captured:
-            g.restart_now()
-
-        lines = self._ready_lines(captured.output)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("True → False", lines[0])
-        self.assertIn("reason=restart", lines[0])
-        self.assertIn("paused=True", lines[0])
-        self.assertIn("shutdown=False", lines[0])
-        self.assertIn("downstream_executing=False", lines[0])
-        self.assertIn("pending=3", lines[0])
-
-    def test_shutdown_ready_write_logs_reason_and_context(self):
-        timer = FakeTimer()
-        sampler = FakeMemorySampler(available_mb=512)
-        g = _make_gateway(
-            paused=False,
-            ever_active=True,
-            downstream_ready=True,
-            idle_restart_timeout=600,
-            timer=timer,
-            memory_sampler=sampler,
-            allow_idle_shutdown_initial=True,
-        )
-        with self.assertLogs(self._LOGGER, level="INFO") as captured:
-            timer.advance(600)
-
-        lines = self._ready_lines(captured.output)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("True → False", lines[0])
-        self.assertIn("reason=shutdown", lines[0])
-        self.assertIn("shutdown=True", lines[0])
-
-    def test_wakeup_ready_write_logs_reason(self):
-        g = _make_gateway(downstream_shutdown=True, downstream_ready=False)
-        with self.assertLogs(self._LOGGER, level="INFO") as captured:
-            g.wake_downstream()
-
-        lines = self._ready_lines(captured.output)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("False → False", lines[0])
-        self.assertIn("reason=wakeup", lines[0])
-        self.assertIn("shutdown=False", lines[0])
-
-    def test_ready_event_write_logs_reason_and_context(self):
-        g = _make_gateway(paused=False, downstream_ready=False, pending_count=2)
-        with self.assertLogs(self._LOGGER, level="INFO") as captured:
-            g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
-
-        lines = self._ready_lines(captured.output)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("False → True", lines[0])
-        self.assertIn("reason=ready_event", lines[0])
-        self.assertIn("paused=False", lines[0])
-        self.assertIn("pending=2", lines[0])
-
-    def test_crash_ready_write_logs_reason(self):
-        g = _make_gateway(paused=False, downstream_ready=True)
-        with self.assertLogs(self._LOGGER, level="INFO") as captured:
-            g._mock_event_bus.publish(DownstreamCrashedEvent())
-
-        lines = self._ready_lines(captured.output)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("True → False", lines[0])
-        self.assertIn("reason=crash", lines[0])
 
     def test_dispatch_gate_logs_specific_blocking_condition(self):
         cases = [
