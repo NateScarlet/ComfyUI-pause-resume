@@ -268,7 +268,7 @@ class Gateway:
         """
         self._allow_restart = False
         self._downstream_lifecycle.transition(DownstreamState.STARTING, Reason.RESTART)
-        self._downstream.restart()
+        self._downstream.ensure_ready()
 
     def _request_downstream_shutdown(self) -> None:
         """发起下游停机：终止进程并保持停机，直到有活动将其唤醒。"""
@@ -276,7 +276,7 @@ class Gateway:
         # 粘滞门控保留，生命周期经 seam 进入 SHUTDOWN，后续唤醒成为全新的生命周期
         self._allow_restart = False
         self._downstream_lifecycle.transition(DownstreamState.SHUTDOWN, Reason.SHUTDOWN)
-        self._downstream.stop()
+        self._downstream.shutdown()
 
     def _arm_idle_restart(self) -> None:
         """按当前空闲窗口剩余时间重新安排下游资源释放评估。
@@ -441,7 +441,7 @@ class Gateway:
             return
         logger.info("⏰ Activity detected, cold starting the downstream")
         self._downstream_lifecycle.transition(DownstreamState.STARTING, Reason.WAKEUP)
-        self._downstream.start()
+        self._downstream.ensure_ready()
         self._refresh()
 
     def set_allow_idle_shutdown(self, allow: bool) -> None:

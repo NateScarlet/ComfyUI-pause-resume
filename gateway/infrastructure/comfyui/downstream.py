@@ -60,10 +60,8 @@ class ComfyUIDownstreamClient(DownstreamClient):
 
         # 所有进程生命周期命令都经同一把锁串行执行，避免停机与唤醒在同一 tick 交错
         self._lifecycle_lock = asyncio.Lock()
-        # 生命周期协程的异常在后续命令中重新抛出，避免失败只留在 asyncio 日志里
-        self._lifecycle_error: Optional[BaseException] = None
-        # 尚未完成的重启生命周期任务：用来合并重复的重启请求
-        self._pending_restart_task: Optional["asyncio.Task[None]"] = None
+        # 尚未完成的就绪生命周期任务：用来合并重复的就绪意图（含冷启动）
+        self._pending_ready_task: Optional["asyncio.Task[None]"] = None
 
         # 每个下游进程配一个日志观察者，随进程创建与作废；
         # 日志读取在后台线程上进行，而卡死判定用的定时器只能在事件循环线程启停，
@@ -75,57 +73,49 @@ class ComfyUIDownstreamClient(DownstreamClient):
         """下游服务监听的物理端口（接口实现）。"""
         return self._downstream_port
 
-    def restart(self) -> None:
-        """重启下游服务（接口实现）。"""
+    def ensure_ready(self) -> None:
+        """发起使下游就绪的意图（接口实现）。
+
+        fire-and-forget：同步返回，返回时下游未必就绪。冷启动与重启共用同一
+        流程，差异由领域在调用前设置的权威生命周期状态表达。
+        """
         if not self._loop.is_running():
             return
         # 已有重启周期在进行（含排队等待生命周期锁）时合并本次请求：
         # 再排一次完整重启会等前一次成功后终止刚就绪的新进程，徒增一次服务中断
-        if (
-            self._pending_restart_task is not None
-            and not self._pending_restart_task.done()
-        ):
+        if self._pending_ready_task is not None and not self._pending_ready_task.done():
             return
-        self._pending_restart_task = self._schedule_lifecycle(self.restart_downstream)
+        self._pending_ready_task = self._schedule_lifecycle(self.restart_downstream)
 
-    def stop(self) -> None:
-        """终止下游进程并保持停机（接口实现）。"""
+    def shutdown(self) -> None:
+        """发起下游停机的意图（接口实现）。
+
+        fire-and-forget：同步返回，返回时进程未必已终止。
+        """
         if not self._loop.is_running():
             return
-        # 停机之后的重启属于新的意图，不能被前面尚未完成的重启请求合并掉
-        self._pending_restart_task = None
+        # 停机之后的就绪请求属于新的意图，不能被前面尚未完成的就绪请求合并掉
+        self._pending_ready_task = None
         self._schedule_lifecycle(self._stop_downstream)
-
-    def start(self) -> None:
-        """冷启动下游进程（接口实现）。"""
-        if not self._loop.is_running():
-            return
-        self._pending_restart_task = self._schedule_lifecycle(self.restart_downstream)
 
     def _schedule_lifecycle(
         self, coroutine_factory: Callable[[], Coroutine[Any, Any, None]]
     ) -> "asyncio.Task[None]":
-        """按命令到达顺序串行调度一个生命周期协程。
-
-        先前的生命周期失败会在下次调度时重新抛给调用者，而不是只留在
-        asyncio 默认的「Task exception was never retrieved」日志里。
-        """
-        previous_error = self._lifecycle_error
-        if previous_error is not None:
-            self._lifecycle_error = None
-            raise previous_error
+        """按命令到达顺序串行调度一个生命周期协程。"""
         task = self._loop.create_task(coroutine_factory())
         task.add_done_callback(self._on_lifecycle_task_done)
         return task
 
     def _on_lifecycle_task_done(self, task: "asyncio.Task[None]") -> None:
-        """记录生命周期协程的失败，使异常不再无人检索。"""
+        """在任务完成回调中记录生命周期失败，使异常不再无人检索。
+
+        失败不向调用者传播：意图接口是 fire-and-forget，错误只通过日志暴露。
+        """
         if task.cancelled():
             return
         error = task.exception()
         if error is None:
             return
-        self._lifecycle_error = error
         logger.error("Downstream lifecycle task failed", exc_info=error)
 
     async def _stop_downstream(self) -> None:
@@ -281,7 +271,7 @@ class ComfyUIDownstreamClient(DownstreamClient):
         # API 请求进入等待，而不是把请求转发到已失去执行能力的下游上
         self._mark_downstream_unready()
         self.event_bus.publish(DownstreamCrashedEvent(error_summary=error_summary))
-        self.restart()
+        self.ensure_ready()
 
     async def wait_downstream_ready(self) -> None:
         """以轮询 GET 的形式等待下游进程就绪。
@@ -449,8 +439,8 @@ class ComfyUIDownstreamClient(DownstreamClient):
             logger.debug(f"Error fetching /history from downstream: {e}")
         return None
 
-    async def shutdown(self) -> None:
-        """停止下游子程序。"""
+    async def close(self) -> None:
+        """网关退出时释放下游资源：置退出标志并终止进程。"""
         self.exiting = True
         self._discard_log_watcher()
         if self._process:

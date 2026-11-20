@@ -262,7 +262,7 @@ async def main() -> None:
             tray_unsub_status()
         if tray_controller is not None:
             tray_controller.stop()
-        await downstream_service.shutdown()
+        await downstream_service.close()
 
         # 构建方释放自己创建的基础设施资源
         try:

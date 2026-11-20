@@ -188,18 +188,19 @@ class DownstreamClient(ABC):
         pass
 
     @abstractmethod
-    def restart(self) -> None:
-        """重启下游服务。"""
+    def ensure_ready(self) -> None:
+        """发起让下游就绪的意图；冷启动还是重启由领域的权威生命周期状态决定。
+
+        fire-and-forget：同步返回，返回时下游未必就绪；实际拉起在后台任务中完成。
+        """
         pass
 
     @abstractmethod
-    def stop(self) -> None:
-        """终止下游进程并保持停机，直到被冷启动唤醒。"""
-        pass
+    def shutdown(self) -> None:
+        """发起下游停机的意图，保持停机直到下一次 ensure_ready 唤醒。
 
-    @abstractmethod
-    def start(self) -> None:
-        """冷启动下游进程（从停机状态拉起）。"""
+        fire-and-forget：同步返回，返回时进程未必已终止；实际终止在后台任务中完成。
+        """
         pass
 
     @abstractmethod

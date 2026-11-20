@@ -438,7 +438,7 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
 
             self._feed_failure_line(client)
             await asyncio.sleep(0)
-            await client.shutdown()
+            await client.close()
             self.timer.advance(3600)
 
             self.assertEqual(
@@ -449,7 +449,11 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
 
 
 class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
-    """测试下游主动停机与冷启动的进程生命周期契约（#16）。"""
+    """测试下游主动停机与就绪意图的进程生命周期契约（#16）。
+
+    断言只通过公共方法替身（进程拉起 spy）与事件总线观测，
+    不读写实现的私有生命周期时序标志。
+    """
 
     def setUp(self) -> None:
         self.timer = FakeTimer()
@@ -472,7 +476,16 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
         )
         return client, bus
 
-    def test_stop_terminates_process_and_stays_shutdown(self):
+    @staticmethod
+    def _ready_events(bus: _RecordingEventBus, ready: bool) -> List[object]:
+        """从事件总线中筛出指定方向的就绪观测事件。"""
+        return [
+            e
+            for e in bus.events
+            if isinstance(e, DownstreamReadyChangedEvent) and e.ready == ready
+        ]
+
+    def test_shutdown_terminates_process_and_stays_shutdown(self):
         """停机必须终止进程并保持未就绪，且发布未就绪而非崩溃（#16）。"""
 
         async def scenario() -> None:
@@ -480,23 +493,23 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             process = _FakeProcess()
             client._process = process
             client._downstream_ready = True
+            spawn_count = 0
 
-            client.stop()
+            def fake_start_downstream() -> None:
+                nonlocal spawn_count
+                spawn_count += 1
+
+            client.start_downstream = fake_start_downstream  # type: ignore[method-assign]
+
+            client.shutdown()
             await asyncio.sleep(0.05)
 
             self.assertTrue(process.killed)
-            self.assertIsNone(client._process)
-            self.assertTrue(client._intentionally_stopped)
-            self.assertFalse(client._downstream_ready)
+            self.assertEqual(spawn_count, 0)
             self.assertEqual(
                 [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
             )
-            self.assertTrue(
-                any(
-                    isinstance(e, DownstreamReadyChangedEvent) and not e.ready
-                    for e in bus.events
-                )
-            )
+            self.assertEqual(len(self._ready_events(bus, False)), 1)
 
         asyncio.run(scenario())
 
@@ -505,8 +518,10 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
 
         async def scenario() -> None:
             client, bus = self._make_client(loop=asyncio.get_running_loop())
-            client._process = _FakeProcess()
-            client._intentionally_stopped = True
+            process = _FakeProcess()
+            client._process = process
+            client.shutdown()
+            await asyncio.sleep(0.02)
 
             async def stop_monitor_later() -> None:
                 await asyncio.sleep(0.05)
@@ -515,18 +530,20 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             asyncio.create_task(stop_monitor_later())
             await asyncio.wait_for(client.monitor_downstream(), timeout=3)
 
+            self.assertTrue(process.killed)
             self.assertEqual(
                 [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
             )
 
         asyncio.run(scenario())
 
-    def test_start_cold_starts_and_clears_stop_flag(self):
-        """唤醒必须清除停机标志并复用重启闭环等待就绪（#16）。"""
+    def test_ensure_ready_after_shutdown_cold_starts(self):
+        """停机后的唤醒必须复用重启闭环拉起新进程（#16）。"""
 
         async def scenario() -> None:
             client, bus = self._make_client(loop=asyncio.get_running_loop())
-            client._intentionally_stopped = True
+            client.shutdown()
+            await asyncio.sleep(0.02)
             spawned: List[_FakeProcess] = []
 
             def fake_start_downstream() -> None:
@@ -535,87 +552,83 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
                 client._process = p
 
             async def fake_wait() -> None:
-                client._downstream_ready = True
+                bus.publish(DownstreamReadyChangedEvent(ready=True))
                 client.exiting = True
 
             client.start_downstream = fake_start_downstream  # type: ignore[method-assign]
             client.wait_downstream_ready = fake_wait  # type: ignore[method-assign]
 
-            client.start()
+            client.ensure_ready()
             await asyncio.sleep(0.05)
 
-            self.assertFalse(client._intentionally_stopped)
             self.assertEqual(len(spawned), 1)
-            self.assertTrue(client._downstream_ready)
+            self.assertEqual(len(self._ready_events(bus, True)), 1)
 
         asyncio.run(scenario())
 
-    def test_stop_then_start_in_same_tick_leaves_process_monitored(self):
+    def test_shutdown_then_ensure_ready_in_same_tick_leaves_new_process(self):
         """同一 tick 内停机后立刻唤醒，最终必须留下被监控的新进程（#16 C1）。"""
 
         async def scenario() -> None:
-            client, _ = self._make_client(loop=asyncio.get_running_loop())
+            client, bus = self._make_client(loop=asyncio.get_running_loop())
             client._process = _FakeProcess()
-            client._downstream_ready = True
-
             spawned: List[_FakeProcess] = []
 
             def fake_start_downstream() -> None:
-                process = _FakeProcess()
-                spawned.append(process)
-                client._process = process
+                p = _FakeProcess()
+                spawned.append(p)
+                client._process = p
 
             async def fake_wait() -> None:
-                client._downstream_ready = True
+                bus.publish(DownstreamReadyChangedEvent(ready=True))
 
             client.start_downstream = fake_start_downstream  # type: ignore[method-assign]
             client.wait_downstream_ready = fake_wait  # type: ignore[method-assign]
 
-            client.stop()
-            client.start()
+            client.shutdown()
+            client.ensure_ready()
             await asyncio.sleep(0.2)
 
             self.assertEqual(len(spawned), 1)
-            self.assertIsNotNone(client._process)
-            self.assertFalse(client._intentionally_stopped)
-            self.assertTrue(client._downstream_ready)
+            self.assertFalse(spawned[0].killed)
+            self.assertEqual(len(self._ready_events(bus, True)), 1)
+            self.assertEqual(
+                [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
+            )
 
         asyncio.run(scenario())
 
-    def test_start_during_slow_termination_keeps_new_process(self):
-        """停机尚在等待进程退出时唤醒，不得丢失进程句柄或让生命周期协程崩掉（#16 C1）。"""
+    def test_ensure_ready_during_slow_termination_keeps_new_process(self):
+        """停机尚在等待进程退出时唤醒，不得丢失新进程（#16 C1）。"""
 
         async def scenario() -> None:
-            client, _ = self._make_client(loop=asyncio.get_running_loop())
+            client, bus = self._make_client(loop=asyncio.get_running_loop())
             client._process = _SlowExitProcess()
-            client._downstream_ready = True
-
             spawned: List[_FakeProcess] = []
 
             def fake_start_downstream() -> None:
-                process = _FakeProcess()
-                spawned.append(process)
-                client._process = process
+                p = _FakeProcess()
+                spawned.append(p)
+                client._process = p
 
             async def fake_wait() -> None:
-                client._downstream_ready = True
+                bus.publish(DownstreamReadyChangedEvent(ready=True))
 
             client.start_downstream = fake_start_downstream  # type: ignore[method-assign]
             client.wait_downstream_ready = fake_wait  # type: ignore[method-assign]
 
-            client.stop()
+            client.shutdown()
             await asyncio.sleep(0.02)
-            client.start()
+            client.ensure_ready()
             await asyncio.sleep(0.5)
 
             self.assertEqual(len(spawned), 1)
-            self.assertEqual(client._process, spawned[0])
-            self.assertFalse(client._intentionally_stopped)
-            self.assertTrue(client._downstream_ready)
+            self.assertFalse(spawned[0].killed)
+            self.assertEqual(len(self._ready_events(bus, True)), 1)
 
         asyncio.run(scenario())
 
-    def test_duplicate_restart_while_restarting_is_merged(self):
+    def test_duplicate_ensure_ready_while_restarting_is_merged(self):
         """重启进行中再次请求重启时必须合并，而不是排队再完整重启一次。
 
         串行化后第二个重启会等第一次重启成功、进程刚就绪时再把它终止重拉，
@@ -623,36 +636,36 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
         """
 
         async def scenario() -> None:
-            client, _ = self._make_client(loop=asyncio.get_running_loop())
+            client, bus = self._make_client(loop=asyncio.get_running_loop())
             spawned: List[_FakeProcess] = []
 
             def fake_start_downstream() -> None:
-                process = _FakeProcess()
-                spawned.append(process)
-                client._process = process
+                p = _FakeProcess()
+                spawned.append(p)
+                client._process = p
 
             async def fake_wait() -> None:
                 # 模拟耗时的就绪等待，让第二次重启请求在第一次尚未结束时到达
                 await asyncio.sleep(0.05)
-                client._downstream_ready = True
+                bus.publish(DownstreamReadyChangedEvent(ready=True))
 
             client.start_downstream = fake_start_downstream  # type: ignore[method-assign]
             client.wait_downstream_ready = fake_wait  # type: ignore[method-assign]
 
-            client.restart()
+            client.ensure_ready()
             await asyncio.sleep(0.02)
-            client.restart()
+            client.ensure_ready()
             await asyncio.sleep(0.2)
 
             # 只允许一次完整重启：只拉起一个新进程，且它没有再次被终止
             self.assertEqual(len(spawned), 1)
             self.assertFalse(spawned[0].killed)
-            self.assertIs(client._process, spawned[0])
+            self.assertEqual(len(self._ready_events(bus, True)), 1)
 
         asyncio.run(scenario())
 
-    def test_restart_after_failed_restart_still_runs(self):
-        """一次重启失败不得让后续重启请求被去重永久吞掉。"""
+    def test_ensure_ready_after_failed_attempt_still_runs(self):
+        """一次生命周期失败不得向调用者传播，也不得让后续请求被去重吞掉。"""
 
         async def scenario() -> None:
             client, _ = self._make_client(loop=asyncio.get_running_loop())
@@ -665,24 +678,24 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             async def succeeding_restart() -> None:
                 attempts.append("succeeded")
 
-            client.restart_downstream = failing_restart  # type: ignore[method-assign]
-            client.restart()
-            await asyncio.sleep(0.05)
+            with self.assertLogs(
+                "gateway.infrastructure.comfyui.downstream", level="ERROR"
+            ) as captured:
+                client.restart_downstream = failing_restart  # type: ignore[method-assign]
+                client.ensure_ready()
+                await asyncio.sleep(0.05)
 
-            client.restart_downstream = succeeding_restart  # type: ignore[method-assign]
-            # 先前的失败先向本次调度者重新抛出，保持错误可见性
-            with self.assertRaises(RuntimeError):
-                client.restart()
-            # 再下一次重启请求必须真正执行
-            client.restart()
-            await asyncio.sleep(0.05)
+                client.restart_downstream = succeeding_restart  # type: ignore[method-assign]
+                client.ensure_ready()
+                await asyncio.sleep(0.05)
 
             self.assertEqual(attempts, ["failed", "succeeded"])
+            self.assertTrue(any("lifecycle failed" in line for line in captured.output))
 
         asyncio.run(scenario())
 
-    def test_lifecycle_failure_is_raised_to_the_next_command(self):
-        """生命周期协程失败必须对后续调用者可见，而不是只留在 asyncio 日志里（#16 C1）。"""
+    def test_lifecycle_failure_is_logged_and_next_command_still_runs(self):
+        """生命周期任务失败不再向调用者传播，错误只通过日志暴露。"""
 
         async def scenario() -> None:
             client, _ = self._make_client(loop=asyncio.get_running_loop())
@@ -693,11 +706,17 @@ class TestComfyUIDownstreamClientShutdown(unittest.TestCase):
             client.restart_downstream = failing_restart  # type: ignore[method-assign]
             client.start_downstream = MagicMock()  # type: ignore[method-assign]
 
-            client.restart()
-            await asyncio.sleep(0.05)
+            with self.assertLogs(
+                "gateway.infrastructure.comfyui.downstream", level="ERROR"
+            ) as captured:
+                client.ensure_ready()
+                await asyncio.sleep(0.05)
+                client.ensure_ready()
+                await asyncio.sleep(0.05)
+                client.shutdown()
+                await asyncio.sleep(0.05)
 
-            with self.assertRaises(RuntimeError):
-                client.start()
+            self.assertTrue(any("lifecycle failed" in line for line in captured.output))
 
         asyncio.run(scenario())
 
