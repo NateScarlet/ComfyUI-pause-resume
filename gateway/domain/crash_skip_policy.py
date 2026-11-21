@@ -1,5 +1,7 @@
 from typing import Optional, Set
 
+from gateway.shared.models import CompletionAction, CompletionOutcome, CrashOutcome
+
 
 class CrashSkipPolicy:
     """崩溃跳过策略：管理任务崩溃计数、派发跳过偏移和永久失败判断。
@@ -62,13 +64,8 @@ class CrashSkipPolicy:
         """派发成功后重置跳过偏移。"""
         self._dispatch_skip_offset = 0
 
-    def record_crash(self, job_id: str) -> str:
-        """记录下游崩溃事件，返回下一步动作。
-
-        Returns:
-            'skip': 崩溃次数未超阈值，任务应被重新入队（requeue）并跳过。
-            'permanent_fail': 崩溃次数超过阈值，任务应标记为永久失败。
-        """
+    def record_crash(self, job_id: str) -> CrashOutcome:
+        """记录下游崩溃事件，返回携带队列动作的显式结果。"""
         if self._last_failed_job_id is not None and self._last_failed_job_id != job_id:
             self.reset()
 
@@ -76,34 +73,34 @@ class CrashSkipPolicy:
 
         if self._crash_count >= self._MAX_CRASH_COUNT:
             self.reset()
-            return "permanent_fail"
+            return CrashOutcome.MARK_PERMANENT_FAILED
 
-        return "skip"
+        return CrashOutcome.REQUEUE_AND_COUNT_CRASH
 
     def increment_crash(self) -> None:
         """递增崩溃计数并标记下游崩溃执行状态（仅在 requeue 成功后调用）。"""
         self._crash_count += 1
         self._crashed_executing = True
 
-    def record_completion(self, allow_restart: bool) -> str:
-        """任务执行结束（非崩溃），返回完成类型。
+    def record_completion(self, allow_restart: bool) -> CompletionOutcome:
+        """任务执行结束（非崩溃），返回携带队列动作与样本决策的显式结果。
 
         allow_restart 是当前运行生命周期内是否执行过任务的标志：崩溃重启后下游
         尚未真正开始执行任务时为 False，此时完成事件不应清零崩溃计数。
-
-        Returns:
-            'complete': 正常完成，清零崩溃计数。
-            'requeue_complete': 崩溃后 requeue 的任务成功完成，清零崩溃计数。
         """
         if self._crashed_executing:
             self._crashed_executing = False
             if allow_restart:
                 self.reset()
-                return "requeue_complete"
-            return "noop"
+                return CompletionOutcome(
+                    action=CompletionAction.MARK_COMPLETED, record_sample=False
+                )
+            return CompletionOutcome(action=CompletionAction.NOOP, record_sample=False)
 
         self.reset()
-        return "complete"
+        return CompletionOutcome(
+            action=CompletionAction.MARK_COMPLETED, record_sample=True
+        )
 
     def get_skip(self, pending_count: int) -> Optional[int]:
         """计算当前应跳过的 pending 任务数。"""

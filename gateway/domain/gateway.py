@@ -21,6 +21,8 @@ from gateway.shared.models import (
     DownstreamState,
     Reason,
     DownstreamAction,
+    CompletionAction,
+    CrashOutcome,
 )
 from gateway.shared.events import (
     StateChangedEvent,
@@ -508,25 +510,21 @@ class Gateway:
             self._job_start_time = int(time.time() * 1000)
             self._refresh()
         else:
-            # 任务完成时记录执行时长（崩溃时不记录，避免污染预估数据）
-            if (
-                not self._crash_skip.crashed_executing
-                and self._job_start_time is not None
-            ):
-                duration_ms = int(time.time() * 1000) - self._job_start_time
-                self._estimation_service.record_completion(duration_ms)
+            # 完成结果自带队列动作与样本决策，聚合根只做单一分派，不再解释完成种类
+            completion_outcome = self._crash_skip.record_completion(self._allow_restart)
+            if completion_outcome.action is CompletionAction.MARK_COMPLETED:
+                self._queue_writer.update_status(
+                    JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+                )
+                # 中断（强制重启 / 崩溃重入列后的空跑）不写预估样本，见 ADR-0001
+                if (
+                    completion_outcome.record_sample
+                    and self._job_start_time is not None
+                ):
+                    duration_ms = int(time.time() * 1000) - self._job_start_time
+                    self._estimation_service.record_completion(duration_ms)
             self._job_start_time = None
 
-            completion_result = self._crash_skip.record_completion(self._allow_restart)
-
-            if completion_result == "requeue_complete":
-                self._queue_writer.update_status(
-                    JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
-                )
-            elif completion_result == "complete":
-                self._queue_writer.update_status(
-                    JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
-                )
             self._refresh()
             skip = self.get_dispatch_skip()
             logger.info(
@@ -570,9 +568,9 @@ class Gateway:
 
         if running_jobs:
             job = running_jobs[0]
-            action = self._crash_skip.record_crash(job.prompt_id)
+            outcome = self._crash_skip.record_crash(job.prompt_id)
 
-            if action == "permanent_fail":
+            if outcome is CrashOutcome.MARK_PERMANENT_FAILED:
                 self._queue_writer.update_status(
                     JobStatus.FAILED, prompt_id=job.prompt_id
                 )
@@ -580,7 +578,7 @@ class Gateway:
                     job,
                     ev.error_summary or "Downstream crashed 3 times during execution.",
                 )
-            elif action == "skip":
+            elif outcome is CrashOutcome.REQUEUE_AND_COUNT_CRASH:
                 if self._queue_writer.requeue_running_if_exists():
                     self._crash_skip.increment_crash()
 

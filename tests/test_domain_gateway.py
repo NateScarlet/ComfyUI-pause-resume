@@ -826,6 +826,44 @@ class TestDomainGateway(unittest.TestCase):
         self.assertEqual(g._crash_skip.crash_count, 1)
         self.assertFalse(g._crash_skip.crashed_executing)
 
+    def test_normal_completion_marks_completed_and_records_duration(self):
+        """正常完成：RUNNING 任务标记 COMPLETED，并写入本次执行时长样本。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(paused=False, downstream_ready=True, running=[running_job])
+        _bind_queue_state(g, [running_job])
+        g._mock_estimation.reset_mock()
+
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+        )
+        g._mock_estimation.record_completion.assert_called_once()
+
+    def test_requeue_completion_marks_completed_without_recording_duration(self):
+        """崩溃 requeue 的任务重新完成：标记 COMPLETED，但该次执行不写预估样本。"""
+        running_job = _make_job("running_1", JobStatus.RUNNING)
+        g = _make_gateway(
+            paused=False,
+            downstream_ready=True,
+            pending_count=1,
+            running=[running_job],
+        )
+        _bind_queue_state(g, [running_job])
+        g._mock_estimation.reset_mock()
+
+        # 崩溃使任务重新入列并置起崩溃执行标志；重启后任务真正执行并再次完成
+        g._mock_event_bus.publish(DownstreamCrashedEvent())
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+        g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+
+        g._mock_writer.update_status.assert_called_once_with(
+            JobStatus.COMPLETED, filter_status=JobStatus.RUNNING
+        )
+        self.assertEqual(g._crash_skip.crash_count, 0)
+        g._mock_estimation.record_completion.assert_not_called()
+
     def test_dispatch_failed_retry_and_cancel(self):
         """测试临时派发失败会触发定时器延迟重试，且派发成功时可以取消该定时器。"""
         # 场景 A：派发失败后，在重试触发前收到成功事件，应取消定时器

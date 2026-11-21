@@ -55,6 +55,28 @@ class DownstreamAction(Enum):
     SHUTDOWN = "shutdown"
 
 
+class CompletionAction(Enum):
+    """完成事件对队列驱动的动作，与「完成种类」分离，保证一种动作只有一个分派点。"""
+
+    MARK_COMPLETED = "mark_completed"
+    NOOP = "noop"
+
+
+@dataclass(frozen=True)
+class CompletionOutcome:
+    """完成策略的显式结果：携带队列动作与是否记录本次执行时长。"""
+
+    action: CompletionAction
+    record_sample: bool
+
+
+class CrashOutcome(Enum):
+    """崩溃策略的显式结果，每个成员对应唯一明确的队列动作。"""
+
+    REQUEUE_AND_COUNT_CRASH = "requeue_and_count_crash"
+    MARK_PERMANENT_FAILED = "mark_permanent_failed"
+
+
 class RawJSON(str):
     """标记一段已经是合法 JSON 的字符串，在序列化时直接嵌入而无需转义，降低转换开销。
 
