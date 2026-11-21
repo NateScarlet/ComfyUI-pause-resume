@@ -23,6 +23,13 @@ from gateway.shared.events import (
     DownstreamReadyChangedEvent,
     DownstreamCrashedEvent,
 )
+from gateway.shared.signals import (
+    ExecutingFalse,
+    ExecutingTrue,
+    Signal,
+    StallWatchCancel,
+    StallWatchStart,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +74,8 @@ class ComfyUIDownstreamClient(DownstreamClient):
         # 日志读取在后台线程上进行，而卡死判定用的定时器只能在事件循环线程启停，
         # 因此由本客户端把日志行跨线程投递到事件循环上再喂给观察者
         self._log_watcher: Optional[ComfyUIExecutionLogWatcher] = None
+        # 卡死计时由本客户端持有；观察者只负责翻译信号，不接触计时器
+        self._cancel_stall_timer: Optional[Callable[[], None]] = None
 
     @property
     def downstream_port(self) -> int:
@@ -235,37 +244,82 @@ class ComfyUIDownstreamClient(DownstreamClient):
             logger.info("[%s] STDOUT: %s", self._downstream_port, line)
 
     def _create_log_watcher(self) -> ComfyUIExecutionLogWatcher:
-        """为新拉起的下游进程创建执行日志观察者。"""
+        """为新拉起的下游进程创建纯信号翻译器。"""
         self._discard_log_watcher()
-        self._log_watcher = ComfyUIExecutionLogWatcher(
-            event_bus=self.event_bus,
-            timer=self._timer,
-            stall_timeout_sec=self.config.stall_timeout_sec,
-            on_stall=self._on_downstream_stall,
-        )
+        self._log_watcher = ComfyUIExecutionLogWatcher()
         return self._log_watcher
 
     def _discard_log_watcher(self) -> None:
-        """作废当前下游进程的日志观察者（进程生命周期结束时调用）。"""
+        """作废当前下游进程的日志观察者（进程生命周期结束时调用）。
+
+        计时器是本客户端持有的资源，作废观察者时必须显式取消该进程的计时句柄，
+        避免老进程的计时回调触发新进程的卡死处置。
+        """
         if self._log_watcher is not None:
             self._log_watcher.close()
             self._log_watcher = None
+        # 通过单一 seam 释放该进程持有的计时句柄
+        self._handle_signal(StallWatchCancel())
+
+    def _cancel_pending_stall_timer(self) -> None:
+        """撤销本客户端持有的卡死计时（若有）。"""
+        if self._cancel_stall_timer is not None:
+            self._cancel_stall_timer()
+            self._cancel_stall_timer = None
 
     def _feed_log_line(self, watcher: ComfyUIExecutionLogWatcher, line: str) -> None:
-        """把一行下游日志转交给产生它的那个观察者。
+        """把一行下游日志翻译出的信号跨线程交给 Adapter 的单一 seam。
 
-        读取日志的是后台线程，而卡死判定用的定时器只能在事件循环线程启停，
-        因此统一跨线程投递到事件循环上处理，保持观察者的状态只被单线程触碰。
+        读取日志的是后台线程，而计时器只能在事件循环线程启停，因此统一跨线程
+        投递到事件循环上处理，保持观察者的状态与计时只被单线程触碰。
         """
-        self._loop.call_soon_threadsafe(watcher.feed, line)
 
-    def _on_downstream_stall(self, error_summary: str) -> None:
+        def deliver() -> None:
+            signal = watcher.feed(line)
+            if signal is not None:
+                self._handle_signal(signal)
+
+        self._loop.call_soon_threadsafe(deliver)
+
+    def _handle_signal(self, signal: Signal) -> None:
+        """Adapter 的唯一反应 seam：把日志信号翻译成事件发布、计时启停与卡死处置。"""
+        if isinstance(signal, ExecutingTrue):
+            self.event_bus.publish(DownstreamExecutingChangedEvent(executing=True))
+        elif isinstance(signal, ExecutingFalse):
+            self.event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
+            self._cancel_pending_stall_timer()
+        elif isinstance(signal, StallWatchStart):
+            self._start_stall_watch()
+        elif isinstance(signal, StallWatchCancel):
+            self._cancel_pending_stall_timer()
+        else:
+            # 其余变体只有 Stall（联合已穷举），其摘要由翻译器内部维护
+            self._on_stall(signal.summary)
+
+    def _start_stall_watch(self) -> None:
+        """首个异常后挂起卡死计时；回调捕获产生它的观察者实例。"""
+        # 只有当前观察者的 feed 会产出信号，因此这里必定能拿到产生信号的实例
+        watcher = cast(ComfyUIExecutionLogWatcher, self._log_watcher)
+
+        def on_timeout() -> None:
+            stall = watcher.on_stall_timeout()
+            # 只有计时到期时仍是当前实例、且翻译器确实仍在等待收尾，才交给 seam
+            if stall is not None and self._log_watcher is watcher:
+                self._handle_signal(stall)
+
+        self._cancel_pending_stall_timer()
+        self._cancel_stall_timer = self._timer.start_timeout(
+            self.config.stall_timeout_sec, on_timeout
+        )
+
+    def _on_stall(self, error_summary: str) -> None:
         """下游抛出执行异常后迟迟不收尾：判定卡死并按崩溃语义处置。
 
         卡死时进程仍然存活，崩溃监控（依赖进程退出）察觉不到；而消费队列的工作
         线程已死，不重启下游就会永久失去执行能力。因此这里复用崩溃事件的领域
         处理路径（重新入列 + 崩溃降级），并立即拉起新进程。
         """
+        self._cancel_stall_timer = None
         logger.error("❌ Downstream stalled after an execution error, restarting...")
         # 卡死被检测到的瞬间立即翻转就绪状态，让代理层从空窗期一开始就让
         # API 请求进入等待，而不是把请求转发到已失去执行能力的下游上

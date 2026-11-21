@@ -7,10 +7,22 @@ from unittest.mock import AsyncMock, MagicMock
 
 from gateway.config import GatewayConfig
 from gateway.infrastructure.comfyui.downstream import ComfyUIDownstreamClient
-from gateway.infrastructure.comfyui.execution_log import FAILURE_MARKER
-from gateway.shared.events import DownstreamCrashedEvent, DownstreamReadyChangedEvent
+from gateway.infrastructure.comfyui.execution_log import (
+    FAILURE_MARKER,
+    ComfyUIExecutionLogWatcher,
+)
+from gateway.shared.events import (
+    DownstreamCrashedEvent,
+    DownstreamExecutingChangedEvent,
+    DownstreamReadyChangedEvent,
+)
 from gateway.shared.exceptions import DownstreamError, DownstreamStartupTimeout
 from gateway.shared.interfaces import EventBus
+from gateway.shared.signals import (
+    ExecutingFalse,
+    ExecutingTrue,
+    Stall,
+)
 from tests.fakes import FakeTimer
 
 T = TypeVar("T")
@@ -345,7 +357,8 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
 
             client.restart_downstream = fake_restart  # type: ignore[method-assign]
 
-            client._on_downstream_stall("CUDA error: out of memory")
+            # 卡死反应链统一由 Adapter 的单一 seam 驱动
+            client._handle_signal(Stall(summary="CUDA error: out of memory"))
             await asyncio.sleep(0.01)
 
             self.assertFalse(client._downstream_ready)
@@ -444,6 +457,173 @@ class TestComfyUIDownstreamClientReadiness(unittest.TestCase):
             self.assertEqual(
                 [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)], []
             )
+
+        asyncio.run(scenario())
+
+
+class TestDownstreamSignalSeam(unittest.TestCase):
+    """验证 Adapter 的单一 seam：信号 → 事件发布 / 计时启停 / 卡死反应链。"""
+
+    def setUp(self) -> None:
+        self.timer = FakeTimer()
+        self.loop = asyncio.new_event_loop()
+        self.addCleanup(self.loop.close)
+
+    def _make_client(
+        self,
+    ) -> tuple[ComfyUIDownstreamClient, _RecordingEventBus]:
+        bus = _RecordingEventBus()
+        config = MagicMock(spec=GatewayConfig)
+        config.restart_delay_sec = 0.05
+        config.stall_timeout_sec = 1800.0
+        client = ComfyUIDownstreamClient(
+            config=config,
+            event_bus=bus,
+            process_manager=MagicMock(),
+            timer=self.timer,
+            loop=asyncio.get_running_loop(),
+        )
+        return client, bus
+
+    @staticmethod
+    def _executing_flags(bus: _RecordingEventBus) -> List[bool]:
+        return [
+            e.executing
+            for e in bus.events
+            if isinstance(e, DownstreamExecutingChangedEvent)
+        ]
+
+    @staticmethod
+    def _crashes(bus: _RecordingEventBus) -> List[DownstreamCrashedEvent]:
+        return [e for e in bus.events if isinstance(e, DownstreamCrashedEvent)]
+
+    def test_executing_signals_publish_executing_events(self):
+        """执行状态信号由 Adapter seam 翻译成执行状态事件，不触碰卡死计时。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client()
+
+            client._handle_signal(ExecutingTrue())
+            client._handle_signal(ExecutingFalse())
+
+            self.assertEqual(self._executing_flags(bus), [True, False])
+            self.assertEqual(self.timer.pending_count, 0)
+
+        asyncio.run(scenario())
+
+    def test_stall_watch_start_and_timeout_drives_reaction_chain(self):
+        """异常后计时到期：翻转未就绪 → 发布崩溃事件 → 重启，顺序与摘要均不回归。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client()
+            client._downstream_ready = True
+            watcher = client._create_log_watcher()
+
+            crash_at_restart: List[List[DownstreamCrashedEvent]] = []
+
+            async def fake_restart() -> None:
+                crash_at_restart.append(self._crashes(bus))
+
+            client.restart_downstream = fake_restart  # type: ignore[method-assign]
+
+            client._feed_log_line(
+                watcher, f"[ERROR] {FAILURE_MARKER} CUDA error: out of memory"
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(self.timer.pending_count, 1)
+            self.assertEqual(self._crashes(bus), [])
+
+            self.timer.advance(1800.0)
+            await asyncio.sleep(0)
+
+            self.assertFalse(client._downstream_ready)
+            crashes = self._crashes(bus)
+            self.assertEqual(len(crashes), 1)
+            self.assertIn(FAILURE_MARKER, crashes[0].error_summary or "")
+            self.assertIn("CUDA error: out of memory", crashes[0].error_summary or "")
+            # 崩溃事件先于重启动作发出
+            self.assertEqual(len(crash_at_restart), 1)
+            self.assertEqual(crash_at_restart[0], crashes)
+            # 未就绪观测先于崩溃事件发出
+            unready_indexes = [
+                i
+                for i, e in enumerate(bus.events)
+                if isinstance(e, DownstreamReadyChangedEvent) and not e.ready
+            ]
+            crash_index = bus.events.index(crashes[0])
+            self.assertLess(unready_indexes[0], crash_index)
+
+        asyncio.run(scenario())
+
+    def test_finish_after_failure_publishes_finished_and_drops_timer(self):
+        """异常后正常收尾：执行状态 False 由 seam 发布并撤销计时，不得误判卡死。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client()
+            watcher = client._create_log_watcher()
+
+            client._feed_log_line(
+                watcher, f"[ERROR] {FAILURE_MARKER} CUDA error: out of memory"
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(self.timer.pending_count, 1)
+
+            client._feed_log_line(watcher, "Prompt executed in 0.10 seconds")
+            await asyncio.sleep(0)
+
+            self.assertEqual(self.timer.pending_count, 0)
+            self.assertEqual(self._executing_flags(bus), [False])
+            self.timer.advance(3600.0)
+            self.assertEqual(self._crashes(bus), [])
+
+        asyncio.run(scenario())
+
+    def test_discard_cancels_timer_held_by_adapter(self):
+        """观察者作废时，Adapter 必须显式取消自己持有的该进程计时句柄。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client()
+            watcher = client._create_log_watcher()
+
+            client._feed_log_line(
+                watcher, f"[ERROR] {FAILURE_MARKER} CUDA error: out of memory"
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(self.timer.pending_count, 1)
+
+            client._discard_log_watcher()
+            # 作废走 StallWatchCancel 分支，只释放计时而不发布多余的执行事件
+            self.assertEqual(self.timer.pending_count, 0)
+            self.assertEqual(self._executing_flags(bus), [])
+
+            self.timer.advance(3600.0)
+            await asyncio.sleep(0)
+            self.assertEqual(self._crashes(bus), [])
+
+        asyncio.run(scenario())
+
+    def test_stale_watcher_timeout_does_not_hit_new_process(self):
+        """旧进程的计时回调即使触发，也不得对新进程执行卡死处置。"""
+
+        async def scenario() -> None:
+            client, bus = self._make_client()
+            client._downstream_ready = True
+            old_watcher = client._create_log_watcher()
+
+            client._feed_log_line(
+                old_watcher, f"[ERROR] {FAILURE_MARKER} CUDA error: out of memory"
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(self.timer.pending_count, 1)
+
+            # 模拟竞态窗口：新观察者已接管，但旧计时回调尚未被取消
+            client._log_watcher = ComfyUIExecutionLogWatcher()
+
+            self.timer.advance(3600.0)
+            await asyncio.sleep(0)
+
+            self.assertEqual(self._crashes(bus), [])
+            self.assertTrue(client._downstream_ready)
 
         asyncio.run(scenario())
 
