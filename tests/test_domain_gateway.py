@@ -293,7 +293,7 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=False, downstream_executing=True)
         g.pause(restart_after_idle=True)
         self.assertTrue(g.paused)
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
         # 情况 2：暂停且当时已空闲，边沿已过，标志挂起但不重启（无操作）
@@ -302,7 +302,7 @@ class TestDomainGateway(unittest.TestCase):
         )
         g.pause(restart_after_idle=True)
         self.assertTrue(g.paused)
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
     def test_pause_persists_state(self):
@@ -316,7 +316,7 @@ class TestDomainGateway(unittest.TestCase):
         g = _make_gateway(paused=True, restart_after_idle_on_pause=True)
         g.resume()
         self.assertFalse(g.paused)
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
         g._mock_dispatcher.dispatch.assert_called_once()
 
     def test_resume_persists_state(self):
@@ -746,7 +746,7 @@ class TestDomainGateway(unittest.TestCase):
         g.report_activity()
         g._mock_downstream.ensure_ready.assert_not_called()
         g.resume()
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
     def test_pause_with_restart_activates_on_idle_edge(self):
@@ -764,7 +764,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
 
         g._mock_downstream.ensure_ready.assert_called_once()
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
 
     def test_activity_does_not_schedule_restart_from_pause_flag(self):
         """活动不得仅因挂起的暂停后重启标志而排程空闲窗口。"""
@@ -1027,13 +1027,13 @@ class TestDomainGateway(unittest.TestCase):
         g.pause(restart_after_idle=True)
 
         self.assertTrue(g.paused)
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
         # 恢复队列
         g.resume()
         self.assertFalse(g.paused)
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
 
         # 模拟下游执行完成变为空闲，不应该触发重启
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
@@ -1118,14 +1118,14 @@ class TestDomainGateway(unittest.TestCase):
             ever_active=True,
         )
         g.pause(restart_after_idle=True)
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
         # 任务完成，外挂程序随之启动并保持运行（旧逻辑会因此卡死重启）
         g._mock_pm.is_running.return_value = True
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
 
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_called_once()
 
     def test_idle_window_restart_deferred_by_latest_activity(self):
@@ -1184,7 +1184,7 @@ class TestDomainGateway(unittest.TestCase):
 
         # 空闲窗口内仍有活动：重启被推迟而不是立即执行
         self.assertTrue(g.paused)
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
         timer.advance(599)
@@ -1193,7 +1193,7 @@ class TestDomainGateway(unittest.TestCase):
         # 窗口结束后才重启，且不会在下次进入空闲时重复重启
         timer.advance(1)
         g._mock_downstream.ensure_ready.assert_called_once()
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
 
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
         timer.advance(3600)
@@ -1216,7 +1216,7 @@ class TestDomainGateway(unittest.TestCase):
         # 任务执行完毕进入空闲，但窗口内仍有活动，重启被推迟
         g._mock_event_bus.publish(DownstreamExecutingChangedEvent(executing=False))
         self.assertTrue(g._is_idle)
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
         timer.advance(600)
@@ -1261,7 +1261,7 @@ class TestDomainGateway(unittest.TestCase):
         timer.advance(600)
         g.pause(restart_after_idle=True)
 
-        self.assertTrue(g._restart_after_idle_on_pause)
+        self.assertTrue(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_not_called()
 
     def test_activity_during_execution_still_restarts_after_idle(self):
@@ -1404,7 +1404,7 @@ class TestDomainGateway(unittest.TestCase):
         g._mock_event_bus.publish(DownstreamReadyChangedEvent(ready=True))
         timer.advance(3600)
 
-        self.assertFalse(g._restart_after_idle_on_pause)
+        self.assertFalse(g._resource_decision.restart_after_idle)
         g._mock_downstream.ensure_ready.assert_called_once()
 
     def test_forced_restart_never_allows_sleep_during_restart(self):
@@ -1470,7 +1470,7 @@ class TestDomainGateway(unittest.TestCase):
         # 窗口到期前即使已经连续低内存也不得停机
         timer.advance(590)
         g._mock_downstream.shutdown.assert_not_called()
-        self.assertGreaterEqual(g._low_memory_samples, 3)
+        self.assertGreaterEqual(g._resource_decision.low_memory_samples, 3)
 
         timer.advance(10)
         g._mock_downstream.shutdown.assert_called_once()
@@ -1540,11 +1540,11 @@ class TestDomainGateway(unittest.TestCase):
             allow_idle_shutdown_initial=True,
         )
         timer.advance(10)
-        self.assertEqual(g._low_memory_samples, 2)
+        self.assertEqual(g._resource_decision.low_memory_samples, 2)
 
         sampler.available_mb = 2048
         timer.advance(10)
-        self.assertEqual(g._low_memory_samples, 0)
+        self.assertEqual(g._resource_decision.low_memory_samples, 0)
         g._mock_downstream.shutdown.assert_not_called()
 
     def test_idle_shutdown_falls_back_to_restart_when_memory_is_sufficient(self):
@@ -1743,7 +1743,7 @@ class TestDomainGateway(unittest.TestCase):
 
         g.set_allow_idle_shutdown(False)
         g._mock_repo.set_allow_idle_shutdown.assert_called_with(False)
-        self.assertEqual(g._low_memory_samples, 0)
+        self.assertEqual(g._resource_decision.low_memory_samples, 0)
 
     def test_persisted_authorization_overrides_environment_initial_value(self):
         """持久化的勾选优先于环境变量初始值，跨网关重启保持（#16）。"""

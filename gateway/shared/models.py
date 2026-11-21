@@ -47,6 +47,14 @@ class Reason(str, Enum):
     STOP = "stop"
 
 
+class DownstreamAction(Enum):
+    """领域决策给出的下游资源释放动作，与日志用的 Reason 分离。"""
+
+    NONE = "none"
+    RESTART = "restart"
+    SHUTDOWN = "shutdown"
+
+
 class RawJSON(str):
     """标记一段已经是合法 JSON 的字符串，在序列化时直接嵌入而无需转义，降低转换开销。
 

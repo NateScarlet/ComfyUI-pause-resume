@@ -20,6 +20,7 @@ from gateway.shared.models import (
     QueueState,
     DownstreamState,
     Reason,
+    DownstreamAction,
 )
 from gateway.shared.events import (
     StateChangedEvent,
@@ -35,12 +36,12 @@ from gateway.shared.events import (
 from gateway.domain.downstream_lifecycle import DownstreamLifecycle
 from gateway.domain.estimation_service import EstimationService
 from gateway.domain.crash_skip_policy import CrashSkipPolicy
+from gateway.domain.downstream_resource_decision import DownstreamResourceDecision
 
 logger = logging.getLogger(__name__)
 
-# 系统可用物理内存的采样节奏，以及判定内存紧张所需的连续低样本次数
+# 系统可用物理内存的采样节奏；采样间隔是定时器参数，仍由聚合根控制
 _MEMORY_SAMPLE_INTERVAL_SEC = 10.0
-_MEMORY_LOW_SAMPLE_COUNT = 3
 
 
 class Gateway:
@@ -80,11 +81,14 @@ class Gateway:
         self._power_controller = power_controller
         self._memory_sampler = memory_sampler
         self._timer = timer
-        self._idle_restart_timeout = idle_restart_timeout
-        self._idle_shutdown_memory_threshold_mb = idle_shutdown_memory_threshold_mb
+        self._resource_decision = DownstreamResourceDecision(
+            idle_restart_timeout=idle_restart_timeout,
+            shutdown_memory_threshold_mb=idle_shutdown_memory_threshold_mb,
+            now=timer.now,
+            restart_after_idle=restart_after_idle_on_pause,
+        )
 
         self._paused = state_repo.get_paused()
-        self._restart_after_idle_on_pause = restart_after_idle_on_pause
         self._downstream_executing = downstream_executing
 
         # 构造参数仅提供初始状态；停机是运行时状态，不持久化，由配置决定
@@ -105,7 +109,6 @@ class Gateway:
             if persisted_allow_idle_shutdown is None
             else persisted_allow_idle_shutdown
         )
-        self._low_memory_samples = 0
         self._cancel_memory_sample: Optional[Callable[[], None]] = None
 
         # 两个标志承载不同语义，不可合并：
@@ -123,8 +126,6 @@ class Gateway:
         self._cancel_dispatch_retry: Optional[Callable[[], None]] = None
         # 最近一次记录的派发门控拦截原因：相同原因连续出现时不重复刷屏
         self._last_dispatch_gate_reason: Optional[str] = None
-        # 空闲窗口的到期时刻（定时器时间基准），每次活动都会把它推迟到活动时刻 + 窗口长度
-        self._idle_window_end = self._timer.now + self._idle_restart_timeout
         self._refreshing = False
         self._refresh_needed = False
         self._job_start_time: Optional[int] = None  # 当前任务开始执行时间（毫秒）
@@ -278,6 +279,15 @@ class Gateway:
         self._downstream_lifecycle.transition(DownstreamState.SHUTDOWN, Reason.SHUTDOWN)
         self._downstream.shutdown()
 
+    def _queue_is_empty(self) -> bool:
+        """读取活跃队列是否为空，作为决策 seam 的输入。"""
+        return (
+            self._queue_reader.count(
+                JobFilters([JobStatus.PENDING, JobStatus.RUNNING]), limit=1
+            )
+            == 0
+        )
+
     def _arm_idle_restart(self) -> None:
         """按当前空闲窗口剩余时间重新安排下游资源释放评估。
 
@@ -287,112 +297,50 @@ class Gateway:
         if self._cancel_idle_timeout:
             self._cancel_idle_timeout()
             self._cancel_idle_timeout = None
-        if not self._idle_window_needed():
+        if not self._resource_decision.window_needed(
+            self._allow_idle_shutdown, self._allow_restart
+        ):
             return
         self._cancel_idle_timeout = self._timer.start_timeout(
-            self._idle_remaining(), self._on_idle_timeout
+            self._resource_decision.remaining(self._timer.now), self._on_idle_timeout
         )
-
-    def _idle_window_needed(self) -> bool:
-        """判定是否需要为下游资源释放排程空闲窗口。
-
-        空闲停机针对的是下游常驻的启动基线内存，与是否执行过任务无关；
-        因此即使下游从未执行过任务，只要用户授权了停机就需要窗口。
-        """
-        return self._restart_wanted() or (
-            self._allow_idle_shutdown and self._idle_restart_timeout > 0
-        )
-
-    def _restart_wanted(self) -> bool:
-        """判定当前是否存在需要被空闲窗口约束的下游重启决策。
-
-        无论显式「暂停后重启」还是空闲超时重启，都必须以当前生命周期执行过任务为前提，
-        否则从未跑过任务的下游会在每个空闲窗口被反复重启。
-        """
-        return self._allow_restart and (
-            self._restart_after_idle_on_pause or self._idle_restart_timeout > 0
-        )
-
-    def _idle_remaining(self) -> float:
-        """返回空闲窗口的剩余秒数。
-
-        以注入的定时器为时间来源推算：窗口起点被推迟到最近一次活动，
-        因此活动之后剩余时间重新计满一个完整窗口。
-        """
-        if self._idle_restart_timeout <= 0:
-            return 0.0
-        return max(0.0, self._idle_window_end - self._timer.now)
-
-    def _restart_after_idle_or_wait(self) -> None:
-        """处理"空闲后重启下游"的决策。
-
-        窗口内已无活动时立即重启；窗口内仍有活动时，推迟到窗口剩余时间走完。
-        """
-        if self._idle_remaining() > 0:
-            self._arm_idle_restart()
-            return
-        self._restart_after_idle_on_pause = False
-        self._request_downstream_restart()
 
     def _on_idle_entered(self) -> None:
-        """进入业务空闲状态时的决策逻辑。"""
-        if self._restart_after_idle_on_pause:
-            self._restart_after_idle_or_wait()
+        """进入业务空闲状态：由决策 seam 判定立即重启还是排程窗口。"""
+        # 显式指令存在时，既有行为无论是否立即重启都会发布状态并刷新一次
+        had_explicit = self._resource_decision.restart_after_idle
+        action = self._resource_decision.evaluate_on_idle_entered(self._timer.now)
+        if action == DownstreamAction.RESTART:
+            self._request_downstream_restart()
+        else:
+            self._arm_idle_restart()
+        if had_explicit:
             self._event_bus.publish(StateChangedEvent(paused=self._paused))
             self._refresh()
-            return
-
-        # 新进入空闲的周期从此刻起算窗口
-        self._idle_window_end = self._timer.now + self._idle_restart_timeout
-        self._arm_idle_restart()
 
     def _on_idle_exited(self) -> None:
-        """退出业务空闲状态时的决策逻辑（取消超时定时器）。"""
+        """退出业务空闲状态时取消超时定时器。"""
         if self._cancel_idle_timeout:
             self._cancel_idle_timeout()
             self._cancel_idle_timeout = None
 
     def _on_idle_timeout(self) -> None:
-        """空闲窗口到达时的下游资源释放决策。"""
-        # 超时回调执行时必须进行防竞态空闲状态校验
-        if not self._is_idle:
-            self._cancel_idle_timeout = None
-            return
+        """空闲窗口到达：只执行决策 seam 返回的动作。"""
         self._cancel_idle_timeout = None
-        if not self._idle_window_needed():
-            return
-        # 显式的「暂停后重启」是用户的直接指令，但仅在本生命周期执行过任务时
-        # 才优先于空闲停机，避免无任务的显式指令绕过停机判定
-        explicit_restart = self._restart_after_idle_on_pause and self._allow_restart
-        # 决策已消费，避免下游重新就绪进入空闲后重复重启
-        self._restart_after_idle_on_pause = False
-        if not explicit_restart and self._should_shutdown_downstream():
+        action = self._resource_decision.evaluate(
+            self._timer.now,
+            self._is_idle,
+            self._queue_is_empty(),
+            self._allow_idle_shutdown,
+            self._allow_restart,
+        )
+        if action == DownstreamAction.SHUTDOWN:
             self._request_downstream_shutdown()
-        elif self._restart_wanted() or explicit_restart:
+        elif action == DownstreamAction.RESTART:
             self._request_downstream_restart()
         else:
-            # 内存充足但下游从未执行过任务：无需重启，等待下一次判定时机
             return
         self._refresh()
-
-    def _should_shutdown_downstream(self) -> bool:
-        """判定空闲时是否应将下游完全停掉释放内存。
-
-        停机是用户授权下的许可动作：必须已授权、处于空闲、队列完全为空，
-        且可用物理内存连续多次采样都低于阈值。
-        """
-        if not self._allow_idle_shutdown:
-            return False
-        if not self._is_idle:
-            return False
-        if (
-            self._queue_reader.count(
-                JobFilters([JobStatus.PENDING, JobStatus.RUNNING]), limit=1
-            )
-            > 0
-        ):
-            return False
-        return self._low_memory_samples >= _MEMORY_LOW_SAMPLE_COUNT
 
     def _start_memory_sampling(self) -> None:
         """开始按固定间隔采样可用物理内存。"""
@@ -404,36 +352,28 @@ class Gateway:
         if self._cancel_memory_sample:
             self._cancel_memory_sample()
             self._cancel_memory_sample = None
-        self._low_memory_samples = 0
+        self._resource_decision.clear_samples()
 
     def _sample_memory(self) -> None:
-        """采样一次可用内存，并据此更新连续低样本计数。"""
-        available_mb = self._memory_sampler.available_memory_mb()
-        if available_mb < self._idle_shutdown_memory_threshold_mb:
-            self._low_memory_samples += 1
-        else:
-            self._low_memory_samples = 0
+        """采样可用内存，并把采样后补做判定交给决策 seam。"""
+        self._resource_decision.record_sample(
+            self._memory_sampler.available_memory_mb()
+        )
         self._cancel_memory_sample = self._timer.start_timeout(
             _MEMORY_SAMPLE_INTERVAL_SEC, self._sample_memory
         )
 
         # 用户可能在空闲窗口已经到期后才勾选授权，此时由采样结果补齐后续判定
-        if self._low_memory_samples >= _MEMORY_LOW_SAMPLE_COUNT:
-            self._evaluate_idle_shutdown_after_sampling()
-
-    def _evaluate_idle_shutdown_after_sampling(self) -> None:
-        """采样确认内存紧张后，在空闲窗口已到期时补做停机判定。"""
-        # 空闲窗口被禁用时不存在「窗口到期」，活动推迟也就无从生效，不得据此停机
-        if self._idle_restart_timeout <= 0:
-            return
-        if self._idle_remaining() > 0:
-            return
-        if self._restart_after_idle_on_pause:
-            return
-        if not self._should_shutdown_downstream():
-            return
-        self._request_downstream_shutdown()
-        self._refresh()
+        action = self._resource_decision.evaluate_after_sampling(
+            self._timer.now,
+            self._is_idle,
+            self._queue_is_empty(),
+            self._allow_idle_shutdown,
+            self._allow_restart,
+        )
+        if action == DownstreamAction.SHUTDOWN:
+            self._request_downstream_shutdown()
+            self._refresh()
 
     def wake_downstream(self) -> None:
         """由活动触发唤醒下游：从停机状态进入未就绪并开始冷启动。"""
@@ -470,14 +410,14 @@ class Gateway:
         重启——该标志只在「非空闲→空闲」的边沿被消费。
         """
         had_pending = self._cancel_idle_timeout is not None
-        self._idle_window_end = self._timer.now + self._idle_restart_timeout
+        self._resource_decision.defer_window(self._timer.now)
         if had_pending:
             self._arm_idle_restart()
 
     def pause(self, restart_after_idle: bool) -> None:
         """暂停队列。"""
         self._paused = True
-        self._restart_after_idle_on_pause = restart_after_idle
+        self._resource_decision.set_restart_after_idle(restart_after_idle)
         self._state_repo.set_paused(True)
 
         # 暂停时取消未完成的派发重试，避免在暂停期间无意义调用 dispatch
@@ -495,7 +435,7 @@ class Gateway:
     def resume(self) -> None:
         """恢复队列，并自动触发副作用。"""
         self._paused = False
-        self._restart_after_idle_on_pause = False
+        self._resource_decision.clear_restart_after_idle()
         self._state_repo.set_paused(False)
 
         # 恢复时取消空闲超时定时器，避免在恢复后仍然空闲时触发非预期的下游重启
@@ -529,7 +469,7 @@ class Gateway:
         self._downstream_executing = False
         self._job_start_time = None
         # 本次重启已经消费了「暂停后空闲重启」的决策，否则重启完成再次进入空闲时会多排程一次重启
-        self._restart_after_idle_on_pause = False
+        self._resource_decision.clear_restart_after_idle()
 
         self._request_downstream_restart()
         self._refresh()
