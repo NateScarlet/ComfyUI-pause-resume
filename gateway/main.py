@@ -23,6 +23,7 @@ from .infrastructure.in_memory.event_bus import InMemoryEventBus
 from .infrastructure.comfyui.dispatcher import ComfyUIJobDispatcher
 from .application.facade import AppFacade
 from .presentation.handlers import GatewayHandlers
+from .presentation.status_fanout import StatusFanout
 from .presentation.routes import setup_routes
 from .shared.events import StateChangedEvent, StatusChangedEvent
 from .shared.exceptions import DownstreamStartupTimeout
@@ -152,6 +153,15 @@ async def main() -> None:
         event_bus=event_bus,
     )
 
+    # 12. 构建客户端状态广播枢纽：单一快照同时驱动 SSE 与 WS
+    status_fanout = StatusFanout(
+        app=app_facade,
+        queue_reader=queue_reader,
+        event_bus=event_bus,
+        timer=timer,
+        loop=loop,
+    )
+
     # 13. 绑定信号量
     exit_event = asyncio.Event()
 
@@ -191,7 +201,7 @@ async def main() -> None:
     handlers = GatewayHandlers(
         app=app_facade,
         downstream_service=downstream_service,
-        queue_reader=queue_reader,
+        fanout=status_fanout,
         event_bus=event_bus,
         startup_wait_sec=config.startup_wait_sec,
     )
@@ -254,7 +264,7 @@ async def main() -> None:
         pass
     finally:
         logger.info("🛑 Gateway shutting down...")
-        handlers.shutdown()
+        handlers.dispose()
         # 取消托盘事件订阅
         if tray_unsub_state is not None:
             tray_unsub_state()

@@ -18,6 +18,7 @@ from tests.test_gateway_handlers import (
     _ProxyStubHandlers,
     _SyncEventBus,
 )
+from tests.fakes import make_fanout
 
 
 class _MutableState:
@@ -43,10 +44,11 @@ def _make_handlers(state: DownstreamState, wait_sec: float = 0.05):
     downstream = MagicMock(spec=DownstreamClient)
     downstream.downstream_port = 8188
     bus = _SyncEventBus()
+    fanout, _ = make_fanout(app, bus)
     handlers = _ProxyStubHandlers(
         app=app,
         downstream_service=downstream,
-        queue_reader=MagicMock(),
+        fanout=fanout,
         event_bus=bus,
         startup_wait_sec=wait_sec,
     )

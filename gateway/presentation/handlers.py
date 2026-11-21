@@ -6,23 +6,19 @@ import time
 from pathlib import Path
 import aiohttp
 from aiohttp import web
-from typing import List, Optional, Set, Union, cast, Dict, Any
+from typing import List, Set, Union, cast, Dict, Any
 
 from gateway.shared.utils import raw_json_dumps
 from gateway.shared.interfaces import (
-    JobQueueReader,
     DownstreamClient,
     EventBus,
 )
 from gateway.shared.models import DownstreamState, JobStatus, JobFilters
-from gateway.shared.events import (
-    StatusChangedEvent,
-    StateChangedEvent,
-    DownstreamStateChanged,
-)
+from gateway.shared.events import DownstreamStateChanged
 from gateway.shared.exceptions import GatewayError, JobNotFoundError
 from gateway.application.facade import AppFacade
 from gateway.presentation.formatters import format_job_summary, format_job_detail
+from gateway.presentation.status_fanout import StatusFanout
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _LOADING_HTML = (_STATIC_DIR / "loading.html").read_text(encoding="utf-8")
@@ -44,14 +40,14 @@ class GatewayHandlers:
         self,
         app: AppFacade,
         downstream_service: DownstreamClient,
-        queue_reader: JobQueueReader,
+        fanout: StatusFanout,
         event_bus: EventBus,
         startup_wait_sec: float,
         sse_keepalive_sec: float = _DEFAULT_SSE_KEEPALIVE_SEC,
     ):
         self._app = app
         self._downstream_service = downstream_service
-        self._queue_reader = queue_reader
+        self._fanout = fanout
         self._event_bus = event_bus
         # 下游未就绪时，代理 API 请求等待其就绪的最长秒数
         self._startup_wait_sec = startup_wait_sec
@@ -62,127 +58,15 @@ class GatewayHandlers:
             )
         self._sse_keepalive_sec = sse_keepalive_sec
 
-        # 维护活跃的连接句柄
-        self.sse_clients: Set[asyncio.Queue[str]] = set()
-        self.ws_clients: Set[web.WebSocketResponse] = set()
+    @property
+    def sse_clients(self) -> Set[asyncio.Queue[str]]:
+        """活跃 SSE 帧队列，由 fanout 统一管理。"""
+        return self._fanout.sse_clients
 
-        # SSE 广播的最近状态缓存：连接快照会先更新，后续增量推送复用
-        self._sse_paused: bool = False
-        self._sse_queue_remaining: int = 0
-        self._sse_downstream: Optional[DownstreamState] = None
-        # SSE 客户端所在事件循环；未建立连接时为 None，此时无需广播
-        self._sse_loop: Optional[asyncio.AbstractEventLoop] = None
-
-        # 通过订阅 EventBus 事件来处理 WS 和 SSE 广播
-        self._unsub_status = self._event_bus.subscribe(
-            StatusChangedEvent, self._on_ws_broadcast_triggered
-        )
-        self._unsub_sse_status = self._event_bus.subscribe(
-            StatusChangedEvent, self._on_sse_queue_changed
-        )
-        self._unsub_state = self._event_bus.subscribe(
-            StateChangedEvent, self._on_sse_pause_changed
-        )
-        self._unsub_downstream_state = self._event_bus.subscribe(
-            DownstreamStateChanged, self._on_sse_downstream_state_changed
-        )
-
-        # WS 广播防抖控制变量
-        self._broadcast_ws_scheduled: bool = False
-        self._broadcast_ws_debounce_sec: float = 0.1
-        self._latest_queue_remaining: int = 0
-
-    def _on_ws_broadcast_triggered(self, ev: StatusChangedEvent) -> None:
-        """应用层通知：触发防抖的 WS 队列剩余数量状态广播。"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(
-                    self._schedule_broadcast_ws_status, ev.queue_remaining
-                )
-        except RuntimeError:
-            pass
-
-    def _schedule_broadcast_ws_status(self, remaining: int) -> None:
-        """在事件循环中调度防抖广播逻辑。"""
-        self._latest_queue_remaining = remaining
-        if self._broadcast_ws_scheduled:
-            return
-        self._broadcast_ws_scheduled = True
-
-        async def do_broadcast() -> None:
-            await asyncio.sleep(self._broadcast_ws_debounce_sec)
-            self._broadcast_ws_scheduled = False
-
-            msg = {
-                "type": "status",
-                "data": {
-                    "status": {
-                        "exec_info": {"queue_remaining": self._latest_queue_remaining}
-                    }
-                },
-            }
-            msg_str = json.dumps(msg)
-
-            for ws in list(self.ws_clients):
-                try:
-                    if not ws.closed:
-                        await ws.send_str(msg_str)
-                except (ConnectionResetError, aiohttp.WebSocketError):
-                    pass
-
-        try:
-            asyncio.create_task(do_broadcast())
-        except RuntimeError:
-            pass
-
-    def _on_sse_pause_changed(self, ev: StateChangedEvent) -> None:
-        """应用层通知：暂停状态变化，用最近一次计数推送 SSE 帧。"""
-        self._sse_paused = ev.paused
-        self._broadcast_sse_frame()
-
-    def _on_sse_queue_changed(self, ev: StatusChangedEvent) -> None:
-        """应用层通知：队列计数变化，直接复用事件中的计数推送 SSE 帧。"""
-        self._sse_queue_remaining = ev.queue_remaining
-        self._broadcast_sse_frame()
-
-    def _on_sse_downstream_state_changed(self, ev: DownstreamStateChanged) -> None:
-        """领域 seam 发布的权威状态变化，直接作为 SSE 推送的状态值。"""
-        self._sse_downstream = ev.state
-        self._broadcast_sse_frame()
-
-    def _broadcast_sse_frame(self) -> None:
-        """把当前状态快照入队到所有 SSE 客户端。
-
-        事件可能来自任意线程，通过事件循环线程安全地投递，避免跨线程操作 asyncio.Queue。
-        """
-        loop = self._sse_loop
-        if loop is None:
-            return
-        data = json.dumps(
-            {
-                "paused": self._sse_paused,
-                "queue_remaining": self._sse_queue_remaining,
-                "downstream": (
-                    self._sse_downstream.value
-                    if self._sse_downstream is not None
-                    else None
-                ),
-            }
-        )
-        try:
-            loop.call_soon_threadsafe(self._enqueue_sse_data, data)
-        except RuntimeError:
-            # 事件循环已关闭（进程退出中），此时不存在可投递的客户端
-            pass
-
-    def _enqueue_sse_data(self, data: str) -> None:
-        """在事件循环线程中把数据帧投递给每个 SSE 客户端。"""
-        for q in list(self.sse_clients):
-            try:
-                q.put_nowait(data)
-            except asyncio.QueueFull:
-                pass
+    @property
+    def ws_clients(self) -> Set[web.WebSocketResponse]:
+        """活跃 WS 连接，由 fanout 统一管理。"""
+        return self._fanout.ws_clients
 
     async def handle_pause(self, request: web.Request) -> web.Response:
         """暂停队列接口。"""
@@ -247,27 +131,11 @@ class GatewayHandlers:
         )
         await response.prepare(request)
 
-        q: asyncio.Queue[str] = asyncio.Queue()
-        state = self._app.get_state.handle()
-        queue_remaining = await self._app.get_job_count.handle(
-            filter_by=JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
-        )
-        # 连接快照同时作为后续增量推送的计数基线
-        self._sse_loop = asyncio.get_running_loop()
-        self._sse_paused = state.paused
-        self._sse_queue_remaining = queue_remaining
-        self._sse_downstream = state.downstream_state
-        self.sse_clients.add(q)
+        # 初始快照与后续增量帧均由 fanout 派生，字段不会各自为政
+        q, status = self._fanout.connect_sse()
         try:
             await response.write(b"retry: 3000\n\n")
-            initial_data = json.dumps(
-                {
-                    "paused": state.paused,
-                    "queue_remaining": queue_remaining,
-                    "downstream": state.downstream_state.value,
-                }
-            )
-            await response.write(f"data: {initial_data}\n\n".encode("utf-8"))
+            await response.write(f"data: {status.to_sse_data()}\n\n".encode("utf-8"))
 
             while True:
                 try:
@@ -285,7 +153,7 @@ class GatewayHandlers:
         except (asyncio.CancelledError, ConnectionResetError):
             pass
         finally:
-            self.sse_clients.discard(q)
+            self._fanout.disconnect_sse(q)
         return response
 
     async def proxy_handler(
@@ -671,7 +539,7 @@ class GatewayHandlers:
 
             ws_server = web.WebSocketResponse()
             await ws_server.prepare(request)
-            self.ws_clients.add(ws_server)
+            self._fanout.add_ws_client(ws_server)
 
             # 连接建立即计一次活动，连接存活期间不重复计数（挂着不等于在用）
             self._app.report_activity()
@@ -679,7 +547,7 @@ class GatewayHandlers:
             try:
                 await self._forward_ws_pair(ws_server, ws_client)
             finally:
-                self.ws_clients.discard(ws_server)
+                self._fanout.discard_ws_client(ws_server)
                 await self._close_ws_pair(ws_server, ws_client)
             return ws_server
 
@@ -739,14 +607,8 @@ class GatewayHandlers:
                         if isinstance(data_json, dict):
                             data_dict = cast(Dict[str, Any], data_json)
                             if data_dict.get("type") == "status":
-                                remaining = self._queue_reader.count(
-                                    JobFilters(
-                                        [
-                                            JobStatus.PENDING,
-                                            JobStatus.RUNNING,
-                                        ]
-                                    )
-                                )
+                                # 下游 exec_info 可能滞后，必须取改写瞬间的权威实时计数
+                                remaining = self._fanout.get_queue_remaining()
                                 data_payload = data_dict.get("data")
                                 if isinstance(data_payload, dict):
                                     data_payload_dict = cast(
@@ -841,35 +703,6 @@ class GatewayHandlers:
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             return web.Response(status=502, text=f"Bad Gateway: {e}")
 
-    def shutdown(self) -> None:
-        """关闭所有订阅及 SSE 和 WS 连接。"""
-        self._unsub_status()
-        self._unsub_sse_status()
-        self._unsub_state()
-        self._unsub_downstream_state()
-
-        for q in list(self.sse_clients):
-            try:
-                q.put_nowait("shutdown")
-            except asyncio.QueueFull:
-                pass
-
-        async def close_ws(ws: web.WebSocketResponse) -> None:
-            try:
-                if not ws.closed:
-                    await ws.close(code=1001, message=b"Server shutting down")
-            except (ConnectionResetError, RuntimeError):
-                pass
-
-        async def close_all_ws() -> None:
-            if self.ws_clients:
-                await asyncio.gather(
-                    *(close_ws(ws) for ws in list(self.ws_clients)),
-                    return_exceptions=True,
-                )
-
-        if self.ws_clients:
-            try:
-                asyncio.create_task(close_all_ws())
-            except RuntimeError:
-                pass
+    def dispose(self) -> None:
+        """经 fanout 的释放入口取消订阅与定时器，并收敛其管理的连接。"""
+        self._fanout.dispose()

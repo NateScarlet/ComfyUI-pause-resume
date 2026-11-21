@@ -1,5 +1,8 @@
+import asyncio
 from typing import Callable, List
+from unittest.mock import MagicMock
 
+from gateway.presentation.status_fanout import StatusFanout
 from gateway.shared.interfaces import MemorySampler, Timer
 
 
@@ -59,3 +62,17 @@ class FakeTimer(Timer):
             self._now = task.deadline
             task.callback()
         self._now = deadline
+
+
+def make_fanout(app, bus, queue_remaining=0, timer=None, loop=None):
+    """构造测试用 fanout；queue_reader 用替身，计数由参数给定。"""
+    reader = MagicMock()
+    reader.count.return_value = queue_remaining
+    fanout = StatusFanout(
+        app=app,
+        queue_reader=reader,
+        event_bus=bus,
+        timer=timer if timer is not None else FakeTimer(),
+        loop=loop if loop is not None else asyncio.get_running_loop(),
+    )
+    return fanout, reader

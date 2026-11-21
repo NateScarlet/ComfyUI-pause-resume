@@ -14,6 +14,7 @@ from gateway.presentation.handlers import (
     _EXT_JS_URL,
     _LOADING_HTML,
 )
+from tests.fakes import make_fanout
 from gateway.shared.events import (
     DownstreamReadyChangedEvent,
     DownstreamStateChanged,
@@ -242,10 +243,11 @@ class TestGatewayHandlersProxyReadiness(unittest.TestCase):
         downstream = MagicMock(spec=DownstreamClient)
         downstream.downstream_port = 8188
         bus = _SyncEventBus()
+        fanout, _ = make_fanout(app, bus)
         handlers = _ProxyStubHandlers(
             app=app,
             downstream_service=downstream,
-            queue_reader=MagicMock(),
+            fanout=fanout,
             event_bus=bus,
             startup_wait_sec=wait_sec,
         )
@@ -407,11 +409,13 @@ class TestGatewayHandlersState(unittest.TestCase):
                     downstream_state=DownstreamState.SHUTDOWN,
                 )
             )
+            bus = _SyncEventBus()
+            fanout, _ = make_fanout(app, bus)
             handlers = GatewayHandlers(
                 app=app,
                 downstream_service=MagicMock(spec=DownstreamClient),
-                queue_reader=MagicMock(),
-                event_bus=_SyncEventBus(),
+                fanout=fanout,
+                event_bus=bus,
                 startup_wait_sec=0.05,
             )
             resp = await handlers.handle_state(
@@ -446,11 +450,13 @@ class TestGatewayHandlersActivity(unittest.TestCase):
         )
         downstream = MagicMock(spec=DownstreamClient)
         downstream.downstream_port = 8188
+        bus = _SyncEventBus()
+        fanout, _ = make_fanout(app, bus)
         handlers = _ProxyStubHandlers(
             app=app,
             downstream_service=downstream,
-            queue_reader=MagicMock(),
-            event_bus=_SyncEventBus(),
+            fanout=fanout,
+            event_bus=bus,
             startup_wait_sec=0.05,
         )
         return handlers, app
@@ -587,11 +593,13 @@ class TestGatewayHandlersWsProxyLifecycle(unittest.TestCase):
         )
         downstream = MagicMock(spec=DownstreamClient)
         downstream.downstream_port = 8188
+        bus = _SyncEventBus()
+        fanout, _ = make_fanout(app, bus)
         return GatewayHandlers(
             app=app,
             downstream_service=downstream,
-            queue_reader=MagicMock(),
-            event_bus=_SyncEventBus(),
+            fanout=fanout,
+            event_bus=bus,
             startup_wait_sec=0.05,
         )
 
@@ -725,16 +733,79 @@ class TestGatewayHandlersWsProxyLifecycle(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class TestGatewayHandlersWsStatusRewrite(unittest.TestCase):
+    """WS 代理改写下游 status 帧时使用 fanout 的实时计数（#28）。"""
+
+    def test_rewrite_uses_realtime_count_from_fanout(self):
+        """下游自带滞后的 exec_info 被改写为改写那一刻的权威计数。"""
+
+        async def scenario() -> None:
+            app = MagicMock()
+            app.get_state.handle = MagicMock(
+                return_value=GatewayState(
+                    paused=False,
+                    allow_idle_shutdown=False,
+                    downstream_state=DownstreamState.READY,
+                )
+            )
+            downstream_service = MagicMock(spec=DownstreamClient)
+            downstream_service.downstream_port = 8188
+            bus = _SyncEventBus()
+            fanout, reader = make_fanout(app, bus, queue_remaining=9)
+            handlers = GatewayHandlers(
+                app=app,
+                downstream_service=downstream_service,
+                fanout=fanout,
+                event_bus=bus,
+                startup_wait_sec=0.05,
+            )
+
+            stale_frame = json.dumps(
+                {
+                    "type": "status",
+                    "data": {"status": {"exec_info": {"queue_remaining": 0}}},
+                }
+            )
+            browser = _ScriptedWebSocket()
+            downstream_ws = _ScriptedWebSocket(
+                messages=[_WsMsg(aiohttp.WSMsgType.TEXT, stale_frame), _EOF]
+            )
+            req = make_mocked_request("GET", "/ws", headers={"Upgrade": "websocket"})
+            with (
+                patch(
+                    "aiohttp.ClientSession",
+                    lambda: _ScriptedClientSession(downstream_ws),
+                ),
+                patch("aiohttp.web.WebSocketResponse", lambda: browser),
+            ):
+                await asyncio.wait_for(handlers.proxy_handler(req), timeout=1)
+
+            self.assertEqual(len(browser.sent_text), 1)
+            self.assertEqual(
+                json.loads(browser.sent_text[0])["data"]["status"]["exec_info"][
+                    "queue_remaining"
+                ],
+                9,
+            )
+            reader.count.assert_called_once_with(
+                filter_by=JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
+            )
+
+        asyncio.run(scenario())
+
+
 class TestGatewayHandlersRestart(unittest.TestCase):
     """测试 /restart 端点把已有的强制重启暴露给外部程序（#20）。"""
 
     def _make_handlers(self):
         app = MagicMock()
+        bus = _SyncEventBus()
+        fanout, _ = make_fanout(app, bus)
         handlers = GatewayHandlers(
             app=app,
             downstream_service=MagicMock(spec=DownstreamClient),
-            queue_reader=MagicMock(),
-            event_bus=_SyncEventBus(),
+            fanout=fanout,
+            event_bus=bus,
             startup_wait_sec=0.05,
         )
         return handlers, app
@@ -781,16 +852,16 @@ class TestGatewayHandlersSse(unittest.TestCase):
                 downstream_state=DownstreamState.READY,
             )
         )
-        app.get_job_count.handle = AsyncMock(return_value=queue_remaining)
         bus = _SyncEventBus()
+        fanout, reader = make_fanout(app, bus, queue_remaining=queue_remaining)
         handlers = GatewayHandlers(
             app=app,
             downstream_service=MagicMock(spec=DownstreamClient),
-            queue_reader=MagicMock(),
+            fanout=fanout,
             event_bus=bus,
             startup_wait_sec=0.05,
         )
-        return handlers, app, bus
+        return handlers, app, bus, reader
 
     async def _connect(self, handlers):
         """建立 SSE 连接，等待初始帧写入后返回任务、响应与帧列表。"""
@@ -825,7 +896,9 @@ class TestGatewayHandlersSse(unittest.TestCase):
         """新连接立即收到暂停状态与当前 pending + running 计数的完整快照（#19）。"""
 
         async def scenario() -> None:
-            handlers, app, _ = self._make_handlers(paused=True, queue_remaining=3)
+            handlers, app, _, reader = self._make_handlers(
+                paused=True, queue_remaining=3
+            )
             task, response, frames = await self._connect(handlers)
             try:
                 self.assertEqual(
@@ -837,8 +910,8 @@ class TestGatewayHandlersSse(unittest.TestCase):
                     },
                 )
                 self.assertEqual(response.chunks[0], "retry: 3000\n\n")
-                # 初始快照只查询一次队列计数
-                app.get_job_count.handle.assert_awaited_once_with(
+                # 初始快照只查询一次队列计数，且筛选条件为 PENDING + RUNNING
+                reader.count.assert_called_once_with(
                     filter_by=JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
                 )
             finally:
@@ -850,7 +923,7 @@ class TestGatewayHandlersSse(unittest.TestCase):
         """队列变化直接复用事件计数推送，不额外查询队列（#19）。"""
 
         async def scenario() -> None:
-            handlers, app, bus = self._make_handlers(queue_remaining=2)
+            handlers, _, bus, reader = self._make_handlers(queue_remaining=2)
             task, response, _ = await self._connect(handlers)
             try:
                 bus.publish(StatusChangedEvent(queue_remaining=7))
@@ -863,7 +936,10 @@ class TestGatewayHandlersSse(unittest.TestCase):
                         "downstream": "ready",
                     },
                 )
-                app.get_job_count.handle.assert_awaited_once()
+                # 增量帧复用事件计数，不额外查询队列
+                reader.count.assert_called_once_with(
+                    filter_by=JobFilters([JobStatus.PENDING, JobStatus.RUNNING])
+                )
             finally:
                 await self._disconnect(task)
 
@@ -873,7 +949,7 @@ class TestGatewayHandlersSse(unittest.TestCase):
         """暂停变化使用最近一次计数推送，连接快照已先更新该缓存（#19）。"""
 
         async def scenario() -> None:
-            handlers, _, bus = self._make_handlers(paused=False, queue_remaining=4)
+            handlers, _, bus, _ = self._make_handlers(paused=False, queue_remaining=4)
             task, response, _ = await self._connect(handlers)
             try:
                 bus.publish(StateChangedEvent(paused=True))
@@ -895,7 +971,7 @@ class TestGatewayHandlersSse(unittest.TestCase):
         """只读 paused 的旧客户端行为不变：帧仍是 JSON 对象且 paused 语义不变（#19）。"""
 
         async def scenario() -> None:
-            handlers, _, bus = self._make_handlers(paused=False, queue_remaining=1)
+            handlers, _, bus, _ = self._make_handlers(paused=False, queue_remaining=1)
             task, response, _ = await self._connect(handlers)
             try:
                 bus.publish(StateChangedEvent(paused=True))
@@ -912,7 +988,7 @@ class TestGatewayHandlersSse(unittest.TestCase):
         """非事件循环线程发布的事件也必须安全投递给 SSE 客户端（#19）。"""
 
         async def scenario() -> None:
-            handlers, _, bus = self._make_handlers(queue_remaining=1)
+            handlers, _, bus, _ = self._make_handlers(queue_remaining=1)
             task, response, _ = await self._connect(handlers)
             try:
                 worker = threading.Thread(
@@ -939,10 +1015,11 @@ class TestGatewayHandlersSse(unittest.TestCase):
         """尚无 SSE 连接时收到事件不得报错，也不得额外查询队列（#19）。"""
 
         async def scenario() -> None:
-            handlers, app, bus = self._make_handlers()
+            handlers, _, bus, reader = self._make_handlers()
             bus.publish(StatusChangedEvent(queue_remaining=5))
             bus.publish(StateChangedEvent(paused=True))
-            app.get_job_count.handle.assert_not_awaited()
+            await asyncio.sleep(0)
+            reader.count.assert_not_called()
             self.assertEqual(handlers.sse_clients, set())
 
         asyncio.run(scenario())
@@ -981,12 +1058,12 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                 downstream_state=DownstreamState.READY,
             )
         )
-        app.get_job_count.handle = AsyncMock(return_value=queue_remaining)
         bus = _SyncEventBus()
+        fanout, _ = make_fanout(app, bus, queue_remaining=queue_remaining)
         handlers = GatewayHandlers(
             app=app,
             downstream_service=MagicMock(spec=DownstreamClient),
-            queue_reader=MagicMock(),
+            fanout=fanout,
             event_bus=bus,
             startup_wait_sec=0.05,
             sse_keepalive_sec=keepalive_sec,
@@ -1049,7 +1126,7 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         )
                         self.assertEqual(ping, b": ping\n\n")
             finally:
-                handlers.shutdown()
+                handlers.dispose()
                 await runner.cleanup()
 
         asyncio.run(scenario())
@@ -1074,7 +1151,7 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         self.assertEqual(frames, [b": ping\n\n"] * 3)
                         self.assertNotIn(b"data:", b"".join(frames))
             finally:
-                handlers.shutdown()
+                handlers.dispose()
                 await runner.cleanup()
 
         asyncio.run(scenario())
@@ -1121,7 +1198,7 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
                         # 状态帧必须在下一个保活间隔到点之前写出
                         self.assertLess(elapsed, 0.5)
             finally:
-                handlers.shutdown()
+                handlers.dispose()
                 await runner.cleanup()
 
         asyncio.run(scenario())
@@ -1188,8 +1265,11 @@ class TestGatewayHandlersSseKeepalive(unittest.TestCase):
     def test_non_positive_keepalive_interval_is_rejected(self):
         """保活间隔为非正数会导致等待立即超时并空转，构造时必须拒绝（#21）。"""
 
-        with self.assertRaises(ValueError):
-            self._make_handlers(keepalive_sec=0)
+        async def scenario() -> None:
+            with self.assertRaises(ValueError):
+                self._make_handlers(keepalive_sec=0)
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":
